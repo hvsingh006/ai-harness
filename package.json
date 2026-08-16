@@ -1,6 +1,6 @@
 {
   "name": "ai-harness",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "description": "Provider-neutral continuity, archive, learning, and development layer for native AI services.",
@@ -8,7 +8,8 @@
     "start": "node src/server.mjs",
     "dev": "node --watch src/server.mjs",
     "test": "node --test",
-    "import": "node scripts/import.mjs"
+    "import": "node scripts/import.mjs",
+    "doctor": "node scripts/doctor.mjs"
   },
   "engines": {
     "node": ">=22.5.0"
