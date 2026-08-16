@@ -153,25 +153,15 @@ function resourceUsePolicy() {
   };
 }
 
-function collaborationPolicy(ws) {
+function collaborationPolicy() {
   return {
-    principle: 'Increase productivity and learning without replacing the user\'s critical thinking.',
-    learning: [
-      'Prefer retrieval practice, questions, hints, and explanation checks before supplying a full solution when the user is learning.',
-      'Preserve and use prior attempts, misconceptions, course sources, and demonstrated mastery.',
-      'Give a direct solution when the user explicitly asks for one, but make assumptions and reasoning inspectable.'
-    ],
-    development: [
-      'Preserve requirements, architecture, code state, experiments, failures, and decisions across sessions.',
-      'Do not silently change product or technical direction. Surface tradeoffs and record decisions with provenance.',
-      'Use the native provider tools when they add value instead of recreating them in the harness.'
-    ],
+    principle: 'Use project context to improve continuity, productivity, and understanding without replacing the user\'s judgment or critical thinking.',
     continuity: [
-      'Do not ask the user to restate facts already supplied in the workspace context.',
-      'Treat newer explicit user statements as superseding older derived state.',
-      'The compact context is a derivative view. The lossless archive remains authoritative for provenance.'
-    ],
-    workspace_kind: ws.kind
+      'Do not ask the user to restate information already available in the project context or retained chat history.',
+      'Use prior user prompts and prior AI responses as working context, while treating AI responses as fallible.',
+      'Use relevant project files and original archived material when details or provenance matter.',
+      'Treat newer explicit user statements as superseding older derived state.'
+    ]
   };
 }
 
@@ -186,11 +176,10 @@ function buildContextPacket(workspaceId) {
     workspace: {
       id: ws.id,
       name: ws.name,
-      kind: ws.kind,
       description: ws.description,
       active_focus: ws.active_focus
     },
-    collaboration_policy: collaborationPolicy(ws),
+    collaboration_policy: collaborationPolicy(),
     resource_use_policy: resourceUsePolicy(),
     next_actions: ws.tasks.filter(t => t.status === 'open').slice(0, 8).map(({ title, details, priority, task_type }) => ({ title, details, priority, task_type })),
     durable_context: ws.memories.map(({ scope, category, content, confidence, source_type, source_ref }) => ({
@@ -200,10 +189,6 @@ function buildContextPacket(workspaceId) {
       id, provider, title, summary, message_count, started_at, capture_status, native_url, display_label,
       provider_refs: rows(db, 'SELECT ref_type,ref_value,source FROM session_external_refs WHERE session_id=? ORDER BY ref_type', id)
     })),
-    learning_state: ws.learning.map(({ item_type, title, details, mastery, status, last_practiced_at, next_review_at, attempt_count }) => ({
-      item_type, title, details, mastery, status, last_practiced_at, next_review_at, attempt_count
-    })),
-    development_state: ws.development.map(({ item_type, title, details, status, source_url }) => ({ item_type, title, details, status, source_url })),
     decisions: ws.decisions.map(({ title, decision, rationale, source_ref }) => ({ title, decision, rationale, source_ref })),
     file_index: [
       ...ws.files.map(({ name, mime_type, source_provider, source_url, notes }) => ({ name, mime_type, source_provider, source_url, notes, canonical: false })),
@@ -211,7 +196,7 @@ function buildContextPacket(workspaceId) {
     ],
     file_index_manifest: { total_canonical_artifacts: canonicalFileCount, included_canonical_artifacts: canonicalFileIndex.length, truncated: canonicalFileIndex.length < canonicalFileCount },
     archive_manifest: ws.archive,
-    handoff_instruction: 'Continue from this workspace state without requiring restatement. Actively use relevant user prompts, prior AI responses, files, PDFs, images, notebook sources, native tools, archive search, and current web information when useful. When volume exceeds the context window, retrieve progressively relevant subsets rather than ignoring material or dumping the entire archive. Never treat summaries as a replacement for archived originals.'
+    handoff_instruction: 'Continue from this Project Space without requiring restatement. Use relevant prior user prompts, prior ChatGPT/Gemini responses, project files, PDFs, images, archive search, native tools, and current web information when useful. If the retained corpus is too large, retrieve progressively relevant subsets rather than ignoring older material or flooding the prompt. Preserve the user\'s critical thinking and judgment.'
   };
 }
 
@@ -393,7 +378,7 @@ async function handleApi(req, res, url) {
   if (url.pathname === '/api/imports/start' && req.method === 'POST') {
     const body = await readJson(req);
     if (!row(db, 'SELECT id FROM workspaces WHERE id=?', body.workspace_id)) return sendJson(res, 404, { error: 'workspace not found' });
-    if (!['chatgpt','gemini','notebooklm','generic'].includes(body.provider)) return sendJson(res, 400, { error: 'unsupported provider' });
+    if (!['chatgpt','gemini'].includes(body.provider)) return sendJson(res, 400, { error: 'unsupported provider' });
     const uploadId = `upload-${randomUUID()}`;
     const dir = path.join(stagingRoot, uploadId);
     fs.mkdirSync(dir, { recursive: true });
@@ -570,8 +555,7 @@ async function handleApi(req, res, url) {
       id, body.name.trim(), body.kind || 'mixed', body.description || '', body.active_focus || '', body.color || 'slate', ts, ts);
     const defaultProviders = [
       ['chatgpt', 'ChatGPT', 'https://chatgpt.com/'],
-      ['gemini', 'Gemini', 'https://gemini.google.com/'],
-      ['notebooklm', 'NotebookLM', 'https://notebooklm.google.com/']
+      ['gemini', 'Gemini', 'https://gemini.google.com/']
     ];
     ensureWorkspaceProjectRoot(db, id);
     for (const [provider, label, providerUrl] of defaultProviders) {

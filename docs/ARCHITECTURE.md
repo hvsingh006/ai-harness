@@ -1,124 +1,80 @@
-# Architecture
+# AI Harness Architecture
 
-## Core rule
-
-**Chats are disposable. Workspaces are durable. Originals are authoritative. Derived context is replaceable.**
-
-## Layers
+## Core model
 
 ```text
-Native ChatGPT / Gemini / NotebookLM / future provider
-                  |
-          Browser companion
-                  |
-        Local AI Harness service
-        /          |          \
-Lossless vault  Working state  Search/index
-        \          |          /
-              Workspace
+Project Space
+├── normal project folder
+├── retained chat history
+├── compact project context
+├── lossless archive
+│
+├── native ChatGPT chats
+└── native Gemini chats
 ```
 
-## Lossless archive
+The Project Space is durable. Native chats are working surfaces that can be replaced without losing the project record.
 
-The archive is the canonical preservation layer.
+## Storage separation
 
-### Raw records
+Application code and user data are physically separate.
 
-`imports` records whole provider-export ingest jobs. Every file in an imported directory is copied into the local content-addressed vault before parsing.
+Application checkout:
 
-### Messages
+```text
+%LOCALAPPDATA%\AI-Harness\app
+```
 
-`messages` stores normalized text plus raw provider JSON/DOM payloads and provider identifiers. Sessions retain provider URLs and external IDs.
+Persistent workspace:
 
-### Artifacts
+```text
+%USERPROFILE%\Documents\AI Harness
+```
 
-`artifacts` stores exact copied bytes with SHA-256, MIME type, original path/source URL, provider, and metadata. The content-addressed vault avoids duplicate byte copies while preserving provenance records.
+The persistent workspace contains Projects, Library, Archive, Backups, and `harness.db`.
 
-### Live asset references
+## Chat identity
 
-`session_assets` tracks files/images discovered in native pages before their bytes are mirrored. A session with unmirrored references is not safe to delete.
+Each captured chat receives an immutable Harness session ID plus provider references such as:
 
-## Derived state
+- provider: `chatgpt` or `gemini`
+- provider chat ID when available
+- route
+- native URL
+- first/last seen timestamps
 
-Derived state can be regenerated from the archive:
+URLs are locators, not the canonical identity.
 
-- memories
-- decisions
-- workspace tasks
-- learning state
-- development state
-- session summaries
-- context packets
+## Archive and context
 
-Every important derived item should eventually carry provenance back to raw messages or artifacts.
+The archive keeps raw messages and source assets. Compact context is derived from the archive and can be regenerated.
 
-## Capture integrity
+A new chat should receive only the relevant subset of project state, while search/retrieval can expand into older raw history as needed.
 
-Required stages:
+## Browser companion
 
-1. `raw_transcript`
-2. `attachments`
-3. `derived_state`
-4. `search_index`
+The Chrome/Edge extension currently supports only:
 
-Only all four complete means `safe_to_delete`.
+- `chatgpt.com`
+- `gemini.google.com`
 
-The current browser companion saves best-effort loaded-page snapshots and therefore does not claim `raw_transcript` completeness.
+Responsibilities:
 
-## Context compiler
+- identify the active provider chat
+- attach it to the selected Project Space
+- capture loaded messages and accessible asset references
+- show the AIH project/chat label
+- insert Project Space context into a fresh chat
+- bring an archived chat back into a prompt
 
-A context packet should be compact enough for fresh sessions and provider handoff. It includes:
+Provider-specific DOM logic should stay isolated so changes to either website do not affect the archive model.
 
-- workspace identity and current focus
-- collaboration policy
-- next actions
-- durable memories
-- recent session summaries/status
-- learning state
-- development state
-- decisions
-- file index
-- archive manifest
+## Project files
 
-The full archive is searched on demand rather than injected wholesale into every prompt.
+Managed Project Spaces use a real folder under `Projects/`. Existing folders can also be attached without moving them.
 
-## Active-learning policy
+The database stores an index and metadata. It does not replace the human-visible filesystem.
 
-Learning context should tell native models to preserve productive struggle where appropriate. The harness tracks attempts and demonstrated mastery rather than treating AI-generated explanations as evidence that a concept is learned.
+## Expansion rule
 
-## Provider adapters
-
-Adapters are replaceable boundary code. A provider website redesign should not affect archive or workspace data. Browser automation is considered fragile by design and isolated from the core.
-
-## NotebookLM / Gemini
-
-NotebookLM and Gemini notebook features remain native. The harness will map notebooks and source inventories into workspaces rather than recreate notebook functionality. Provider-specific sync is treated as an optimization, not canonical storage.
-
-## Application / workspace separation
-
-Application source and persistent user data are physically separate. The source checkout may be replaced or updated without touching Projects, Archive, Backups, or `harness.db`. Managed Project Spaces are normal filesystem directories; the immutable archive vault is a separate preservation layer. See `STORAGE.md`.
-
-## Local-first
-
-Prototype stack:
-
-- Node.js 22+
-- built-in `node:sqlite`
-- local HTTP service on `127.0.0.1`
-- static local dashboard
-- Manifest V3 browser companion
-- content-addressed local vault
-
-A packaged desktop shell can be added after the core workflow stabilizes.
-
-## Provider chat identity
-
-Harness `sessions.id` is the immutable internal identity. Provider-native identifiers live in `session_external_refs`, allowing one session to retain a ChatGPT/Gemini chat ID, native URL, route, import/export identifier, and future provider-specific references without coupling the core schema to one vendor. See `CHAT_IDENTITY.md`.
-
-## Resource retrieval
-
-The archive is intentionally larger than a model context window may be. The context compiler provides working state and a resource manifest, while retrieval selects original messages/artifacts as needed. Scaling down means reducing active context, never deleting canonical history. See `RESOURCE_POLICY.md`.
-
-## Readiness signal
-
-Browser companions send a local heartbeat. `/api/readiness` reports whether the native-browser workflow has been seen. The dashboard uses the requested bright red dot only when the companion has checked in.
+Keep the initial product centered on ChatGPT, Gemini, Project Spaces, files, and chat continuity. Additional modes/tools may be considered later only if they solve a demonstrated user problem without making the base workflow harder to understand.

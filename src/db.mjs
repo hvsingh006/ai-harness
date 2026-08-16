@@ -27,6 +27,7 @@ export function openDatabase(dbPath = null) {
   migrateStorageReferences(db, storage);
   seed(db);
   ensureWorkspaceProjectRoots(db);
+  ensureHarnessProjectOverview(db);
   return db;
 }
 
@@ -370,6 +371,40 @@ export function attachWorkspaceFolder(db, workspaceId, folderPath) {
   return db.prepare('SELECT * FROM workspaces WHERE id=?').get(workspaceId);
 }
 
+function ensureHarnessProjectOverview(db) {
+  const workspace = db.prepare("SELECT id FROM workspaces WHERE id='ws-harness'").get();
+  if (!workspace) return;
+  const rootPath = ensureWorkspaceProjectRoot(db, 'ws-harness');
+  const overviewPath = path.join(rootPath, 'AI_HARNESS_PROJECT.md');
+  if (!fs.existsSync(overviewPath)) {
+    fs.writeFileSync(overviewPath, `# AI Harness Project
+
+## Goal
+Create a simple Project Space that lets the user work in native ChatGPT and Gemini without losing context when starting a new chat or switching between the two services.
+
+## Core functionality
+- Separate Project Spaces with their own files and retained chat history.
+- Open native ChatGPT and Gemini from the selected project.
+- Capture and retain chats with stable provider chat IDs and native URLs.
+- Reopen archived native chats and bring prior chat context into a new prompt.
+- Search retained raw chat history across ChatGPT and Gemini within a project.
+- Keep project files, PDFs, images, and folders available independently of individual chats.
+- Preserve original source material; summaries and compact context are derived views only.
+- Scale context progressively when the complete project history is too large for one prompt.
+- Support light, dark, and system appearance.
+
+## Product boundaries
+- The Harness is not a replacement chat UI. ChatGPT and Gemini remain the working interfaces.
+- Learning and development are important use cases, not separate project modes.
+- The first UI stays deliberately simple and can expand later.
+- AI should improve productivity and understanding without replacing the user's critical thinking or judgment.
+
+## Current priority
+Make continuity reliable: a fresh ChatGPT or Gemini chat should know the relevant project context and prior work without forcing the user to reconstruct it manually.
+`, 'utf8');
+  }
+}
+
 function now() {
   return new Date().toISOString();
 }
@@ -383,9 +418,7 @@ function seed(db) {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
-    insertWorkspace.run('ws-harness', 'AI Harness', 'mixed', 'Build the provider-neutral continuity layer itself.', 'Reach a working prototype where native ChatGPT, Gemini, and NotebookLM sessions can be replaced without losing raw history, files, or working state.', 'slate', ts, ts);
-    insertWorkspace.run('ws-course', 'Learning Workspace', 'learning', 'Course materials, concept mastery, study sessions, labs, and AI-assisted learning.', 'Learn faster while preserving source context and requiring active reasoning rather than passive answer consumption.', 'blue', ts, ts);
-    insertWorkspace.run('ws-dev', 'Development Workspace', 'development', 'Repositories, code, architecture, debugging history, experiments, and technical decisions.', 'Build without losing implementation context when switching models or starting fresh chats.', 'violet', ts, ts);
+    insertWorkspace.run('ws-harness', 'AI Harness', 'general', 'The AI Harness project itself.', 'Keep project context, files, and chat history continuous across new ChatGPT and Gemini chats.', 'slate', ts, ts);
 
     const insertMemory = db.prepare(`
       INSERT INTO memories (id, workspace_id, scope, category, content, confidence, source_type, source_ref, status, created_at, updated_at)
@@ -393,8 +426,8 @@ function seed(db) {
     `);
     insertMemory.run('mem-product-goal', null, 'global', 'product_goal', 'Use AI to become more productive and learn more without replacing critical thinking.', 1, 'user_explicit', 'product-definition', ts, ts);
     insertMemory.run('mem-continuity', null, 'global', 'continuity_requirement', 'A fresh chat or provider switch should inherit the same useful context, while the harness retains the complete source archive.', 1, 'user_explicit', 'product-definition', ts, ts);
-    insertMemory.run('mem-full-archive', null, 'global', 'retention_requirement', 'Preserve all capturable chat history, files, PDFs, images, notebook sources, and raw provider data. Derived summaries never replace originals.', 1, 'user_explicit', 'product-definition', ts, ts);
-    insertMemory.run('mem-native-ui', null, 'global', 'native_ui_requirement', 'Use native ChatGPT, Gemini, NotebookLM, and future provider interfaces rather than a replacement chat UI.', 1, 'user_explicit', 'product-definition', ts, ts);
+    insertMemory.run('mem-full-archive', null, 'global', 'retention_requirement', 'Preserve all capturable ChatGPT/Gemini chat history, files, PDFs, images, and raw source data. Derived summaries never replace originals.', 1, 'user_explicit', 'product-definition', ts, ts);
+    insertMemory.run('mem-native-ui', null, 'global', 'native_ui_requirement', 'Use native ChatGPT and Gemini interfaces rather than a replacement chat UI.', 1, 'user_explicit', 'product-definition', ts, ts);
   }
 
   const ts = now();
@@ -407,60 +440,61 @@ function seed(db) {
       DELETE FROM learning_items WHERE id IN ('learn-1','learn-2','learn-3');
       DELETE FROM development_items WHERE id IN ('dev-1','dev-2');
     `);
-    db.prepare(`UPDATE workspaces SET name='Learning Workspace', description=?, active_focus=? WHERE id='ws-course'`).run(
-      'Course materials, concept mastery, study sessions, labs, and AI-assisted learning.',
-      'Learn faster while preserving source context and requiring active reasoning rather than passive answer consumption.'
-    );
-    db.prepare(`UPDATE workspaces SET name='Development Workspace', description=?, active_focus=? WHERE id='ws-dev'`).run(
-      'Repositories, code, architecture, debugging history, experiments, and technical decisions.',
-      'Build without losing implementation context when switching models or starting fresh chats.'
-    );
     db.prepare(`INSERT OR REPLACE INTO settings (key,value) VALUES ('prototype_cleanup_v2','done')`).run();
   }
 
   const workspaceExists = db.prepare('SELECT id FROM workspaces WHERE id = ?').get('ws-harness');
   if (!workspaceExists) {
     db.prepare(`INSERT INTO workspaces (id,name,kind,description,active_focus,color,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)`).run(
-      'ws-harness', 'AI Harness', 'mixed', 'Build the provider-neutral continuity layer itself.', 'Reach a working prototype where native AI sessions can be replaced without losing raw history, files, or working state.', 'slate', ts, ts
+      'ws-harness', 'AI Harness', 'general', 'The AI Harness project itself.', 'Keep project context, files, and chat history continuous across new ChatGPT and Gemini chats.', 'slate', ts, ts
     );
   }
 
   const ensureMemory = db.prepare(`INSERT OR IGNORE INTO memories (id,workspace_id,scope,category,content,confidence,source_type,source_ref,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
   ensureMemory.run('mem-product-goal', null, 'global', 'product_goal', 'Use AI to become more productive and learn more without replacing critical thinking.', 1, 'user_explicit', 'product-definition', 'active', ts, ts);
   ensureMemory.run('mem-continuity', null, 'global', 'continuity_requirement', 'New chats and provider switches should continue from prior work without forcing restatement.', 1, 'user_explicit', 'product-definition', 'active', ts, ts);
-  ensureMemory.run('mem-full-archive', null, 'global', 'retention_requirement', 'Preserve all capturable chat history, files, PDFs, images, notebook sources, and raw provider data. Derived summaries never replace originals.', 1, 'user_explicit', 'product-definition', 'active', ts, ts);
-  ensureMemory.run('mem-native-ui', null, 'global', 'native_ui_requirement', 'Keep ChatGPT, Gemini, NotebookLM, and future services as native working surfaces.', 1, 'user_explicit', 'product-definition', 'active', ts, ts);
-  ensureMemory.run('mem-resource-use', null, 'global', 'resource_use_requirement', 'AI sessions should actively use relevant prior user prompts, prior AI responses, full archive search, files, PDFs, images, notebook sources, native tools, and current web information when useful. Summaries do not replace source material.', 1, 'user_explicit', 'product-definition', 'active', ts, ts);
+  ensureMemory.run('mem-full-archive', null, 'global', 'retention_requirement', 'Preserve all capturable ChatGPT/Gemini chat history, files, PDFs, images, and raw source data. Derived summaries never replace originals.', 1, 'user_explicit', 'product-definition', 'active', ts, ts);
+  ensureMemory.run('mem-native-ui', null, 'global', 'native_ui_requirement', 'Keep ChatGPT and Gemini as the native working surfaces.', 1, 'user_explicit', 'product-definition', 'active', ts, ts);
+  ensureMemory.run('mem-resource-use', null, 'global', 'resource_use_requirement', 'AI sessions should actively use relevant prior user prompts, prior ChatGPT/Gemini responses, full archive search, files, PDFs, images, native tools, and current web information when useful. Summaries do not replace source material.', 1, 'user_explicit', 'product-definition', 'active', ts, ts);
   ensureMemory.run('mem-progressive-context', null, 'global', 'context_scaling_requirement', 'When the workspace corpus is too large for one model context window, preserve the complete archive and retrieve progressively relevant subsets with provenance instead of ignoring older material or dumping everything into one prompt.', 1, 'user_explicit', 'product-definition', 'active', ts, ts);
   ensureMemory.run('mem-chat-labels', null, 'global', 'traceability_requirement', 'Native chats should show a stable harness label tied to provider chat identifiers so archived chats can be reopened, traced to a workspace, and brought back into later prompts.', 1, 'user_explicit', 'product-definition', 'active', ts, ts);
   ensureMemory.run('mem-project-space', null, 'global', 'project_space_requirement', 'Each workspace is also a project space: users can drag or add documents, PDFs, images, datasets, code artifacts, and folders once so those resources persist independently of any individual AI chat.', 1, 'user_explicit', 'product-definition', 'active', ts, ts);
-  ensureMemory.run('mem-coding-adapters', null, 'global', 'future_integration_requirement', 'Coding agents such as Codex should integrate through provider-neutral project and task adapters rather than becoming part of the canonical archive model.', 1, 'user_explicit', 'product-definition', 'active', ts, ts);
 
   const links = [
     ['link-gpt-harness', 'ws-harness', 'chatgpt', 'ChatGPT', 'https://chatgpt.com/'],
-    ['link-gem-harness', 'ws-harness', 'gemini', 'Gemini', 'https://gemini.google.com/'],
-    ['link-nblm-harness', 'ws-harness', 'notebooklm', 'NotebookLM', 'https://notebooklm.google.com/']
+    ['link-gem-harness', 'ws-harness', 'gemini', 'Gemini', 'https://gemini.google.com/']
   ];
   const insertLink = db.prepare(`INSERT OR IGNORE INTO provider_links (id,workspace_id,provider,label,url,status,metadata_json,created_at,updated_at) VALUES (?,?,?,?,?,'linked','{}',?,?)`);
   for (const link of links) insertLink.run(...link, ts, ts);
 
   const tasks = [
-    ['task-archive', 'Preserve complete raw history and assets', 'Lossless archive must be independent of summaries and provider memory.', 1],
-    ['task-capture', 'Make current native chats capturable', 'Browser companion should capture messages and attachment inventory without replacing native UI.', 1],
-    ['task-import', 'Import historical provider exports', 'Ingest ChatGPT exports and Google/Gemini exports losslessly before relying on live capture.', 1],
-    ['task-learning', 'Add active-learning continuity', 'Track knowledge gaps, attempts, mastery evidence, and next study actions without doing the thinking for the user.', 2],
-    ['task-project-space', 'Make workspaces usable as project spaces', 'Support drag/drop files and folders, canonical resource storage, previews, and resource retrieval without depending on a native chat.', 1],
-    ['task-coding-adapters', 'Define coding-tool adapter boundary', 'Keep repository/task/thread/test state provider-neutral so Codex and future coding agents can attach later.', 3]
+    ['task-continuity', 'Make chat continuity reliable', 'A new ChatGPT/Gemini chat should continue the same Project Space without manual reconstruction.', 1],
+    ['task-history', 'Retain complete chat history', 'Preserve raw ChatGPT and Gemini conversations and make them searchable/reopenable from the project.', 1],
+    ['task-files', 'Keep project files available', 'Project files should remain attached to the Project Space across chats and provider switches.', 1]
   ];
   const insertTask = db.prepare(`INSERT OR IGNORE INTO workspace_tasks (id,workspace_id,title,details,task_type,status,priority,source_ref,created_at,updated_at) VALUES (?,?,?,?,'next_action','open',?,'product-definition',?,?)`);
   for (const [id,title,details,priority] of tasks) insertTask.run(id, 'ws-harness', title, details, priority, ts, ts);
 
-  db.prepare(`INSERT OR IGNORE INTO settings (key, value) VALUES ('theme', 'system')`).run();
+  
+  const simpleUiCleanup = db.prepare(`SELECT value FROM settings WHERE key='simple_ui_cleanup_v1'`).get();
+  if (!simpleUiCleanup) {
+    for (const id of ['ws-course','ws-dev']) {
+      const counts = {
+        sessions: db.prepare('SELECT COUNT(*) AS n FROM sessions WHERE workspace_id=?').get(id)?.n || 0,
+        files: db.prepare('SELECT COUNT(*) AS n FROM workspace_files WHERE workspace_id=?').get(id)?.n || 0,
+        memories: db.prepare('SELECT COUNT(*) AS n FROM memories WHERE workspace_id=?').get(id)?.n || 0
+      };
+      if (counts.sessions === 0 && counts.files === 0 && counts.memories === 0) db.prepare('DELETE FROM workspaces WHERE id=?').run(id);
+    }
+    db.prepare(`DELETE FROM provider_links WHERE provider='notebooklm'`).run();
+    db.prepare(`INSERT OR REPLACE INTO settings (key,value) VALUES ('simple_ui_cleanup_v1','done')`).run();
+  }
+
+db.prepare(`INSERT OR IGNORE INTO settings (key, value) VALUES ('theme', 'system')`).run();
   const activeSetting = db.prepare(`SELECT value FROM settings WHERE key='active_workspace_id'`).get();
-  if (!activeSetting || activeSetting.value === 'ws-course') {
+  if (!activeSetting || ['ws-course','ws-dev'].includes(activeSetting.value)) {
     db.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES ('active_workspace_id', 'ws-harness')`).run();
   }
-  db.prepare(`INSERT OR IGNORE INTO settings (key, value) VALUES ('learning_policy', 'active_reasoning')`).run();
 
   for (const session of db.prepare(`SELECT s.id,s.display_label,w.name AS workspace_name FROM sessions s JOIN workspaces w ON w.id=s.workspace_id WHERE s.display_label=''`).all()) {
     const short = String(session.id).replace(/^session-/, '').slice(0, 8);

@@ -9,9 +9,11 @@ import { archiveFile } from '../src/archive.mjs';
 test('database migrates and seeds core prototype data', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aih-'));
   const db = openDatabase(path.join(dir, 'test.db'));
-  assert.equal(row(db, 'SELECT COUNT(*) AS n FROM workspaces').n, 3);
+  assert.equal(row(db, 'SELECT COUNT(*) AS n FROM workspaces').n, 1);
   assert.ok(row(db, `SELECT value FROM settings WHERE key = 'active_workspace_id'`).value);
-  assert.ok(rows(db, `SELECT * FROM provider_links WHERE provider = 'notebooklm'`).length >= 1);
+  assert.equal(rows(db, `SELECT * FROM provider_links WHERE provider = 'notebooklm'`).length, 0);
+  const harnessRoot = ensureWorkspaceProjectRoot(db, 'ws-harness');
+  assert.equal(fs.existsSync(path.join(harnessRoot, 'AI_HARNESS_PROJECT.md')), true);
   db.close();
 });
 
@@ -20,10 +22,10 @@ test('provider-neutral memories can be added independently of sessions', () => {
   const db = openDatabase(path.join(dir, 'test.db'));
   const ts = new Date().toISOString();
   run(db, `INSERT INTO memories (id,workspace_id,scope,category,content,confidence,source_type,source_ref,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-    'test-memory', 'ws-course', 'workspace', 'misconception', 'Confuses phase shift sign convention.', 0.9, 'session_extract', 'session-x', 'active', ts, ts);
+    'test-memory', 'ws-harness', 'workspace', 'misconception', 'Confuses phase shift sign convention.', 0.9, 'session_extract', 'session-x', 'active', ts, ts);
   const memory = row(db, 'SELECT * FROM memories WHERE id = ?', 'test-memory');
   assert.equal(memory.category, 'misconception');
-  assert.equal(memory.workspace_id, 'ws-course');
+  assert.equal(memory.workspace_id, 'ws-harness');
   db.close();
 });
 
@@ -93,13 +95,13 @@ test('project resources are vaulted and associated with the workspace independen
   const db = openDatabase(path.join(dir, 'test.db'));
   const artifact = archiveFile(db, {
     filePath: source,
-    workspaceId: 'ws-course',
+    workspaceId: 'ws-harness',
     provider: 'local',
     artifactType: 'file',
     sourcePathOverride: `test-project-space:${dir}`,
     metadata: { added_via: 'project_space' }
   });
-  assert.equal(artifact.workspace_id, 'ws-course');
+  assert.equal(artifact.workspace_id, 'ws-harness');
   assert.equal(artifact.session_id, null);
   assert.ok(fs.existsSync(artifact.vault_path));
   assert.equal(fs.readFileSync(artifact.vault_path, 'utf8'), 'timing analysis notes');
@@ -118,7 +120,7 @@ test('persistent workspace storage stays outside application code and owns proje
   assert.ok(fs.existsSync(storage.projectsDir));
   assert.ok(fs.existsSync(storage.archiveDir));
   assert.ok(fs.existsSync(storage.backupsDir));
-  const projectRoot = ensureWorkspaceProjectRoot(db, 'ws-course');
+  const projectRoot = ensureWorkspaceProjectRoot(db, 'ws-harness');
   assert.ok(path.resolve(projectRoot).startsWith(path.resolve(storage.projectsDir)));
   db.close();
   fs.rmSync(dir, { recursive: true, force: true });

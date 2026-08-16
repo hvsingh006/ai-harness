@@ -42,7 +42,7 @@ Chrome: `chrome://extensions`
 
 Edge: `edge://extensions`
 
-Enable Developer mode, choose **Load unpacked**, and select the application's `extension` folder. Refresh ChatGPT, Gemini, or NotebookLM.
+Enable Developer mode, choose **Load unpacked**, and select the application's `extension` folder. Refresh ChatGPT or Gemini.
 
 A bright red **Harness ready** dot means the local service and browser companion can see one another. It does not mean every individual chat is safe to delete.
 

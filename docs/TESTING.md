@@ -10,7 +10,7 @@ This milestone is for validating the core continuity workflow. Do not judge `saf
 4. Open Chrome or Edge extensions.
 5. Enable Developer mode.
 6. Load the repository's `extension/` folder as an unpacked extension.
-7. Refresh ChatGPT, Gemini, and/or NotebookLM.
+7. Refresh ChatGPT and/or Gemini.
 8. Open the Harness **Setup & Test** screen. A bright red **Harness ready** dot means the local service and companion are connected.
 
 ## Test A: verify update-safe storage
@@ -76,7 +76,6 @@ Pass condition: starting a new native conversation does not require reconstructi
 - perfect capture of lazy-loaded very long conversations
 - every authenticated provider attachment
 - automatic context insertion with zero clicks
-- complete NotebookLM notebook-source inventory
 - semantic chapter/jump navigation
 
 These are the next reliability targets after the first real-world smoke test.

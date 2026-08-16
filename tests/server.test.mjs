@@ -34,7 +34,7 @@ test('server supports first-run project and native continuity smoke flow', async
   const healthResponse = await waitFor(`${base}/health`);
   const health = await healthResponse.json();
   assert.equal(health.ok, true);
-  assert.equal(health.version, '0.6.0');
+  assert.equal(health.version, '0.6.2');
   assert.equal(path.resolve(health.storage.workspace_root), path.resolve(dir));
   assert.ok(health.storage.database_path.endsWith('test.db'));
 
@@ -46,7 +46,7 @@ test('server supports first-run project and native continuity smoke flow', async
   assert.equal(createResponse.status, 201);
   const workspace = await createResponse.json();
   assert.equal(workspace.name, 'Smoke project');
-  assert.deepEqual(new Set(workspace.providers.map(item => item.provider)), new Set(['chatgpt', 'gemini', 'notebooklm']));
+  assert.deepEqual(new Set(workspace.providers.map(item => item.provider)), new Set(['chatgpt', 'gemini']));
   assert.ok(workspace.root_path);
   assert.ok(path.resolve(workspace.root_path).startsWith(path.resolve(dir)));
 

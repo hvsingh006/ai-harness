@@ -18,7 +18,7 @@ async function api(path, options = {}) {
 }
 
 function providerName(provider) {
-  return ({ chatgpt: 'ChatGPT', gemini: 'Gemini', notebooklm: 'NotebookLM' })[provider] || provider;
+  return ({ chatgpt: 'ChatGPT', gemini: 'Gemini' })[provider] || provider;
 }
 
 function applyTheme(theme) {
@@ -73,8 +73,8 @@ function renderWorkspaceSelect() {
 
 function providerButtons() {
   const links = active?.providers || [];
-  const preferred = ['chatgpt', 'gemini', 'notebooklm'];
-  const sorted = [...links].sort((a,b) => preferred.indexOf(a.provider) - preferred.indexOf(b.provider));
+  const preferred = ['chatgpt', 'gemini'];
+  const sorted = links.filter(link => preferred.includes(link.provider)).sort((a,b) => preferred.indexOf(a.provider) - preferred.indexOf(b.provider));
   const buttons = sorted.map(link => `
     <button class="provider-button" data-open="${esc(link.url)}">
       <span>${esc(providerName(link.provider))}</span><span>Open native service ↗</span>
@@ -121,16 +121,15 @@ function renderProjectResources() {
 
 function renderWorkspace() {
   const archive = active.archive || {};
-  const openTasks = (active.tasks || []).filter(t => t.status === 'open');
   const recent = (active.sessions || []).slice(0, 6);
   return `
     <div class="hero">
       <div class="card">
-        <div class="eyebrow">${esc(active.kind.toUpperCase())} WORKSPACE</div>
+        <div class="eyebrow">PROJECT SPACE</div>
         <h2>${esc(active.name)}</h2>
         <p class="lede">${esc(active.description)}</p>
         <div class="focus"><strong>CURRENT WORKING STATE</strong>${esc(active.active_focus || 'No active focus yet.')}</div>
-        <div class="principle"><strong>Collaboration principle</strong><span>Use AI to increase output and understanding, not to remove the reasoning you should be practicing.</span></div>
+        <div class="principle"><strong>Purpose</strong><span>Keep your project context, files, and chat history available when you start a new chat or switch between ChatGPT and Gemini. Use AI to improve productivity and understanding without replacing your judgment.</span></div>
       </div>
       <div class="card">
         <div class="section-title"><h3>Native AI surfaces</h3><span class="badge">same workspace</span></div>
@@ -144,120 +143,39 @@ function renderWorkspace() {
       ${metric('sessions retained', archive.sessions || 0)}
       ${metric('safe to delete', archive.safe_sessions || 0, `${archive.incomplete_sessions || 0} incomplete`)}
     </div>
-    <div class="two-col">
-      <div class="card">
-        <div class="section-title"><h3>Next actions</h3><span class="badge">working state</span></div>
-        <div class="list">${openTasks.slice(0, 7).map(t => `
-          <div class="list-row"><div><div class="list-title">${esc(t.title)}</div><div class="list-sub">${esc(t.details)}</div></div><span class="badge">P${esc(t.priority)}</span></div>`).join('') || '<div class="empty">No open next actions.</div>'}</div>
-      </div>
-      <div class="card">
-        <div class="section-title"><h3>Recent native sessions</h3><span class="badge">disposable surfaces</span></div>
-        <div class="list">${recent.map(s => `
-          <div class="list-row"><div><div class="list-title">${esc(s.title)}</div><div class="list-sub">${esc(providerName(s.provider))} · ${esc(s.message_count)} messages<br>${esc(s.summary || 'Raw session retained; derived summary not yet available.')}</div></div>${statusBadge(s.capture_status)}</div>`).join('') || '<div class="empty">No captured sessions yet.</div>'}</div>
-      </div>
-    </div>`;
-}
-
-function renderLearning() {
-  return `
-    <div class="card" style="margin-bottom:18px">
-      <div class="eyebrow">ACTIVE LEARNING</div>
-      <h2>Continuity should improve understanding, not automate it away</h2>
-      <p class="lede">The workspace carries course sources, prior attempts, misconceptions, mastery evidence, and unfinished questions into ChatGPT, Gemini, NotebookLM, or a future provider. The default handoff asks native AIs to favor recall, hints, questions, and explanation checks before full solutions when the goal is learning.</p>
-    </div>
-    <div class="two-col">
-      <div class="card">
-        <div class="section-title"><h3>Knowledge state</h3><span class="badge">evidence over confidence</span></div>
-        <div class="list">${(active.learning || []).map(item => `
-          <div class="list-row"><div><div class="list-title">${esc(item.title)}</div><div class="list-sub">${esc(item.details)}${item.attempt_count ? `<br>${esc(item.attempt_count)} recorded attempts` : ''}</div><div class="progress"><span style="width:${Math.round(Number(item.mastery || 0)*100)}%"></span></div></div><span class="badge">${Math.round(Number(item.mastery || 0)*100)}%</span></div>`).join('') || '<div class="empty">No learning evidence yet. This is expected in the harness-development workspace.</div>'}</div>
-      </div>
-      <div class="card">
-        <h3>Learning loop</h3>
-        <ol class="flow-list">
-          <li><strong>Attempt</strong><span>You first retrieve, derive, predict, or implement.</span></li>
-          <li><strong>Feedback</strong><span>The AI checks reasoning and points to gaps.</span></li>
-          <li><strong>Repair</strong><span>Use hints, sources, or a targeted explanation.</span></li>
-          <li><strong>Verify</strong><span>Explain or solve a fresh case without the answer in view.</span></li>
-          <li><strong>Carry forward</strong><span>The next AI knows what you actually demonstrated.</span></li>
-        </ol>
-      </div>
-    </div>`;
-}
-
-function renderDevelopment() {
-  return `
-    <div class="card" style="margin-bottom:18px">
-      <div class="eyebrow">DEVELOPMENT CONTINUITY</div>
-      <h2>Repository state and reasoning survive model changes</h2>
-      <p class="lede">The harness archives the implementation record and maintains a compact current state: objective, requirements, architecture, relevant files, experiments, failures, technical decisions, blockers, and next actions.</p>
-    </div>
-    <div class="two-col">
-      <div class="card"><div class="section-title"><h3>Project state</h3><span class="badge">provider neutral</span></div><div class="list">${(active.development || []).map(item => `<div class="list-row"><div><div class="list-title">${esc(item.title)}</div><div class="list-sub">${esc(item.details)}</div></div>${statusBadge(item.status)}</div>`).join('') || '<div class="empty">No development state recorded in this workspace yet.</div>'}</div></div>
-      <div class="card"><h3>Critical-thinking boundary</h3><div class="callout" style="margin-top:12px">Models can implement, debug, research, and compare approaches. Product requirements, important architectural tradeoffs, and uncertain assumptions stay visible and attributable so you can evaluate them rather than inheriting opaque AI decisions.</div></div>
-    </div>
-    <div class="card" style="margin-top:18px">
-      <div class="section-title"><div><div class="eyebrow">FUTURE CODING TOOLS</div><h3>Attach agents to the same project state</h3></div><span class="badge">planned adapter</span></div>
-      <p class="lede">Codex and other coding agents should receive repository identity, branch/commit state, requirements, relevant project resources, prior technical decisions, and current blockers. Their task IDs, patches, commits, tests, and pull requests then return to the Harness as traceable project evidence.</p>
+    <div class="card">
+      <div class="section-title"><h3>Recent chats</h3><span class="badge">same project context</span></div>
+      <div class="list">${recent.map(s => `
+        <div class="list-row"><div><div class="list-title">${esc(s.title)}</div><div class="list-sub">${esc(providerName(s.provider))} · ${esc(s.message_count)} messages<br>${esc(s.summary || 'Chat retained in this project.')}</div></div>${statusBadge(s.capture_status)}</div>`).join('') || '<div class="empty">No captured chats yet. Open ChatGPT or Gemini from this project to start.</div>'}</div>
     </div>`;
 }
 
 function renderSessions() {
-  return `
-    <div class="card">
-      <div class="section-title"><div><div class="eyebrow">SESSION ARCHIVE</div><h2>Native chats are replaceable</h2></div><span class="badge">${esc((active.sessions || []).length)} sessions</span></div>
-      <div class="list">${(active.sessions || []).map(s => `
-        <div class="list-row session-row" data-session="${esc(s.id)}"><div><div class="list-title">${esc(s.display_label || s.title)}</div><div class="list-sub">${esc(s.title)}<br>${esc(providerName(s.provider))} · ${esc(s.message_count)} messages · ${esc(s.started_at || '')}<br>raw ${s.raw_complete ? '✓' : '…'} · attachments ${s.attachments_complete ? '✓' : '…'} · derived state ${s.derived_complete ? '✓' : '…'}</div><div class="session-actions">${s.native_url ? `<button class="tiny-button" data-open="${esc(s.native_url)}">Open native chat ↗</button>` : ''}<button class="tiny-button" data-session-context="${esc(s.id)}">Copy chat context</button></div></div>${statusBadge(s.capture_status)}</div>`).join('') || '<div class="empty">No sessions captured.</div>'}</div>
-    </div>`;
-}
-
-function renderArchive() {
   const a = active.archive || {};
   return `
     <div class="card" style="margin-bottom:18px">
-      <div class="eyebrow">LOSSLESS ARCHIVE</div>
-      <h2>Originals are preserved before anything is summarized</h2>
-      <p class="lede">The vault stores exact provider exports and copied artifacts by SHA-256. Parsed messages, summaries, learning state, and decisions are derivative indexes. A parser can be rebuilt without losing the underlying source.</p>
-    </div>
-    <div class="metric-grid">
-      ${metric('messages', a.messages || 0)}
-      ${metric('artifacts', a.artifacts || 0)}
-      ${metric('vault size', bytes(a.artifact_bytes || 0))}
-      ${metric('imports', a.imports || 0)}
+      <div class="section-title"><div><div class="eyebrow">CHAT HISTORY</div><h2>All chats for ${esc(active.name)}</h2></div><span class="badge">${esc((active.sessions || []).length)} chats</span></div>
+      <p class="lede">ChatGPT and Gemini conversations stay attached to this Project Space. Reopen an old native chat, search prior messages, or bring an archived chat back into a new prompt.</p>
+      <div class="list">${(active.sessions || []).map(s => `
+        <div class="list-row session-row" data-session="${esc(s.id)}"><div><div class="list-title">${esc(s.display_label || s.title)}</div><div class="list-sub">${esc(providerName(s.provider))} · ${esc(s.message_count)} messages · ${esc(s.started_at || '')}<br>${esc(s.title)}</div><div class="session-actions">${s.native_url ? `<button class="tiny-button" data-open="${esc(s.native_url)}">Open chat ↗</button>` : ''}<button class="tiny-button" data-session-context="${esc(s.id)}">Bring into prompt</button></div></div>${statusBadge(s.capture_status)}</div>`).join('') || '<div class="empty">No chats captured yet.</div>'}</div>
     </div>
     <div class="two-col">
       <div class="card">
-        <div class="section-title"><h3>Historical imports</h3><span class="badge">raw first</span></div>
+        <div class="section-title"><h3>Search history</h3><span class="badge">${esc(a.messages || 0)} messages</span></div>
+        <form id="searchForm" class="search-form"><input id="searchInput" placeholder="Search prior ChatGPT and Gemini chats…" autocomplete="off"><button class="primary">Search</button></form>
+        <div id="searchResults" class="list"><div class="empty">Search the retained raw chat history for this project.</div></div>
+      </div>
+      <div class="card">
+        <div class="section-title"><h3>Import older chats</h3><span class="badge">optional</span></div>
         <div class="import-box">
           <div class="import-controls">
-            <select id="importProvider"><option value="chatgpt">ChatGPT export</option><option value="gemini">Gemini / Google export</option><option value="notebooklm">NotebookLM export</option><option value="generic">Other provider</option></select>
+            <select id="importProvider"><option value="chatgpt">ChatGPT export</option><option value="gemini">Gemini / Google export</option></select>
             <label class="file-picker">Choose extracted export folder<input id="importFolder" type="file" webkitdirectory directory multiple></label>
           </div>
-          <div id="importProgress" class="list-sub">Select the folder you extracted from the provider's export ZIP. The harness copies every file into the vault before parsing.</div>
+          <div id="importProgress" class="list-sub">Use this only when you want to bring older ChatGPT or Gemini history into the project.</div>
         </div>
-        <div class="list">${(active.imports || []).map(i => `<div class="list-row"><div><div class="list-title">${esc(providerName(i.provider))} · ${esc(i.import_type)}</div><div class="list-sub">${esc(i.raw_file_count)} raw files · ${esc(i.parsed_message_count)} parsed messages · ${esc(i.artifact_count)} artifacts<br>${esc(i.source_path)}</div></div>${statusBadge(i.status)}</div>`).join('') || '<div class="empty">No provider exports imported yet.</div>'}</div>
-      </div>
-      <div class="card">
-        <div class="section-title"><h3>Search the complete archive</h3><span class="badge">not summaries</span></div>
-        <form id="searchForm" class="search-form"><input id="searchInput" placeholder="Search exact prior discussions…" autocomplete="off"><button class="primary">Search</button></form>
-        <div id="searchResults" class="list"><div class="empty">Search archived raw messages across providers.</div></div>
       </div>
     </div>`;
-}
-
-function renderKnowledge() {
-  return `
-    <div class="two-col">
-      <div class="card"><div class="section-title"><h3>Durable context</h3><span class="badge">derived + sourced</span></div><div class="list">${(active.memories || []).map(m => `<div class="list-row"><div><div class="list-title">${esc(m.category.replaceAll('_',' '))}</div><div class="list-sub">${esc(m.content)}<br>source: ${esc(m.source_ref || m.source_type)}</div></div><span class="badge">${esc(m.scope)}</span></div>`).join('') || '<div class="empty">No durable memory.</div>'}</div></div>
-      <div class="card"><div class="section-title"><h3>Decisions</h3><span class="badge">reasoning retained</span></div><div class="list">${(active.decisions || []).map(d => `<div class="list-row"><div><div class="list-title">${esc(d.title)}</div><div class="list-sub">${esc(d.decision)}<br>${esc(d.rationale)}</div></div></div>`).join('') || '<div class="empty">No formal decisions recorded yet.</div>'}</div></div>
-    </div>`;
-}
-
-function renderIntegrations() {
-  return `<div class="card" style="margin-bottom:18px"><div class="eyebrow">RESOURCE POLICY</div><h2>Use the evidence, not just the summary</h2><p class="lede">Fresh AI sessions are instructed to use relevant user prompts, prior model responses, full archive search, files, PDFs, images, notebook sources, native tools, and current web research. If the corpus is too large, context is retrieved progressively while the complete archive remains intact.</p></div><div class="integrations">
-    <div class="card integration-card"><h3>ChatGPT</h3><div class="status">Native surface</div><p>Use the real ChatGPT interface and features. The companion handles workspace context and capture. Historical exports can seed the archive.</p><a href="https://chatgpt.com/" target="_blank">Open ChatGPT ↗</a></div>
-    <div class="card integration-card"><h3>Gemini</h3><div class="status">Native surface</div><p>Use Gemini chats, notebooks, learning and research features while keeping the canonical archive provider-neutral.</p><a href="https://gemini.google.com/" target="_blank">Open Gemini ↗</a></div>
-    <div class="card integration-card"><h3>NotebookLM</h3><div class="status">Native learning surface</div><p>Notebook sources and notebook context stay useful natively while the harness records source inventories and cross-provider learning state.</p><a href="https://notebooklm.google.com/" target="_blank">Open NotebookLM ↗</a></div>
-  </div>`;
 }
 
 function renderSetup() {
@@ -288,7 +206,7 @@ function renderSetup() {
           <li>Create a Project Space with <strong>New project</strong>.</li>
           <li>Drag a small PDF or image into Project Space and confirm it appears under resources.</li>
           <li>Open ChatGPT or Gemini, confirm the red AIH label appears, and send a short two-message exchange.</li>
-          <li>Return here and confirm the session appears under <strong>Sessions</strong>.</li>
+          <li>Return here and confirm the chat appears under <strong>Chat History</strong>.</li>
           <li>Start a fresh chat in the other AI service and use <strong>Insert workspace context</strong> in the companion.</li>
           <li>Ask the second AI to identify the workspace objective/resource list. It should continue without you restating them.</li>
           <li>Do not delete either native chat yet unless its session status explicitly says <strong>safe to delete</strong>.</li>
@@ -297,14 +215,14 @@ function renderSetup() {
     </div>
     <div class="card" style="margin-top:18px">
       <div class="section-title"><h3>Browser companion installation</h3><span class="badge">Chrome / Edge</span></div>
-      <div class="callout">Open the browser extensions page, enable Developer mode, choose <strong>Load unpacked</strong>, and select this repository's <code>extension</code> folder. After any extension update, press Reload on the extension and refresh ChatGPT/Gemini/NotebookLM.</div>
+      <div class="callout">Open the browser extensions page, enable Developer mode, choose <strong>Load unpacked</strong>, and select this repository's <code>extension</code> folder. After any extension update, press Reload on the extension and refresh ChatGPT/Gemini.</div>
       <p class="lede">Windows shortcut: double-click <code>start-harness.cmd</code> to start the service and open this dashboard. Application code may be updated independently; persistent projects, archive, and the database live under <code>${esc(storage.workspace_root || 'Documents\\AI Harness')}</code>. Run <code>npm run doctor</code> if something is not connecting.</p>
     </div>`;
 }
 
 function render() {
   if (!active) return;
-  const views = { workspace: renderWorkspace, learning: renderLearning, development: renderDevelopment, sessions: renderSessions, archive: renderArchive, knowledge: renderKnowledge, integrations: renderIntegrations, setup: renderSetup };
+  const views = { workspace: renderWorkspace, history: renderSessions, setup: renderSetup };
   qs('#view').innerHTML = (views[currentView] || renderWorkspace)();
   wireDynamicButtons();
 }
@@ -410,7 +328,7 @@ function wireDynamicButtons() {
   });
   qs('#importFolder')?.addEventListener('change', async e => {
     const input = e.currentTarget;
-    const provider = qs('#importProvider')?.value || 'generic';
+    const provider = qs('#importProvider')?.value || 'chatgpt';
     const progress = qs('#importProgress');
     try {
       await uploadImportFolder(input.files, provider);
@@ -480,7 +398,6 @@ qs('#freshButton').addEventListener('click', async () => {
 
 qs('#newWorkspaceButton').addEventListener('click', () => {
   qs('#workspaceName').value = '';
-  qs('#workspaceKind').value = 'mixed';
   qs('#workspaceFocus').value = '';
   qs('#workspaceDialog').showModal();
   setTimeout(() => qs('#workspaceName').focus(), 30);
@@ -492,7 +409,7 @@ qs('#workspaceForm').addEventListener('submit', async e => {
   const name = qs('#workspaceName').value.trim();
   if (!name) return;
   const created = await api('/workspaces', { method: 'POST', body: JSON.stringify({
-    name, kind: qs('#workspaceKind').value, active_focus: qs('#workspaceFocus').value.trim()
+    name, kind: 'general', active_focus: qs('#workspaceFocus').value.trim()
   }) });
   workspaces = await api('/workspaces');
   active = await api('/active-workspace', { method: 'PUT', body: JSON.stringify({ workspace_id: created.id }) });
