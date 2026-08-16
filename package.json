@@ -1,9 +1,9 @@
 {
   "name": "ai-harness",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "private": true,
   "type": "module",
-  "description": "Provider-neutral continuity, archive, learning, and development layer for native AI services.",
+  "description": "Local Project Spaces that retain files and ChatGPT/Gemini history across chats and services.",
   "scripts": {
     "start": "node src/server.mjs",
     "dev": "node --watch src/server.mjs",

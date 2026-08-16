@@ -20,6 +20,56 @@ const storage = storageForDatabase(db);
 const stagingRoot = path.join(storage.stagingDir, 'imports');
 fs.mkdirSync(stagingRoot, { recursive: true });
 
+function gitOutput(args, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('git', args, { cwd: rootDir, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error('git command timed out'));
+    }, timeoutMs);
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    child.on('error', error => { clearTimeout(timer); reject(error); });
+    child.on('close', code => {
+      clearTimeout(timer);
+      if (code === 0) resolve(stdout.trim());
+      else reject(new Error(stderr.trim() || `git exited with code ${code}`));
+    });
+  });
+}
+
+async function applicationUpdateStatus() {
+  if (!fs.existsSync(path.join(rootDir, '.git'))) {
+    return { supported: false, update_available: false, current_version: HARNESS_VERSION, message: 'This installation is not a Git checkout.' };
+  }
+  const currentCommit = await gitOutput(['rev-parse', 'HEAD']);
+  try {
+    await gitOutput(['fetch', '--quiet', 'origin', 'main'], 12000);
+    const remoteCommit = await gitOutput(['rev-parse', 'origin/main']);
+    const counts = (await gitOutput(['rev-list', '--left-right', '--count', `${currentCommit}...${remoteCommit}`])).split(/\s+/).map(Number);
+    let remoteVersion = null;
+    try {
+      const versionSource = await gitOutput(['show', 'origin/main:src/version.mjs']);
+      remoteVersion = versionSource.match(/HARNESS_VERSION\s*=\s*['\"]([^'\"]+)/)?.[1] || null;
+    } catch {}
+    return {
+      supported: true,
+      current_version: HARNESS_VERSION,
+      remote_version: remoteVersion,
+      current_commit: currentCommit,
+      remote_commit: remoteCommit,
+      ahead: counts[0] || 0,
+      behind: counts[1] || 0,
+      update_available: (counts[1] || 0) > 0,
+      message: (counts[1] || 0) > 0 ? 'A newer version is available.' : 'AI Harness is up to date.'
+    };
+  } catch (error) {
+    return { supported: true, update_available: false, current_version: HARNESS_VERSION, current_commit: currentCommit, error: error.message, message: 'Could not check GitHub. The installed version is unchanged.' };
+  }
+}
+
 function safeRelativePath(value) {
   const normalized = String(value || '').replaceAll('\\', '/').replace(/^\/+/, '');
   const parts = normalized.split('/').filter(Boolean);
@@ -355,7 +405,8 @@ function captureBrowserSession(body) {
 async function handleApi(req, res, url) {
   if (req.method === 'OPTIONS') return sendJson(res, 204, {});
 
-  if (url.pathname === '/api/health') return sendJson(res, 200, { ok: true, version: HARNESS_VERSION, database: 'sqlite', storage: storageSummary(db), archive: archiveStats() });
+  if (url.pathname === '/api/health') return sendJson(res, 200, { ok: true, version: HARNESS_VERSION, pid: process.pid, database: 'sqlite', storage: storageSummary(db), archive: archiveStats() });
+  if (url.pathname === '/api/update-status' && req.method === 'GET') return sendJson(res, 200, await applicationUpdateStatus());
   if (url.pathname === '/api/readiness' && req.method === 'GET') return sendJson(res, 200, readiness());
   if (url.pathname === '/api/companion/heartbeat' && req.method === 'POST') {
     const body = await readJson(req);

@@ -134,3 +134,7 @@ Git stores application source, tests, migration logic, and documentation only. P
 - `docs/IMPORTS.md`
 - `docs/TESTING.md`
 - `docs/ROADMAP.md`
+
+## Update and launch
+
+On Windows, use `update-and-launch-harness.cmd` (installed as the **AI Harness** Desktop/Start Menu shortcut). It checks for a newer `main`, backs up data before applying an update, validates the new build, rolls application code back on failure, and launches the Harness. Project Spaces and the archive remain outside the Git checkout.
