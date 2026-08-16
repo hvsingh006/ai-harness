@@ -1,6 +1,6 @@
 # Prototype setup
 
-Normal use is intended to become installer-driven. Prototype 0.3 still uses an unpacked browser extension.
+Normal use is intended to become installer-driven. Prototype 0.5 still uses an unpacked browser extension.
 
 ## Requirements
 
@@ -55,3 +55,22 @@ During prototype development, after the `extension` folder changes:
 3. Refresh the ChatGPT/Gemini/NotebookLM tab.
 
 A packaged installer/update path should replace these steps before a stable release.
+
+
+## Windows quick start
+
+After cloning or downloading the repository, double-click `start-harness.cmd`. It checks that Node.js is available, opens the local dashboard, and starts the Harness service. Keep the command window open while testing.
+
+## Diagnostics
+
+Run:
+
+```bash
+npm run doctor
+```
+
+It checks the Node version, local data/vault write access, SQLite database, running service, and browser-companion heartbeat.
+
+## First test
+
+Follow `docs/TESTING.md`. The first milestone validates Project Space persistence, native ChatGPT capture, a ChatGPT-to-Gemini workspace handoff, and stable chat identity.
