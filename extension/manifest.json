@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "AI Harness Companion",
+  "version": "0.3.0",
+  "description": "Connect native ChatGPT, Gemini, and NotebookLM sessions to a provider-neutral persistent workspace and lossless local archive.",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:4317/*",
+    "https://chatgpt.com/*",
+    "https://gemini.google.com/*",
+    "https://notebooklm.google.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://gemini.google.com/*",
+        "https://notebooklm.google.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "content.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
