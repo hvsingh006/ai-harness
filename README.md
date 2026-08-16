@@ -107,7 +107,7 @@ Git tracks source code, schema, documentation, and tests. Personal conversation 
 
 ## Repository
 
-This working tree is the `ai-harness` project. It preserves the original prototype Git history. The private GitHub remote is `hvsingh006/ai-harness`.
+This working tree is the `ai-harness` project. It preserves the original prototype Git history. The private GitHub repository is `hvsingh006/ai-harness`. Git stores source, tests, and documentation only; personal archive data remains local and ignored.
 
 See:
 
@@ -115,6 +115,7 @@ See:
 - `docs/ARCHITECTURE.md`
 - `docs/ROADMAP.md`
 - `docs/IMPORTS.md`
+- `docs/TESTING.md`
 
 
 ## Resource use
@@ -134,3 +135,8 @@ The current browser companion is an unpacked Chrome/Edge extension. See `docs/IN
 A Harness workspace is also a durable project space. The local UI supports dragging or selecting documents, PDFs, images, datasets, folders, and other working material into the workspace. Originals are stored in the canonical content-addressed vault and remain available independently of any individual ChatGPT, Gemini, NotebookLM, or future coding-agent session.
 
 See `docs/PROJECT_SPACE.md` for the resource model and `docs/CODING_ADAPTERS.md` for the planned provider-neutral coding-tool boundary.
+
+
+## Prototype 0.5 quick test
+
+On Windows, double-click `start-harness.cmd`, load `extension/` as an unpacked Chrome/Edge extension, then open **Setup & Test** in the local dashboard. Follow `docs/TESTING.md` to validate Project Space persistence, native capture, and ChatGPT/Gemini continuity.
