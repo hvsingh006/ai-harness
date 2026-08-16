@@ -1,0 +1,484 @@
+diff --git a/README.md b/README.md
+index 72a4ce5..a6502e6 100644
+--- a/README.md
++++ b/README.md
+@@ -134,3 +134,7 @@ Git stores application source, tests, migration logic, and documentation only. P
+ - `docs/IMPORTS.md`
+ - `docs/TESTING.md`
+ - `docs/ROADMAP.md`
++
++## Update and launch
++
++On Windows, use `update-and-launch-harness.cmd` (installed as the **AI Harness** Desktop/Start Menu shortcut). It checks for a newer `main`, backs up data before applying an update, validates the new build, rolls application code back on failure, and launches the Harness. Project Spaces and the archive remain outside the Git checkout.
+diff --git a/docs/INSTALL.md b/docs/INSTALL.md
+index b03082b..9622d1d 100644
+--- a/docs/INSTALL.md
++++ b/docs/INSTALL.md
+@@ -1,16 +1,20 @@
+-# Prototype 0.6 setup
++# Prototype 0.6.3 setup
+ 
+-Prototype 0.6 separates the application from your permanent AI workspace.
++AI Harness keeps the updateable application separate from your permanent Project Spaces and chat archive.
+ 
+-## Requirements
++## Normal Windows use
+ 
+-- Windows, macOS, or Linux with Node.js 22.5 or newer
+-- Chrome or Microsoft Edge
+-- Git if you want `git pull` updates
++After installation, use the **AI Harness** Desktop or Start Menu shortcut. It runs `update-and-launch-harness.cmd`, which:
+ 
+-No provider API key is required for the current browser-companion workflow.
++1. checks `origin/main` for a newer version;
++2. if an update exists, creates a SQLite backup first;
++3. applies only a clean fast-forward update;
++4. installs required Node dependencies;
++5. runs diagnostics;
++6. rolls the application source back to the prior revision if validation fails;
++7. launches AI Harness.
+ 
+-## Recommended Windows locations
++If GitHub cannot be reached, the Update & Launch wrapper opens the currently installed version instead.
+ 
+ Application checkout:
+ 
+@@ -18,23 +22,13 @@ Application checkout:
+ %LOCALAPPDATA%\AI-Harness\app
+ ```
+ 
+-Persistent data, created automatically:
++Persistent workspace:
+ 
+ ```text
+ %USERPROFILE%\Documents\AI Harness
+ ```
+ 
+-The second location contains Projects, Archive, Backups, and `harness.db`. It is not part of the Git repository.
+-
+-## Start
+-
+-From the application checkout, double-click `start-harness.cmd`, or run:
+-
+-```bash
+-npm start
+-```
+-
+-Open `http://127.0.0.1:4317/`.
++The persistent location contains Projects, Archive, Backups, and `harness.db`. It is not part of the Git repository.
+ 
+ ## Browser companion
+ 
+@@ -46,28 +40,28 @@ Enable Developer mode, choose **Load unpacked**, and select the application's `e
+ 
+ A bright red **Harness ready** dot means the local service and browser companion can see one another. It does not mean every individual chat is safe to delete.
+ 
+-## Update the application
++## Manual controls
+ 
+-If this is a Git checkout, run `update-harness.cmd` or `update-harness.ps1`. It:
++Update without launching:
+ 
+-1. creates a clean SQLite backup under the persistent `Backups` folder;
+-2. runs `git pull --ff-only` on application source;
+-3. runs diagnostics.
++```text
++update-harness.cmd
++```
++
++Launch without checking for updates:
+ 
+-Your project folders and archive are outside the Git checkout and are not replaced by the pull.
++```text
++start-harness.cmd
++```
+ 
+-## Diagnostics
++Diagnostics:
+ 
+ ```bash
+ npm run doctor
+ ```
+ 
+-## Manual backup
++Manual backup:
+ 
+ ```bash
+ npm run backup
+ ```
+-
+-## First test
+-
+-Follow `docs/TESTING.md`.
+diff --git a/extension/manifest.json b/extension/manifest.json
+index 64bbc77..86238ab 100644
+--- a/extension/manifest.json
++++ b/extension/manifest.json
+@@ -1,7 +1,7 @@
+ {
+   "manifest_version": 3,
+   "name": "AI Harness Companion",
+-  "version": "0.6.2",
++  "version": "0.6.3",
+   "description": "Connect native ChatGPT and Gemini sessions to a shared persistent Project Space and lossless local archive.",
+   "permissions": [
+     "storage"
+diff --git a/package.json b/package.json
+index fcb7142..a66f40c 100644
+--- a/package.json
++++ b/package.json
+@@ -1,9 +1,9 @@
+ {
+   "name": "ai-harness",
+-  "version": "0.6.2",
++  "version": "0.6.3",
+   "private": true,
+   "type": "module",
+-  "description": "Provider-neutral continuity, archive, learning, and development layer for native AI services.",
++  "description": "Local Project Spaces that retain files and ChatGPT/Gemini history across chats and services.",
+   "scripts": {
+     "start": "node src/server.mjs",
+     "dev": "node --watch src/server.mjs",
+diff --git a/public/app.js b/public/app.js
+index 9c10c37..fee3b7a 100644
+--- a/public/app.js
++++ b/public/app.js
+@@ -48,6 +48,8 @@ async function load() {
+   readiness = ready;
+   health = serviceHealth;
+   workspaces = ws;
++  const versionLabel = qs('#versionLabel');
++  if (versionLabel) versionLabel.textContent = `Version ${health?.version || 'unknown'}`;
+   qs('#themeSelect').value = settings.theme || 'system';
+   applyTheme(settings.theme || 'system');
+   active = await api('/active-workspace');
+@@ -213,10 +215,14 @@ function renderSetup() {
+         </ol>
+       </div>
+     </div>
++    <div class="card" style="margin-top:18px">
++      <div class="section-title"><div><div class="eyebrow">APPLICATION</div><h3>Version ${esc(health?.version || 'unknown')}</h3></div><button class="secondary" id="checkUpdatesButton">Check for updates</button></div>
++      <div id="updateStatusText" class="callout">Use the <strong>AI Harness</strong> desktop or Start Menu shortcut to check for an update and launch in one action. If GitHub is unavailable, it launches the currently installed version.</div>
++    </div>
+     <div class="card" style="margin-top:18px">
+       <div class="section-title"><h3>Browser companion installation</h3><span class="badge">Chrome / Edge</span></div>
+-      <div class="callout">Open the browser extensions page, enable Developer mode, choose <strong>Load unpacked</strong>, and select this repository's <code>extension</code> folder. After any extension update, press Reload on the extension and refresh ChatGPT/Gemini.</div>
+-      <p class="lede">Windows shortcut: double-click <code>start-harness.cmd</code> to start the service and open this dashboard. Application code may be updated independently; persistent projects, archive, and the database live under <code>${esc(storage.workspace_root || 'Documents\\AI Harness')}</code>. Run <code>npm run doctor</code> if something is not connecting.</p>
++      <div class="callout">Open the browser extensions page, enable Developer mode, choose <strong>Load unpacked</strong>, and select this repository's <code>extension</code> folder. After an extension update, press Reload on the extension and refresh ChatGPT/Gemini.</div>
++      <p class="lede">Persistent projects, archive, and the database live under <code>${esc(storage.workspace_root || 'Documents\\AI Harness')}</code>, outside the updateable application checkout.</p>
+     </div>`;
+ }
+ 
+@@ -271,6 +277,29 @@ async function uploadProjectFiles(files) {
+ }
+ 
+ function wireDynamicButtons() {
++  qs('#checkUpdatesButton')?.addEventListener('click', async e => {
++    const button = e.currentTarget;
++    const status = qs('#updateStatusText');
++    const original = button.textContent;
++    button.disabled = true;
++    button.textContent = 'Checking…';
++    if (status) status.textContent = 'Checking GitHub for origin/main…';
++    try {
++      const result = await api('/update-status');
++      if (result.error) {
++        if (status) status.textContent = `${result.message} ${result.error}`;
++      } else if (result.update_available) {
++        if (status) status.innerHTML = `Update available: <strong>v${esc(result.remote_version || 'newer')}</strong>. Close Harness and use the <strong>AI Harness</strong> desktop/Start Menu shortcut to update and relaunch safely.`;
++      } else {
++        if (status) status.innerHTML = `<strong>${esc(result.message || 'AI Harness is up to date.')}</strong> Installed v${esc(result.current_version || health?.version || 'unknown')}.`;
++      }
++    } catch (error) {
++      if (status) status.textContent = `Update check failed: ${error.message}`;
++    } finally {
++      button.disabled = false;
++      button.textContent = original;
++    }
++  });
+   const dropZone = qs('#projectDropZone');
+   const stopDrop = e => { e.preventDefault(); e.stopPropagation(); };
+   if (dropZone) {
+diff --git a/public/index.html b/public/index.html
+index e6b9885..f9d6a79 100644
+--- a/public/index.html
++++ b/public/index.html
+@@ -24,6 +24,7 @@
+       </nav>
+ 
+       <div class="sidebar-footer">
++        <div class="version-label" id="versionLabel">Version …</div>
+         <label for="themeSelect">Appearance</label>
+         <select id="themeSelect">
+           <option value="system">System</option>
+diff --git a/public/styles.css b/public/styles.css
+index db0b87d..75ba335 100644
+--- a/public/styles.css
++++ b/public/styles.css
+@@ -183,3 +183,5 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
+   background: var(--surface-2);
+   border: 1px solid var(--border);
+ }
++
++.version-label { font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+diff --git a/src/server.mjs b/src/server.mjs
+index 59da822..20815df 100644
+--- a/src/server.mjs
++++ b/src/server.mjs
+@@ -20,6 +20,56 @@ const storage = storageForDatabase(db);
+ const stagingRoot = path.join(storage.stagingDir, 'imports');
+ fs.mkdirSync(stagingRoot, { recursive: true });
+ 
++function gitOutput(args, timeoutMs = 8000) {
++  return new Promise((resolve, reject) => {
++    const child = spawn('git', args, { cwd: rootDir, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
++    let stdout = '';
++    let stderr = '';
++    const timer = setTimeout(() => {
++      child.kill();
++      reject(new Error('git command timed out'));
++    }, timeoutMs);
++    child.stdout.on('data', chunk => { stdout += chunk; });
++    child.stderr.on('data', chunk => { stderr += chunk; });
++    child.on('error', error => { clearTimeout(timer); reject(error); });
++    child.on('close', code => {
++      clearTimeout(timer);
++      if (code === 0) resolve(stdout.trim());
++      else reject(new Error(stderr.trim() || `git exited with code ${code}`));
++    });
++  });
++}
++
++async function applicationUpdateStatus() {
++  if (!fs.existsSync(path.join(rootDir, '.git'))) {
++    return { supported: false, update_available: false, current_version: HARNESS_VERSION, message: 'This installation is not a Git checkout.' };
++  }
++  const currentCommit = await gitOutput(['rev-parse', 'HEAD']);
++  try {
++    await gitOutput(['fetch', '--quiet', 'origin', 'main'], 12000);
++    const remoteCommit = await gitOutput(['rev-parse', 'origin/main']);
++    const counts = (await gitOutput(['rev-list', '--left-right', '--count', `${currentCommit}...${remoteCommit}`])).split(/\s+/).map(Number);
++    let remoteVersion = null;
++    try {
++      const versionSource = await gitOutput(['show', 'origin/main:src/version.mjs']);
++      remoteVersion = versionSource.match(/HARNESS_VERSION\s*=\s*['\"]([^'\"]+)/)?.[1] || null;
++    } catch {}
++    return {
++      supported: true,
++      current_version: HARNESS_VERSION,
++      remote_version: remoteVersion,
++      current_commit: currentCommit,
++      remote_commit: remoteCommit,
++      ahead: counts[0] || 0,
++      behind: counts[1] || 0,
++      update_available: (counts[1] || 0) > 0,
++      message: (counts[1] || 0) > 0 ? 'A newer version is available.' : 'AI Harness is up to date.'
++    };
++  } catch (error) {
++    return { supported: true, update_available: false, current_version: HARNESS_VERSION, current_commit: currentCommit, error: error.message, message: 'Could not check GitHub. The installed version is unchanged.' };
++  }
++}
++
+ function safeRelativePath(value) {
+   const normalized = String(value || '').replaceAll('\\', '/').replace(/^\/+/, '');
+   const parts = normalized.split('/').filter(Boolean);
+@@ -355,7 +405,8 @@ function captureBrowserSession(body) {
+ async function handleApi(req, res, url) {
+   if (req.method === 'OPTIONS') return sendJson(res, 204, {});
+ 
+-  if (url.pathname === '/api/health') return sendJson(res, 200, { ok: true, version: HARNESS_VERSION, database: 'sqlite', storage: storageSummary(db), archive: archiveStats() });
++  if (url.pathname === '/api/health') return sendJson(res, 200, { ok: true, version: HARNESS_VERSION, pid: process.pid, database: 'sqlite', storage: storageSummary(db), archive: archiveStats() });
++  if (url.pathname === '/api/update-status' && req.method === 'GET') return sendJson(res, 200, await applicationUpdateStatus());
+   if (url.pathname === '/api/readiness' && req.method === 'GET') return sendJson(res, 200, readiness());
+   if (url.pathname === '/api/companion/heartbeat' && req.method === 'POST') {
+     const body = await readJson(req);
+diff --git a/src/version.mjs b/src/version.mjs
+index 92d670b..3468afb 100644
+--- a/src/version.mjs
++++ b/src/version.mjs
+@@ -1 +1 @@
+-export const HARNESS_VERSION = '0.6.2';
++export const HARNESS_VERSION = '0.6.3';
+diff --git a/tests/server.test.mjs b/tests/server.test.mjs
+index 9cc87d7..c6a2b8d 100644
+--- a/tests/server.test.mjs
++++ b/tests/server.test.mjs
+@@ -34,7 +34,7 @@ test('server supports first-run project and native continuity smoke flow', async
+   const healthResponse = await waitFor(`${base}/health`);
+   const health = await healthResponse.json();
+   assert.equal(health.ok, true);
+-  assert.equal(health.version, '0.6.2');
++  assert.equal(health.version, '0.6.3');
+   assert.equal(path.resolve(health.storage.workspace_root), path.resolve(dir));
+   assert.ok(health.storage.database_path.endsWith('test.db'));
+ 
+diff --git a/update-harness.ps1 b/update-harness.ps1
+index cf7c065..5c7c930 100644
+--- a/update-harness.ps1
++++ b/update-harness.ps1
+@@ -1,29 +1,96 @@
+ $ErrorActionPreference = 'Stop'
+ Set-Location $PSScriptRoot
+ 
+-if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+-  Write-Host 'Git is required for one-click source updates.' -ForegroundColor Red
+-  Write-Host 'Install Git for Windows, or update the application from a downloaded release.'
+-  exit 1
++function Write-Step($text) {
++  Write-Host ""
++  Write-Host "==> $text" -ForegroundColor Cyan
+ }
++
++function Require-Command($name, $message) {
++  if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
++    throw $message
++  }
++}
++
++function Install-Dependencies {
++  if (Test-Path 'package-lock.json') {
++    npm ci --no-audit --no-fund
++  } else {
++    npm install --no-audit --no-fund
++  }
++  if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
++}
++
++function Run-Doctor {
++  node .\scripts\doctor.mjs
++  if ($LASTEXITCODE -ne 0) { throw 'AI Harness diagnostics failed.' }
++}
++
++Require-Command 'git' 'Git is required for one-click source updates.'
++Require-Command 'node' 'AI Harness needs Node.js 22.5 or newer.'
+ if (-not (Test-Path '.git')) {
+-  Write-Host 'This copy is not a Git checkout, so it cannot pull updates.' -ForegroundColor Yellow
+-  Write-Host 'Your project data is already external and safe. Clone the repository once, then use this updater.'
+-  exit 1
++  throw 'This copy is not a Git checkout. Re-run the AI Harness installer once to enable one-click updates.'
+ }
+-if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+-  Write-Host 'AI Harness needs Node.js 22.5 or newer.' -ForegroundColor Red
+-  exit 1
++
++$branch = (git branch --show-current).Trim()
++if ($LASTEXITCODE -ne 0 -or $branch -ne 'main') {
++  throw "The installed application must be on the main branch for automatic updates. Current branch: $branch"
+ }
+ 
+-Write-Host 'Backing up Harness metadata before update...'
++$dirty = @(git status --porcelain)
++if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the application checkout.' }
++if ($dirty.Count -gt 0) {
++  throw 'The application checkout has local source changes. Automatic update stopped rather than overwriting them.'
++}
++
++$oldHead = (git rev-parse HEAD).Trim()
++if ($LASTEXITCODE -ne 0) { throw 'Could not read the current application revision.' }
++
++Write-Step 'Checking GitHub for a newer AI Harness version'
++git fetch --quiet origin main
++if ($LASTEXITCODE -ne 0) { throw 'Could not contact GitHub. Your currently installed version was not changed.' }
++$remoteHead = (git rev-parse origin/main).Trim()
++if ($LASTEXITCODE -ne 0) { throw 'Could not read origin/main after fetching updates.' }
++
++if ($oldHead -eq $remoteHead) {
++  Write-Host 'AI Harness is already up to date.' -ForegroundColor Green
++  exit 0
++}
++
++Write-Step 'Backing up Harness metadata before update'
+ node .\scripts\backup.mjs
++if ($LASTEXITCODE -ne 0) { throw 'Backup failed. Update stopped before changing application code.' }
++
++try {
++  Write-Step 'Applying application update'
++  git merge --ff-only origin/main
++  if ($LASTEXITCODE -ne 0) { throw 'Git could not apply the update as a clean fast-forward.' }
+ 
+-Write-Host 'Pulling application changes...'
+-git pull --ff-only
++  Write-Step 'Preparing dependencies'
++  Install-Dependencies
+ 
+-Write-Host 'Running installation checks...'
+-node .\scripts\doctor.mjs
++  Write-Step 'Validating updated application'
++  Run-Doctor
+ 
+-Write-Host ''
+-Write-Host 'AI Harness application updated. Your Project folders and archive were not replaced by git pull.' -ForegroundColor Green
++  $newHead = (git rev-parse HEAD).Trim()
++  Write-Host ""
++  Write-Host "AI Harness updated successfully." -ForegroundColor Green
++  Write-Host "Previous revision: $oldHead"
++  Write-Host "Current revision:  $newHead"
++  Write-Host 'Your Project folders, archive, and database remain outside the application checkout.'
++}
++catch {
++  $failure = $_.Exception.Message
++  Write-Host ""
++  Write-Host 'Update validation failed. Rolling application code back to the previous working revision...' -ForegroundColor Yellow
++  git reset --hard $oldHead | Out-Host
++  try {
++    Install-Dependencies
++    Run-Doctor
++    Write-Host 'Previous application revision restored successfully.' -ForegroundColor Green
++  }
++  catch {
++    Write-Host 'Rollback completed, but the previous revision also failed diagnostics. Use the automatic database backup if recovery is needed.' -ForegroundColor Red
++  }
++  throw "Update failed and was rolled back. Cause: $failure"
++}
+diff --git a/update-and-launch-harness.cmd b/update-and-launch-harness.cmd
+new file mode 100644
+index 0000000..bf3b1a4
+--- /dev/null
++++ b/update-and-launch-harness.cmd
+@@ -0,0 +1,8 @@
++@echo off
++setlocal
++powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0update-and-launch-harness.ps1"
++if errorlevel 1 (
++  echo.
++  echo AI Harness could not be launched.
++  pause
++)
+diff --git a/update-and-launch-harness.ps1 b/update-and-launch-harness.ps1
+new file mode 100644
+index 0000000..f29fe41
+--- /dev/null
++++ b/update-and-launch-harness.ps1
+@@ -0,0 +1,32 @@
++$ErrorActionPreference = 'Continue'
++Set-Location $PSScriptRoot
++
++Write-Host ''
++Write-Host 'AI Harness Update & Launch' -ForegroundColor White
++
++# Stop only the local Harness process reported by its own health endpoint.
++try {
++  $health = Invoke-RestMethod -Uri 'http://127.0.0.1:4317/api/health' -TimeoutSec 2
++  if ($health.pid) {
++    Write-Host "Stopping running AI Harness process $($health.pid)..."
++    Stop-Process -Id ([int]$health.pid) -Force -ErrorAction Stop
++    Start-Sleep -Milliseconds 600
++  }
++} catch {}
++
++$updateSucceeded = $true
++try {
++  & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'update-harness.ps1')
++  if ($LASTEXITCODE -ne 0) { $updateSucceeded = $false }
++} catch {
++  $updateSucceeded = $false
++}
++
++if (-not $updateSucceeded) {
++  Write-Host ''
++  Write-Host 'Update was unavailable or failed. Launching the currently installed working version instead.' -ForegroundColor Yellow
++}
++
++Write-Host ''
++Write-Host 'Launching AI Harness...'
++Start-Process -FilePath (Join-Path $PSScriptRoot 'start-harness.cmd')
