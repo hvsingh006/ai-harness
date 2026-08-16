@@ -22,7 +22,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tar -xzf .aih-sync/payload.tar.gz -C .
+          cat .aih-sync/exact-* > /tmp/aih-sync.b64
+          base64 --decode /tmp/aih-sync.b64 > /tmp/aih-sync.tar.gz
+          tar -xzf /tmp/aih-sync.tar.gz -C .
           if [ -f .aih-delete ]; then
             while IFS= read -r path; do
               [ -z "$path" ] || rm -f -- "$path"
