@@ -14,7 +14,6 @@
   function providerId() {
     if (location.hostname === 'chatgpt.com') return 'chatgpt';
     if (location.hostname === 'gemini.google.com') return 'gemini';
-    if (location.hostname === 'notebooklm.google.com') return 'notebooklm';
     return 'unknown';
   }
 
@@ -26,7 +25,6 @@
     let match = null;
     if (providerId() === 'chatgpt') match = location.pathname.match(/\/c\/([^/?#]+)/);
     if (providerId() === 'gemini') match = location.pathname.match(/\/app\/([^/?#]+)/);
-    if (providerId() === 'notebooklm') match = location.pathname.match(/\/notebook\/([^/?#]+)/);
     if (match?.[1]) refs.unshift({ ref_type: 'chat_id', ref_value: match[1], source: 'browser_companion' });
     return refs;
   }
@@ -61,7 +59,7 @@
   }
 
   function providerName() {
-    return ({ chatgpt: 'ChatGPT', gemini: 'Gemini', notebooklm: 'NotebookLM' })[providerId()] || 'AI service';
+    return ({ chatgpt: 'ChatGPT', gemini: 'Gemini' })[providerId()] || 'AI service';
   }
 
   async function request(path, options = {}) {
@@ -85,7 +83,6 @@
   function findComposer() {
     if (providerId() === 'chatgpt') return document.querySelector('#prompt-textarea') || document.querySelector('[contenteditable="true"]');
     if (providerId() === 'gemini') return document.querySelector('rich-textarea [contenteditable="true"]') || document.querySelector('[contenteditable="true"]');
-    if (providerId() === 'notebooklm') return document.querySelector('textarea') || document.querySelector('[contenteditable="true"]');
     return null;
   }
 
@@ -110,7 +107,7 @@
     const packet = await request(`/workspaces/${workspace.id}/context`);
     return [
       '[AI HARNESS WORKSPACE CONTEXT]',
-      'Use this as durable workspace background. Do not repeat it unless useful. Continue established work without requiring restatement. Actively use relevant user prompts, prior AI responses, files, PDFs, images, notebook sources, native tools, archive material, and current web information when useful. If the corpus is too large, retrieve progressively relevant subsets rather than ignoring material or flooding the context window. For learning, preserve active reasoning and prior attempts rather than defaulting to answer delivery.',
+      'Use this as durable workspace background. Do not repeat it unless useful. Continue established work without requiring restatement. Use relevant prior user prompts, prior ChatGPT/Gemini responses, project files, PDFs, images, native tools, archive material, and current web information when useful. If the corpus is too large, retrieve progressively relevant subsets rather than ignoring material or flooding the context window. Preserve the user\'s critical thinking and judgment.',
       JSON.stringify(packet),
       '[/AI HARNESS WORKSPACE CONTEXT]',
       '',
@@ -147,18 +144,6 @@
         provider_message_id: node.id || '',
         raw: { index, tag: node.tagName.toLowerCase(), html: node.outerHTML.slice(0, 250000) }
       }));
-    } else if (provider === 'notebooklm') {
-      const candidates = [...document.querySelectorAll('[data-message-id], [class*="message"], [class*="chat"]')]
-        .filter(node => node.innerText?.trim() && node.innerText.trim().length > 1);
-      candidates.forEach((node, index) => {
-        const text = node.innerText.trim();
-        const aria = (node.getAttribute('aria-label') || '').toLowerCase();
-        const cls = String(node.className || '').toLowerCase();
-        let role = 'unknown';
-        if (/user|you|question/.test(aria + cls)) role = 'user';
-        if (/assistant|model|answer|response/.test(aria + cls)) role = 'assistant';
-        messages.push({ role, content: text, provider_message_id: node.getAttribute('data-message-id') || '', raw: { index, html: node.outerHTML.slice(0, 150000) } });
-      });
     }
     return uniqueMessages(messages);
   }
@@ -225,7 +210,7 @@
         body: JSON.stringify({
           workspace_id: workspace.id,
           provider: providerId(),
-          title: document.title.replace(/\s*[-|]\s*(ChatGPT|Gemini|NotebookLM).*$/i, '').trim() || `${providerName()} session`,
+          title: document.title.replace(/\s*[-|]\s*(ChatGPT|Gemini).*$/i, '').trim() || `${providerName()} session`,
           native_url: location.href,
           external_id: providerRefs().find(ref => ref.ref_type === 'chat_id')?.ref_value || location.pathname + location.search,
           provider_refs: providerRefs(),
