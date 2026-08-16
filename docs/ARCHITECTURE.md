@@ -1,80 +1,72 @@
-# AI Harness Architecture
+# AI Harness architecture
 
-## Core model
+## Authority model
 
 ```text
-Project Space
-├── normal project folder
-├── retained chat history
-├── compact project context
-├── lossless archive
+Project Space (durable authority)
+├── explicitly approved live roots
+├── immutable resource/message/archive versions
+├── rebuildable extraction + SQLite FTS5 chunks
+├── compact deterministic working state
+├── verified per-send snapshots and audits
 │
-├── native ChatGPT chats
-└── native Gemini chats
+├── native ChatGPT chats (working surfaces)
+└── native Gemini chats (working surfaces)
 ```
 
-The Project Space is durable. Native chats are working surfaces that can be replaced without losing the project record.
+Original files/messages are authoritative. Derived chunks, working state, retrieval rankings, and context envelopes can be rebuilt. Provider conversations can be replaced without replacing the Project Space.
 
-## Storage separation
-
-Application code and user data are physically separate.
-
-Application checkout:
+## Verified managed-send flow
 
 ```text
-%LOCALAPPDATA%\AI-Harness\app
+native click / Enter
+  → capture adapter synchronizes visible chat
+  → companion authenticates to 127.0.0.1
+  → approved roots canonicalized and fully reconciled
+  → changed bytes archived/versioned/extracted/indexed
+  → Git repository state observed locally
+  → corpus/index/chat generations checked
+  → CURRENT snapshot or structured BLOCKED result
+  → current-version + cross-provider retrieval
+  → local-only filter and secret scan
+  → outgoing context/source audit
+  → current binary attachments confirmed when needed
+  → context injected and native Send replayed exactly once
 ```
 
-Persistent workspace:
+Watchers mark state stale and perform background indexing for latency. They are never the proof of freshness; every guaranteed send performs the reconciliation barrier again.
 
-```text
-%USERPROFILE%\Documents\AI Harness
-```
+## Module boundaries
 
-The persistent workspace contains Projects, Library, Archive, Backups, and `harness.db`.
+- `security/paths.mjs`: realpath/canonical containment, traversal rejection, secure root walking, symlink skipping.
+- `security/secrets.mjs`: sensitive filename policy and deterministic outgoing secret detection/redaction.
+- `security/companion-auth.mjs`: private install credential, one-time pairing, token hashing, extension identity/origin checks.
+- `resources.mjs` and `resource-extractors.mjs`: resource identity, immutable versions, vault preservation, extraction, chunk/FTS indexing.
+- `repository.mjs`: safe argument-array Git observation without credential transmission.
+- `chat-capture.mjs`: stable provider-ref reconciliation, capture evidence/coverage, clean-vs-raw managed messages.
+- `freshness.mjs`: pre-send generations, root/repository/chat verification, snapshots, deterministic working state.
+- `retrieval.mjs`: FTS/BM25 candidates plus user/decision/current-version/recency/cross-provider weighting.
+- `outgoing-context.mjs`: context budget, trust envelope, attachment manifest, secret filtering, provenance audit.
+- `server.mjs`: HTTP routing, same-origin dashboard endpoints, authenticated companion endpoints, watchers, and legacy UI compatibility.
+- `extension/provider-adapters.js`: provider DOM selectors and attachment mechanics isolated from the send coordinator.
+- `extension/content.js`: capture completeness and single-replay send state machine.
 
-## Chat identity
+## Trust hierarchy
 
-Each captured chat receives an immutable Harness session ID plus provider references such as:
+1. Harness security policy
+2. current explicit user request
+3. Project Space configuration
+4. retrieved project material
+5. retained assistant responses
 
-- provider: `chatgpt` or `gemini`
-- provider chat ID when available
-- route
-- native URL
-- first/last seen timestamps
+Retrieved content is never executed and cannot change permissions. ChatGPT/Gemini receive selected approved context and opaque attachment bytes only—not filesystem paths, shells, Git credentials, SSH material, or generic local APIs.
 
-URLs are locators, not the canonical identity.
+## Freshness versus coverage
 
-## Archive and context
+Freshness is `CURRENT`, `VERIFYING`, `STALE`, `BLOCKED`, or `ERROR`. A `CURRENT` snapshot means every known required root was reachable/canonical, its inventory and current versions were reconciled, required extraction/indexing succeeded, repository state was observed, the visible native chat synchronized, generations matched, and security policy was active.
 
-The archive keeps raw messages and source assets. Compact context is derived from the archive and can be regenerated.
+History coverage is independently `COMPLETE`, `PARTIAL`, or `UNKNOWN`. A complete current source corpus does not fabricate uncaptured provider activity. `safe_to_delete` is separate from both.
 
-A new chat should receive only the relevant subset of project state, while search/retrieval can expand into older raw history as needed.
+## Provider limitations
 
-## Browser companion
-
-The Chrome/Edge extension currently supports only:
-
-- `chatgpt.com`
-- `gemini.google.com`
-
-Responsibilities:
-
-- identify the active provider chat
-- attach it to the selected Project Space
-- capture loaded messages and accessible asset references
-- show the AIH project/chat label
-- insert Project Space context into a fresh chat
-- bring an archived chat back into a prompt
-
-Provider-specific DOM logic should stay isolated so changes to either website do not affect the archive model.
-
-## Project files
-
-Managed Project Spaces use a real folder under `Projects/`. Existing folders can also be attached without moving them.
-
-The database stores an index and metadata. It does not replace the human-visible filesystem.
-
-## Expansion rule
-
-Keep the initial product centered on ChatGPT, Gemini, Project Spaces, files, and chat continuity. Additional modes/tools may be considered later only if they solve a demonstrated user problem without making the base workflow harder to understand.
+ChatGPT/Gemini DOMs and native file controls are not stable APIs. Adapters use versioned selectors and explicit capture/attachment evidence. If a provider control cannot be recognized, lazy history cannot be proven complete, or an attachment is not reflected by the native UI, Harness reports the limitation and does not claim success. Real long-conversation and provider-update smoke testing remains an ongoing release gate.

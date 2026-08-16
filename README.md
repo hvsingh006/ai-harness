@@ -1,140 +1,84 @@
 # AI Harness
 
-A local continuity and project layer for working in **native ChatGPT and Gemini** without restarting your context every time you open a new chat or switch services.
+AI Harness is a local continuity layer for working in native ChatGPT and Gemini. Project Spaces retain authoritative files, repository state, provider history, and provenance while native chats remain replaceable working surfaces.
 
-## Product thesis
+## 0.8 context-integrity contract
 
-**Chats are disposable. Project spaces are durable. Originals are never replaced by summaries.**
+A Harness-managed native send proceeds only after the selected Project Space reaches a verified `CURRENT` snapshot. Immediately before replaying the normal ChatGPT/Gemini Send action, Harness:
 
-The Harness exists to keep project context, files, and chat history continuous across ChatGPT and Gemini while improving productivity and learning without replacing the user's critical thinking.
+1. synchronizes the visible native conversation;
+2. verifies every required approved root by canonical path;
+3. hashes the current file inventory and archives changed versions;
+4. extracts and indexes changed text/code/PDF resources;
+5. observes repository branch, HEAD, dirty/staged/unstaged/untracked state;
+6. ties corpus, index, and chat generations to a snapshot;
+7. retrieves current sources plus relevant ChatGPT/Gemini history;
+8. removes local-only sources and scans for secrets;
+9. records the sanitized context and exact source provenance;
+10. injects/attaches the verified context and replays native Send once.
 
-## 0.6 storage model
+If any required source, extraction/index, chat synchronization, repository check, authentication check, or security check cannot be established, guaranteed mode returns `Context Blocked`. It does not reuse a cached packet.
 
-Application code and personal data are physically separate.
+Freshness and history coverage are separate. `Project Current` proves the known current corpus at a snapshot; history remains `COMPLETE`, `PARTIAL`, or `UNKNOWN` according to what was actually captured.
 
-Recommended Windows layout:
+## Storage layout
 
 ```text
-%LOCALAPPDATA%\AI-Harness\app\        # Git checkout / application code
+%USERPROFILE%\Documents\AI Workspace\Projects\
+  ai-harness\                 # canonical source/runtime checkout
+  project-a\                  # normal live project material
 
-%USERPROFILE%\Documents\AI Harness\  # permanent working space
-├── Projects\
-├── Library\
-├── Archive\
-│   ├── Vault\
-│   └── Imports\
-├── Backups\
-├── .harness\
-└── harness.db
+%USERPROFILE%\Documents\AI Harness\
+  harness.db                  # private metadata/index/audit state
+  Archive\Vault\             # immutable source/version blobs
+  Archive\Imports\
+  Backups\
+  Library\
+  .harness\                   # private runtime credential/staging
 ```
 
-You can update, delete, or reclone the application checkout without deleting your projects or archive. `HARNESS_WORKSPACE_ROOT` can override the default persistent location, but the Harness refuses to place persistent storage inside its own source checkout.
+`HARNESS_WORKSPACE_ROOT` overrides private state. `HARNESS_PROJECTS_ROOT` overrides the live managed-project parent. Explicitly linked external folders stay in place. Older managed folders under private `AI Harness\Projects` can be copied and hash-verified into the live projects root from Setup; conflicts never overwrite and the source is retained as a fallback.
 
-See `docs/STORAGE.md`.
+## Start and pair
 
-## Project Spaces
-
-A Project Space is backed by a **real folder**, not just database records. Files dragged into the local app are written into that project folder while immutable archive snapshots are maintained separately when needed for provenance/recovery.
-
-You can also attach an existing project folder without moving it.
-
-## What the Harness owns
-
-- complete capturable conversation archive
-- exact imported provider exports
-- provider chat IDs, routes, URLs, and native traceability
-- real project folders plus indexed resource manifests
-- immutable archived copies of provider/chat assets
-- current working state and next actions
-- source-linked memories and decisions
-- cross-provider search and handoff context
-
-## What it does not replace
-
-- ChatGPT UI and native capabilities
-- Gemini UI and native capabilities
-
-## Archive model
-
-Two layers are kept separately:
-
-1. **Lossless source archive**: raw messages, provider records, exact assets, IDs/URLs, metadata, hashes.
-2. **Derived working state**: summaries, memories, decisions, current focus, and context packets.
-
-Derived state can be regenerated. It never replaces the originals.
-
-A native chat is only `safe_to_delete` after raw transcript, attachments/assets, derived state, and search indexing are all verified complete.
-
-## Start
-
-Requires Node.js 22.5+.
-
-Windows:
+Requires Node.js 22.5 or newer.
 
 ```text
 start-harness.cmd
 ```
 
-Or:
+Or run `npm start`, then open `http://127.0.0.1:4317/`.
+
+Load `extension/` as an unpacked Chrome/Edge extension, open Harness Setup, and choose **Pair browser companion**. Pairing uses a short-lived one-time challenge; the long-lived 256-bit token stays in extension local storage and only a peppered hash is retained locally. Companion APIs are allowlisted, bound to `127.0.0.1`, origin checked, and never expose generic filesystem or shell operations.
+
+Once paired, work in native ChatGPT/Gemini and use their normal Send button or Enter. Shift+Enter remains a newline.
+
+## Resource behavior
+
+- Approved roots are explicit and independently configurable as required/optional, indexed/unindexed, and provider-allowed/local-only.
+- Symlinks and junction-style escapes are not followed during indexing; `.git` internals and generated dependency/build trees are excluded.
+- Logical resources retain immutable SHA-256 versions; normal retrieval joins only the current version.
+- Text/code uses deterministic line-aware chunks. PDF extraction uses local `pdftotext` with page provenance. If it is unavailable or extraction fails for a required PDF, guaranteed currentness blocks rather than pretending the PDF was indexed.
+- Unsupported Office/binary formats remain truthfully versioned and can be selected as current provider-native attachments when relevant.
+- Images retain current hash/type/dimensions when available and can be attached automatically. Send remains paused unless the provider UI confirms the attachment.
+- High-confidence secrets block a source or prompt; lower-confidence token material is deterministically redacted. Findings store only rules, locations, and masked fingerprints.
+
+## Retention and trust
+
+Raw provider messages, imports, assets, files, and prior resource versions remain authoritative. FTS indexes, snapshots, workspace state, and context envelopes are rebuildable derived data. Captured managed messages keep the lossless provider-visible envelope but index the clean user-authored text so context does not recursively pollute history.
+
+Retrieved files and old AI responses are evidence, not authority. They cannot alter approved roots, grant shell/filesystem permissions, disable scanning, or change security policy. Explicit user reasoning and decisions receive stronger retrieval weight than old assistant prose.
+
+`safe_to_delete` remains stricter and separate from `Project Current`: raw transcript, attachments, derived state, and search indexing must all be complete before deletion safety is claimed.
+
+## Validation and updates
 
 ```bash
-npm start
-```
-
-Then open `http://127.0.0.1:4317/`.
-
-## Browser companion
-
-Load `extension/` as an unpacked Chrome/Edge extension. It currently supports ChatGPT and Gemini native pages for capture, chat labels, context handoff, and archived-session reuse.
-
-The requested bright red **Harness ready** indicator appears after the local service and browser companion have connected.
-
-## Updates and backups
-
-If the application is a Git checkout:
-
-```text
-update-harness.cmd
-```
-
-The updater creates a database backup first, then performs `git pull --ff-only`, then runs diagnostics. Personal Projects and Archive data are outside Git.
-
-Manual commands:
-
-```bash
-npm run backup
-npm run doctor
 npm test
+npm run doctor
+npm run dev:status
 ```
 
-## Historical imports
+Use `update-and-launch-harness.cmd` for the fail-closed update flow: inspect the worktree, back up private metadata, fetch/fast-forward only, validate, roll source back on failure, and restart the same canonical checkout. It never creates a duplicate installed source tree.
 
-```bash
-npm run import -- chatgpt /path/to/extracted-export <workspace-id>
-npm run import -- gemini /path/to/extracted-export <workspace-id>
-```
-
-The importer preserves source files before parsing them.
-
-## Repository
-
-Private remote: `hvsingh006/ai-harness`.
-
-Git stores application source, tests, migration logic, and documentation only. Personal project data, chats, files, PDFs, images, the archive vault, backups, and `harness.db` remain local.
-
-## Key documentation
-
-- `docs/STORAGE.md`
-- `docs/PRODUCT_SPEC.md`
-- `docs/ARCHITECTURE.md`
-- `docs/PROJECT_SPACE.md`
-- `docs/RESOURCE_POLICY.md`
-- `docs/CHAT_IDENTITY.md`
-- `docs/CODING_ADAPTERS.md`
-- `docs/IMPORTS.md`
-- `docs/TESTING.md`
-- `docs/ROADMAP.md`
-
-## Update and launch
-
-On Windows, use `update-and-launch-harness.cmd` (installed as the **AI Harness** Desktop/Start Menu shortcut). It checks for a newer `main`, backs up data before applying an update, validates the new build, rolls application code back on failure, and launches the Harness. Project Spaces and the archive remain outside the Git checkout.
+See `docs/ARCHITECTURE.md`, `docs/STORAGE.md`, `docs/PROJECT_SPACE.md`, `docs/TESTING.md`, and `docs/ROADMAP.md`.

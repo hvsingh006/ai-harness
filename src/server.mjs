@@ -4,11 +4,18 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { openDatabase, rows, row, run, storageForDatabase, ensureWorkspaceProjectRoot, attachWorkspaceFolder, upsertSessionExternalRef } from './db.mjs';
-import { sha256Text, archiveFile } from './archive.mjs';
+import { openDatabase, rows, row, run, storageForDatabase, ensureWorkspaceProjectRoot, attachWorkspaceFolder, registerWorkspaceRoot, workspaceRoots } from './db.mjs';
+import { archiveFile, sha256File } from './archive.mjs';
 import { setCaptureStages, importChatGPTExport, importProviderArchive } from './importers.mjs';
 import { HARNESS_VERSION } from './version.mjs';
 import { indexWorkspaceFile, scanWorkspaceFiles, projectFileDestination, storageSummary } from './project-space.mjs';
+import { captureBrowserSession as captureVerifiedBrowserSession, resolveSessionByRefs as resolveCapturedSession } from './chat-capture.mjs';
+import { prepareManagedSend, markContextRunSent, markContextRunFailed } from './outgoing-context.mjs';
+import { workspaceIntegrity, markWorkspaceStale } from './freshness.mjs';
+import { currentWorkspaceResources, reconcileWorkspaceResources } from './resources.mjs';
+import { createPairingChallenge, completePairing, authenticateCompanionRequest, ensureInstallCredential, isSameOriginDashboardRequest, pairedCompanionStatus } from './security/companion-auth.mjs';
+import { pendingManagedWorkspaceMigrations, migrateManagedWorkspaceProject } from './workspace-migration.mjs';
+import { isPathWithin } from './security/paths.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
@@ -16,9 +23,52 @@ const publicDir = path.join(rootDir, 'public');
 const port = Number(process.env.HARNESS_PORT || 4317);
 const db = process.env.HARNESS_DB ? openDatabase(path.resolve(process.env.HARNESS_DB)) : openDatabase();
 const storage = storageForDatabase(db);
+const companionCredential = ensureInstallCredential(storage.runtimeDir);
 
 const stagingRoot = path.join(storage.stagingDir, 'imports');
 fs.mkdirSync(stagingRoot, { recursive: true });
+
+const rootWatchers = new Map();
+const indexingTimers = new Map();
+
+function scheduleBackgroundIndex(workspaceId) {
+  markWorkspaceStale(db, workspaceId, 'filesystem_change_observed');
+  clearTimeout(indexingTimers.get(workspaceId));
+  indexingTimers.set(workspaceId, setTimeout(() => {
+    try { reconcileWorkspaceResources(db, workspaceId); }
+    catch {}
+    finally {
+      markWorkspaceStale(db, workspaceId, 'background_index_updated_pending_send_verification');
+      indexingTimers.delete(workspaceId);
+    }
+  }, 700));
+}
+
+function refreshRootWatchers() {
+  const activeIds = new Set();
+  for (const root of rows(db, `SELECT id,workspace_id,root_path FROM workspace_roots WHERE indexing_enabled=1`)) {
+    activeIds.add(root.id);
+    if (rootWatchers.has(root.id) || !fs.existsSync(root.root_path)) continue;
+    try {
+      const watcher = fs.watch(root.root_path, { recursive: true }, () => scheduleBackgroundIndex(root.workspace_id));
+      watcher.on('error', () => {
+        try { watcher.close(); } catch {}
+        rootWatchers.delete(root.id);
+        markWorkspaceStale(db, root.workspace_id, 'filesystem_watcher_error');
+      });
+      rootWatchers.set(root.id, watcher);
+    } catch {
+      markWorkspaceStale(db, root.workspace_id, 'filesystem_watcher_unavailable');
+    }
+  }
+  for (const [rootId, watcher] of rootWatchers) {
+    if (activeIds.has(rootId)) continue;
+    try { watcher.close(); } catch {}
+    rootWatchers.delete(rootId);
+  }
+}
+
+refreshRootWatchers();
 
 function gitOutput(args, timeoutMs = 8000) {
   return new Promise((resolve, reject) => {
@@ -115,14 +165,13 @@ const mimeTypes = {
 function sendJson(res, status, payload) {
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff'
   });
   res.end(JSON.stringify(payload));
 }
 
-async function readJson(req, maxBytes = 25 * 1024 * 1024) {
+async function readJson(req, maxBytes = 1024 * 1024) {
   let body = '';
   let size = 0;
   for await (const chunk of req) {
@@ -144,11 +193,12 @@ function getSettings() {
 function workspaceSummary(id) {
   const workspace = row(db, 'SELECT * FROM workspaces WHERE id = ?', id);
   if (!workspace) return null;
-  let projectFiles = [];
-  try { projectFiles = scanWorkspaceFiles(db, id, { maxFiles: 5000 }); }
-  catch { projectFiles = rows(db, 'SELECT * FROM workspace_files WHERE workspace_id = ? ORDER BY relative_path', id); }
+  const projectFiles = rows(db, 'SELECT * FROM workspace_files WHERE workspace_id = ? ORDER BY relative_path', id);
   return {
     ...workspace,
+    roots: workspaceRoots(db, id),
+    integrity: workspaceIntegrity(db, id),
+    resources: currentWorkspaceResources(db, id),
     providers: rows(db, 'SELECT * FROM provider_links WHERE workspace_id = ? ORDER BY provider', id),
     sessions: rows(db, 'SELECT * FROM sessions WHERE workspace_id = ? ORDER BY started_at DESC LIMIT 100', id),
     memories: rows(db, `SELECT * FROM memories WHERE (workspace_id = ? OR scope = 'global') AND status = 'active' ORDER BY scope, updated_at DESC`, id),
@@ -272,17 +322,6 @@ function sessionLabel(session, workspaceName = '') {
   return `AIH · ${workspaceName || 'Workspace'} · ${short}`;
 }
 
-function resolveSessionByRefs(provider, refs = []) {
-  for (const ref of refs) {
-    const type = String(ref.ref_type || '').trim();
-    const value = String(ref.ref_value || '').trim();
-    if (!type || !value) continue;
-    const found = row(db, `SELECT s.* FROM session_external_refs r JOIN sessions s ON s.id=r.session_id WHERE r.provider=? AND r.ref_type=? AND r.ref_value=?`, provider, type, value);
-    if (found) return found;
-  }
-  return null;
-}
-
 function buildSessionContextPacket(sessionId, maxChars = 60000) {
   const session = row(db, 'SELECT * FROM sessions WHERE id=?', sessionId);
   if (!session) return null;
@@ -318,113 +357,143 @@ function buildSessionContextPacket(sessionId, maxChars = 60000) {
 
 function readiness() {
   const client = row(db, 'SELECT * FROM companion_clients ORDER BY last_seen_at DESC LIMIT 1');
+  const pairing = pairedCompanionStatus(db);
   return {
     service_ready: true,
     database_ready: true,
-    browser_companion_seen: Boolean(client),
+    browser_companion_seen: Boolean(client && pairing),
+    browser_companion_paired: Boolean(pairing),
+    paired_extension_id: pairing?.extension_id || null,
     browser_companion_last_seen: client?.last_seen_at || null,
     browser_companion_version: client?.version || null,
-    ready_for_native_workflow: Boolean(client),
-    indicator: Boolean(client) ? 'bright_red' : 'setup_required'
-  };
-}
-
-function captureBrowserSession(body) {
-  const workspaceId = body.workspace_id;
-  if (!row(db, 'SELECT id FROM workspaces WHERE id=?', workspaceId)) throw new Error('workspace not found');
-  const provider = String(body.provider || 'unknown').toLowerCase();
-  const nativeUrl = String(body.native_url || '');
-  const providerRefs = Array.isArray(body.provider_refs) ? body.provider_refs.filter(r => r && r.ref_type && r.ref_value) : [];
-  if (nativeUrl) providerRefs.push({ ref_type: 'native_url', ref_value: nativeUrl, source: 'browser_companion' });
-  const chatRef = providerRefs.find(r => r.ref_type === 'chat_id');
-  const externalId = String(chatRef?.ref_value || body.external_id || (nativeUrl ? sha256Text(nativeUrl).slice(0, 32) : randomUUID()));
-  let session = resolveSessionByRefs(provider, providerRefs) || row(db, 'SELECT * FROM sessions WHERE workspace_id=? AND provider=? AND external_id=?', workspaceId, provider, externalId);
-  const now = new Date().toISOString();
-  if (!session) {
-    const id = `session-${randomUUID()}`;
-    run(db, `INSERT INTO sessions (id,workspace_id,provider,title,native_url,summary,capture_status,started_at,message_count,external_id,raw_complete,attachments_complete,derived_complete,last_captured_at)
-             VALUES (?,?,?,?,?,?, 'captured_incomplete', ?,0,?,0,0,0,?)`,
-      id, workspaceId, provider, body.title || `${provider} session`, nativeUrl, '', body.started_at || now, externalId, now);
-    session = row(db, 'SELECT * FROM sessions WHERE id=?', id);
-  } else {
-    run(db, 'UPDATE sessions SET title=?, native_url=?, last_captured_at=? WHERE id=?', body.title || session.title, nativeUrl || session.native_url, now, session.id);
-  }
-
-  const sessionWorkspace = row(db, 'SELECT * FROM workspaces WHERE id=?', session.workspace_id);
-  const label = sessionLabel(session, sessionWorkspace?.name);
-  if (!session.display_label) run(db, 'UPDATE sessions SET display_label=? WHERE id=?', label, session.id);
-  for (const ref of providerRefs) upsertSessionExternalRef(db, { sessionId: session.id, provider, refType: ref.ref_type, refValue: ref.ref_value, source: ref.source || 'browser_companion' });
-
-  const messages = Array.isArray(body.messages) ? body.messages : [];
-  for (let i = 0; i < messages.length; i++) {
-    const item = messages[i] || {};
-    const content = String(item.content || item.text || '').trim();
-    if (!content) continue;
-    const providerMessageId = String(item.provider_message_id || sha256Text(`${item.role || 'unknown'}\0${content}\0${i}`).slice(0, 32));
-    if (row(db, 'SELECT id FROM messages WHERE session_id=? AND provider_message_id=?', session.id, providerMessageId)) continue;
-    const ordinal = Number(row(db, 'SELECT COALESCE(MAX(ordinal), -1) AS n FROM messages WHERE session_id=?', session.id)?.n ?? -1) + 1;
-    const id = `msg-${randomUUID()}`;
-    run(db, `INSERT INTO messages (id,session_id,provider_message_id,parent_provider_message_id,ordinal,role,content_text,content_json,raw_json,content_hash,created_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-      id, session.id, providerMessageId, '', ordinal, item.role || 'unknown', content, JSON.stringify(item.content_json || {}), JSON.stringify(item.raw || {}), sha256Text(content), item.created_at || now);
-    try {
-      run(db, `INSERT INTO message_fts (message_id,session_id,workspace_id,provider,title,role,content) VALUES (?,?,?,?,?,?,?)`,
-        id, session.id, session.workspace_id, provider, body.title || session.title, item.role || 'unknown', content);
-    } catch {}
-  }
-
-  const assets = Array.isArray(body.assets) ? body.assets : [];
-  for (const asset of assets) {
-    const nativeId = String(asset.native_id || sha256Text(`${asset.url || ''}|${asset.name || ''}`).slice(0, 32));
-    if (row(db, 'SELECT id FROM session_assets WHERE session_id=? AND native_id=?', session.id, nativeId)) continue;
-    const id = `assetref-${randomUUID()}`;
-    run(db, `INSERT INTO session_assets (id,session_id,provider,asset_type,name,source_url,native_id,mime_type,mirror_status,metadata_json,created_at,updated_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-      id, session.id, provider, asset.asset_type || 'file', asset.name || '', asset.url || '', nativeId, asset.mime_type || 'application/octet-stream', 'referenced', JSON.stringify(asset.metadata || {}), now, now);
-  }
-
-  const assetRefs = Number(row(db, 'SELECT COUNT(*) AS n FROM session_assets WHERE session_id=?', session.id)?.n || 0);
-  const unmirrored = Number(row(db, `SELECT COUNT(*) AS n FROM session_assets WHERE session_id=? AND mirror_status!='captured'`, session.id)?.n || 0);
-  setCaptureStages(db, session.id, {
-    raw: body.complete === true,
-    attachments: assetRefs === 0 || unmirrored === 0,
-    derived: false,
-    search: true
-  });
-  run(db, 'UPDATE sessions SET message_count=(SELECT COUNT(*) FROM messages WHERE session_id=?), last_captured_at=? WHERE id=?', session.id, now, session.id);
-  return {
-    session: row(db, 'SELECT * FROM sessions WHERE id=?', session.id),
-    workspace: sessionWorkspace,
-    workspace_mismatch: session.workspace_id !== workspaceId,
-    provider_refs: rows(db, 'SELECT ref_type,ref_value,source FROM session_external_refs WHERE session_id=? ORDER BY ref_type', session.id),
-    capture_stages: rows(db, 'SELECT stage,status,details,updated_at FROM capture_stages WHERE session_id=? ORDER BY stage', session.id),
-    asset_refs: rows(db, 'SELECT * FROM session_assets WHERE session_id=? ORDER BY created_at', session.id)
+    ready_for_native_workflow: Boolean(client && pairing),
+    indicator: client && pairing ? 'bright_red' : 'setup_required'
   };
 }
 
 async function handleApi(req, res, url) {
   if (req.method === 'OPTIONS') return sendJson(res, 204, {});
 
-  if (url.pathname === '/api/health') return sendJson(res, 200, { ok: true, version: HARNESS_VERSION, pid: process.pid, database: 'sqlite', storage: storageSummary(db), archive: archiveStats() });
+  const pairingChallengePath = url.pathname === '/api/companion/pairing-challenge';
+  const pairingPath = url.pathname === '/api/companion/pair';
+  const companionProtected = url.pathname.startsWith('/api/companion/') && !pairingChallengePath && !pairingPath;
+  if (companionProtected) {
+    const authenticated = authenticateCompanionRequest(db, req, { installSecret: companionCredential.secret });
+    if (!authenticated.ok) return sendJson(res, 401, { ok: false, code: authenticated.code, error: authenticated.message });
+    req.aihCompanion = authenticated;
+  } else if (pairingChallengePath) {
+    if (!isSameOriginDashboardRequest(req, port)) return sendJson(res, 403, { ok: false, code: 'ORIGIN_REJECTED', error: 'pairing must begin from the local Harness dashboard' });
+  } else if (pairingPath) {
+    const extensionId = String(req.headers['x-aih-extension-id'] || '');
+    if (req.headers.origin !== `chrome-extension://${extensionId}`) return sendJson(res, 403, { ok: false, code: 'ORIGIN_REJECTED', error: 'pairing origin rejected' });
+  } else if (!['GET', 'HEAD'].includes(req.method) && !isSameOriginDashboardRequest(req, port)) {
+    return sendJson(res, 403, { ok: false, code: 'ORIGIN_REJECTED', error: 'request origin rejected' });
+  }
+
+  if (url.pathname === '/api/health') return sendJson(res, 200, { ok: true, version: HARNESS_VERSION, pid: process.pid, database: 'sqlite', storage: storageSummary(db), archive: archiveStats(), pending_managed_project_migrations: pendingManagedWorkspaceMigrations(db).length });
   if (url.pathname === '/api/update-status' && req.method === 'GET') return sendJson(res, 200, await applicationUpdateStatus());
   if (url.pathname === '/api/readiness' && req.method === 'GET') return sendJson(res, 200, readiness());
+  if (url.pathname === '/api/companion/pairing-challenge' && req.method === 'POST') {
+    return sendJson(res, 201, { ok: true, ...createPairingChallenge(db, { installSecret: companionCredential.secret }) });
+  }
+  if (url.pathname === '/api/companion/pair' && req.method === 'POST') {
+    try {
+      const body = await readJson(req, 16 * 1024);
+      const extensionId = String(req.headers['x-aih-extension-id'] || body.extension_id || '');
+      return sendJson(res, 201, { ok: true, ...completePairing(db, { challenge: body.challenge, extensionId, installSecret: companionCredential.secret }) });
+    } catch (error) {
+      return sendJson(res, error.statusCode || 401, { ok: false, code: 'PAIRING_FAILED', error: error.message });
+    }
+  }
   if (url.pathname === '/api/companion/heartbeat' && req.method === 'POST') {
     const body = await readJson(req);
-    if (!body.client_id) return sendJson(res, 400, { error: 'client_id required' });
+    const clientId = req.aihCompanion.extensionId;
     const ts = new Date().toISOString();
-    run(db, `INSERT INTO companion_clients (client_id,version,provider,last_seen_at,metadata_json) VALUES (?,?,?,?,?) ON CONFLICT(client_id) DO UPDATE SET version=excluded.version,provider=excluded.provider,last_seen_at=excluded.last_seen_at,metadata_json=excluded.metadata_json`, body.client_id, body.version || '', body.provider || '', ts, JSON.stringify(body.metadata || {}));
+    run(db, `INSERT INTO companion_clients (client_id,version,provider,last_seen_at,metadata_json) VALUES (?,?,?,?,?) ON CONFLICT(client_id) DO UPDATE SET version=excluded.version,provider=excluded.provider,last_seen_at=excluded.last_seen_at,metadata_json=excluded.metadata_json`, clientId, body.version || '', body.provider || '', ts, JSON.stringify(body.metadata || {}));
     return sendJson(res, 200, readiness());
   }
-  if (url.pathname === '/api/provider-session' && req.method === 'GET') {
+  if (url.pathname === '/api/companion/active-workspace' && req.method === 'GET') {
+    const id = row(db, `SELECT value FROM settings WHERE key='active_workspace_id'`)?.value;
+    const activeWorkspace = id ? row(db, 'SELECT id,name,description,active_focus,freshness_status,history_coverage FROM workspaces WHERE id=?', id) : null;
+    return activeWorkspace ? sendJson(res, 200, activeWorkspace) : sendJson(res, 404, { error: 'active workspace not found' });
+  }
+  if (url.pathname === '/api/companion/provider-session' && req.method === 'GET') {
     const provider = String(url.searchParams.get('provider') || '').toLowerCase();
     const refs = [];
     for (const [key, value] of url.searchParams.entries()) if (key !== 'provider' && value) refs.push({ ref_type: key, ref_value: value });
-    const session = resolveSessionByRefs(provider, refs);
+    const session = resolveCapturedSession(db, provider, refs);
     if (!session) return sendJson(res, 404, { error: 'session not found' });
-    const ws = row(db, 'SELECT * FROM workspaces WHERE id=?', session.workspace_id);
+    const ws = row(db, 'SELECT id,name,description,active_focus,freshness_status,history_coverage FROM workspaces WHERE id=?', session.workspace_id);
     return sendJson(res, 200, { ...session, display_label: sessionLabel(session, ws?.name), workspace: ws, provider_refs: rows(db, 'SELECT ref_type,ref_value,source FROM session_external_refs WHERE session_id=? ORDER BY ref_type', session.id) });
   }
   if (url.pathname === '/api/archive/stats') return sendJson(res, 200, archiveStats(url.searchParams.get('workspace_id')));
+
+  if (url.pathname === '/api/companion/capture' && req.method === 'POST') {
+    try {
+      const result = captureVerifiedBrowserSession(db, await readJson(req));
+      return sendJson(res, 201, { ...result, workspace: { id: result.workspace.id, name: result.workspace.name, description: result.workspace.description, active_focus: result.workspace.active_focus, freshness_status: result.workspace.freshness_status, history_coverage: result.workspace.history_coverage } });
+    }
+    catch (error) { return sendJson(res, error.code === 'SESSION_WORKSPACE_MISMATCH' ? 409 : 400, { ok: false, code: error.code || 'CAPTURE_FAILED', error: error.message }); }
+  }
+
+  const prepareSendMatch = url.pathname.match(/^\/api\/companion\/workspaces\/([^/]+)\/prepare-send$/);
+  if (prepareSendMatch && req.method === 'POST') {
+    try {
+      const body = await readJson(req);
+      const result = prepareManagedSend(db, {
+        workspaceId: prepareSendMatch[1],
+        provider: body.provider,
+        userPrompt: body.user_prompt,
+        capture: body.capture,
+        contextCharacterBudget: Math.min(60000, Math.max(8000, Number(body.context_character_budget || 30000)))
+      });
+      return sendJson(res, result.ok ? 200 : 412, result);
+    } catch (error) {
+      return sendJson(res, 400, { ok: false, freshness: 'blocked', reasons: [{ code: error.code || 'INVALID_REQUEST', message: error.message }] });
+    }
+  }
+
+  const sentRunMatch = url.pathname.match(/^\/api\/companion\/outgoing-context\/([^/]+)\/sent$/);
+  if (sentRunMatch && req.method === 'POST') {
+    return markContextRunSent(db, sentRunMatch[1]) ? sendJson(res, 200, { ok: true }) : sendJson(res, 409, { ok: false, code: 'RUN_NOT_PREPARED' });
+  }
+
+  const failedRunMatch = url.pathname.match(/^\/api\/companion\/outgoing-context\/([^/]+)\/failed$/);
+  if (failedRunMatch && req.method === 'POST') {
+    const body = await readJson(req, 16 * 1024);
+    return markContextRunFailed(db, failedRunMatch[1], { code: body.code, message: String(body.message || '').slice(0, 500) })
+      ? sendJson(res, 200, { ok: true })
+      : sendJson(res, 409, { ok: false, code: 'RUN_NOT_PREPARED' });
+  }
+
+  const resourceVersionContent = url.pathname.match(/^\/api\/companion\/resource-versions\/([^/]+)\/content$/);
+  if (resourceVersionContent && req.method === 'GET') {
+    const version = row(db, `SELECT v.*,r.relative_path,r.mime_type,r.current_version_id,r.provider_transmission_allowed,
+      wr.provider_transmission_allowed AS root_transmission_allowed,wr.status AS root_status,a.vault_path
+      FROM resource_versions v
+      JOIN workspace_resources r ON r.id=v.resource_id
+      JOIN workspace_roots wr ON wr.id=r.root_id
+      LEFT JOIN artifacts a ON a.id=v.archive_artifact_id
+      WHERE v.id=?`, resourceVersionContent[1]);
+    if (!version || version.current_version_id !== version.id || !version.provider_transmission_allowed || !version.root_transmission_allowed || version.root_status !== 'current' || !version.vault_path) {
+      return sendJson(res, 404, { ok: false, code: 'RESOURCE_NOT_AVAILABLE' });
+    }
+    if (String(version.security_status).startsWith('local_only') || !isPathWithin(version.vault_path, storage.vaultDir) || !fs.existsSync(version.vault_path)) {
+      return sendJson(res, 403, { ok: false, code: 'RESOURCE_TRANSMISSION_BLOCKED' });
+    }
+    const stat = fs.statSync(version.vault_path);
+    if (stat.size > 100 * 1024 * 1024) return sendJson(res, 413, { ok: false, code: 'RESOURCE_TOO_LARGE' });
+    if (sha256File(version.vault_path) !== version.sha256) return sendJson(res, 409, { ok: false, code: 'RESOURCE_INTEGRITY_FAILURE' });
+    const safeName = path.basename(version.relative_path).replace(/[\r\n"]/g, '_');
+    res.writeHead(200, {
+      'Content-Type': version.mime_type || 'application/octet-stream',
+      'Content-Length': stat.size,
+      'Content-Disposition': `attachment; filename="${safeName}"`,
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff'
+    });
+    return fs.createReadStream(version.vault_path).pipe(res);
+  }
 
   if (url.pathname === '/api/imports/start' && req.method === 'POST') {
     const body = await readJson(req);
@@ -571,28 +640,33 @@ async function handleApi(req, res, url) {
   if (workspaceFileContent && req.method === 'GET') {
     const file = row(db, 'SELECT * FROM workspace_files WHERE id=?', workspaceFileContent[1]);
     if (!file || !file.local_path || !fs.existsSync(file.local_path)) return sendJson(res, 404, { error: 'project file not found' });
-    const stat = fs.statSync(file.local_path);
+    const stat = fs.lstatSync(file.local_path);
+    const realFile = stat.isSymbolicLink() ? '' : fs.realpathSync.native(file.local_path);
+    const approved = realFile && workspaceRoots(db, file.workspace_id).some(root => {
+      try { return isPathWithin(realFile, fs.realpathSync.native(root.root_path)); } catch { return false; }
+    });
+    if (!approved || !stat.isFile()) return sendJson(res, 403, { ok: false, code: 'ROOT_SECURITY_FAILURE' });
     const safeName = String(file.name || 'file').replace(/[\r\n"]/g, '_');
     res.writeHead(200, {
       'Content-Type': file.mime_type || 'application/octet-stream',
       'Content-Length': stat.size,
       'Content-Disposition': `inline; filename="${safeName}"`,
-      'Access-Control-Allow-Origin': '*'
+      'X-Content-Type-Options': 'nosniff'
     });
-    return fs.createReadStream(file.local_path).pipe(res);
+    return fs.createReadStream(realFile).pipe(res);
   }
 
   const artifactContent = url.pathname.match(/^\/api\/artifacts\/([^/]+)\/content$/);
   if (artifactContent && req.method === 'GET') {
     const artifact = row(db, 'SELECT * FROM artifacts WHERE id=?', artifactContent[1]);
-    if (!artifact || !artifact.vault_path || !fs.existsSync(artifact.vault_path)) return sendJson(res, 404, { error: 'artifact content not found' });
+    if (!artifact || !artifact.vault_path || !isPathWithin(artifact.vault_path, storage.vaultDir) || !fs.existsSync(artifact.vault_path)) return sendJson(res, 404, { error: 'artifact content not found' });
     const stat = fs.statSync(artifact.vault_path);
     const safeName = String(artifact.name || 'artifact').replace(/[\r\n"]/g, '_');
     res.writeHead(200, {
       'Content-Type': artifact.mime_type || 'application/octet-stream',
       'Content-Length': stat.size,
       'Content-Disposition': `inline; filename="${safeName}"`,
-      'Access-Control-Allow-Origin': '*'
+      'X-Content-Type-Options': 'nosniff'
     });
     return fs.createReadStream(artifact.vault_path).pipe(res);
   }
@@ -609,6 +683,7 @@ async function handleApi(req, res, url) {
       ['gemini', 'Gemini', 'https://gemini.google.com/']
     ];
     ensureWorkspaceProjectRoot(db, id);
+    refreshRootWatchers();
     for (const [provider, label, providerUrl] of defaultProviders) {
       run(db, `INSERT INTO provider_links (id,workspace_id,provider,label,url,status,metadata_json,created_at,updated_at) VALUES (?,?,?,?,?,'linked','{}',?,?)`,
         `provider-${randomUUID()}`, id, provider, label, providerUrl, ts, ts);
@@ -621,6 +696,7 @@ async function handleApi(req, res, url) {
     try {
       const body = await readJson(req);
       const workspace = attachWorkspaceFolder(db, attachWorkspaceMatch[1], body.path);
+      refreshRootWatchers();
       scanWorkspaceFiles(db, workspace.id);
       return sendJson(res, 200, workspaceSummary(workspace.id));
     } catch (error) { return sendJson(res, 400, { error: error.message }); }
@@ -653,8 +729,66 @@ async function handleApi(req, res, url) {
   }
 
   if (url.pathname === '/api/capture' && req.method === 'POST') {
-    try { return sendJson(res, 201, captureBrowserSession(await readJson(req))); }
-    catch (error) { return sendJson(res, 400, { error: error.message }); }
+    return sendJson(res, 401, { ok: false, code: 'COMPANION_UNAUTHENTICATED', error: 'use the authenticated companion capture endpoint' });
+  }
+
+  if (url.pathname === '/api/storage/managed-project-migrations' && req.method === 'GET') {
+    return sendJson(res, 200, pendingManagedWorkspaceMigrations(db));
+  }
+
+  const migrateWorkspaceMatch = url.pathname.match(/^\/api\/workspaces\/([^/]+)\/migrate-managed-project$/);
+  if (migrateWorkspaceMatch && req.method === 'POST') {
+    try { const result = migrateManagedWorkspaceProject(db, migrateWorkspaceMatch[1]); refreshRootWatchers(); return sendJson(res, 200, result); }
+    catch (error) { return sendJson(res, 409, { ok: false, code: 'MIGRATION_FAILED', error: error.message }); }
+  }
+
+  const integrityMatch = url.pathname.match(/^\/api\/workspaces\/([^/]+)\/integrity$/);
+  if (integrityMatch && req.method === 'GET') {
+    const integrity = workspaceIntegrity(db, integrityMatch[1]);
+    return integrity ? sendJson(res, 200, integrity) : sendJson(res, 404, { error: 'workspace not found' });
+  }
+
+  const rootsMatch = url.pathname.match(/^\/api\/workspaces\/([^/]+)\/roots$/);
+  if (rootsMatch && req.method === 'GET') return sendJson(res, 200, workspaceRoots(db, rootsMatch[1]));
+  if (rootsMatch && req.method === 'POST') {
+    try {
+      const body = await readJson(req);
+      const root = registerWorkspaceRoot(db, rootsMatch[1], {
+        rootPath: body.path,
+        rootKind: ['primary', 'repository', 'linked_folder', 'resources'].includes(body.root_kind) ? body.root_kind : 'linked_folder',
+        label: String(body.label || '').slice(0, 120),
+        requiredForFreshness: body.required_for_freshness !== false,
+        indexingEnabled: body.indexing_enabled !== false,
+        providerTransmissionAllowed: body.transmission_policy !== 'local_only'
+      });
+      markWorkspaceStale(db, rootsMatch[1], 'approved_root_added');
+      refreshRootWatchers();
+      return sendJson(res, 201, root);
+    } catch (error) { return sendJson(res, 400, { ok: false, code: error.code || 'ROOT_REGISTRATION_FAILED', error: error.message }); }
+  }
+
+  const rootPolicyMatch = url.pathname.match(/^\/api\/workspace-roots\/([^/]+)\/policy$/);
+  if (rootPolicyMatch && req.method === 'PUT') {
+    const body = await readJson(req);
+    const root = row(db, 'SELECT * FROM workspace_roots WHERE id=?', rootPolicyMatch[1]);
+    if (!root) return sendJson(res, 404, { error: 'workspace root not found' });
+    run(db, `UPDATE workspace_roots SET required_for_freshness=?,indexing_enabled=?,provider_transmission_allowed=?,status='unknown',updated_at=? WHERE id=?`,
+      body.required_for_freshness === false ? 0 : 1, body.indexing_enabled === false ? 0 : 1, body.transmission_policy === 'local_only' ? 0 : 1, new Date().toISOString(), root.id);
+    markWorkspaceStale(db, root.workspace_id, 'root_policy_changed');
+    refreshRootWatchers();
+    return sendJson(res, 200, row(db, 'SELECT * FROM workspace_roots WHERE id=?', root.id));
+  }
+
+  const outgoingRunsMatch = url.pathname.match(/^\/api\/workspaces\/([^/]+)\/outgoing-context$/);
+  if (outgoingRunsMatch && req.method === 'GET') {
+    return sendJson(res, 200, rows(db, `SELECT id,session_id,provider,snapshot_id,status,final_context_hash,estimated_tokens,security_status,failure_code,created_at,sent_at,metadata_json FROM outgoing_context_runs WHERE workspace_id=? ORDER BY created_at DESC LIMIT 50`, outgoingRunsMatch[1]));
+  }
+
+  const outgoingRunDetail = url.pathname.match(/^\/api\/outgoing-context\/([^/]+)$/);
+  if (outgoingRunDetail && req.method === 'GET') {
+    const contextRun = row(db, 'SELECT * FROM outgoing_context_runs WHERE id=?', outgoingRunDetail[1]);
+    if (!contextRun) return sendJson(res, 404, { error: 'outgoing context run not found' });
+    return sendJson(res, 200, { ...contextRun, metadata: JSON.parse(contextRun.metadata_json || '{}'), sources: rows(db, 'SELECT * FROM outgoing_context_sources WHERE run_id=? ORDER BY retrieval_score DESC', contextRun.id) });
   }
 
   const wsMatch = url.pathname.match(/^\/api\/workspaces\/([^/]+)$/);
@@ -718,7 +852,9 @@ const server = http.createServer(async (req, res) => {
     fs.createReadStream(filePath).pipe(res);
   } catch (error) {
     console.error(error);
-    sendJson(res, error.message === 'request too large' ? 413 : 500, { error: error.message || 'internal server error' });
+    if (error.message === 'request too large') return sendJson(res, 413, { error: 'request too large' });
+    if (error instanceof SyntaxError) return sendJson(res, 400, { error: 'invalid JSON request' });
+    sendJson(res, 500, { error: 'internal server error' });
   }
 });
 

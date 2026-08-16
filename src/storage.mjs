@@ -17,17 +17,33 @@ export function defaultWorkspaceRoot() {
   return path.join(home, 'Documents', 'AI Harness');
 }
 
+export function defaultProjectsRoot() {
+  if (process.env.HARNESS_PROJECTS_ROOT?.trim()) return normalizeAbsolute(process.env.HARNESS_PROJECTS_ROOT);
+  const home = os.homedir();
+  return path.join(home, 'Documents', 'AI Workspace', 'Projects');
+}
+
 export function resolveWorkspaceRoot({ dbPath = null } = {}) {
-  if (process.env.HARNESS_WORKSPACE_ROOT?.trim()) return normalizeAbsolute(process.env.HARNESS_WORKSPACE_ROOT);
   if (dbPath) return path.dirname(normalizeAbsolute(dbPath));
+  if (process.env.HARNESS_WORKSPACE_ROOT?.trim()) return normalizeAbsolute(process.env.HARNESS_WORKSPACE_ROOT);
   return defaultWorkspaceRoot();
 }
 
-export function buildStoragePaths(workspaceRoot = defaultWorkspaceRoot()) {
+export function resolveProjectsRoot({ workspaceRoot = defaultWorkspaceRoot(), dbPath = null } = {}) {
+  if (process.env.HARNESS_PROJECTS_ROOT?.trim()) return normalizeAbsolute(process.env.HARNESS_PROJECTS_ROOT);
+  // An explicit database is normally a test, portable, or recovery instance. Keep
+  // its live projects beside that database instead of touching the user's default.
+  if (dbPath) return path.join(normalizeAbsolute(workspaceRoot), 'Projects');
+  return defaultProjectsRoot();
+}
+
+export function buildStoragePaths(workspaceRoot = defaultWorkspaceRoot(), projectsRoot = null) {
   const root = normalizeAbsolute(workspaceRoot);
+  const liveProjectsRoot = normalizeAbsolute(projectsRoot || defaultProjectsRoot());
   return {
     workspaceRoot: root,
-    projectsDir: path.join(root, 'Projects'),
+    projectsDir: liveProjectsRoot,
+    legacyProjectsDir: path.join(root, 'Projects'),
     libraryDir: path.join(root, 'Library'),
     archiveDir: path.join(root, 'Archive'),
     backupsDir: path.join(root, 'Backups'),
@@ -52,8 +68,18 @@ export function assertSafeWorkspaceRoot(workspaceRoot) {
   return root;
 }
 
+export function assertSafeProjectsRoot(projectsRoot, workspaceRoot = defaultWorkspaceRoot()) {
+  const root = normalizeAbsolute(projectsRoot);
+  const privateRoot = normalizeAbsolute(workspaceRoot);
+  if (isWithin(root, privateRoot) && root !== path.join(privateRoot, 'Projects')) {
+    throw new Error(`Unsafe projects root: ${root}. Live Project Space material must use a dedicated project parent, not a private Harness state subdirectory.`);
+  }
+  return root;
+}
+
 export function ensureStorageLayout(paths) {
   assertSafeWorkspaceRoot(paths.workspaceRoot);
+  assertSafeProjectsRoot(paths.projectsDir, paths.workspaceRoot);
   for (const dir of [
     paths.workspaceRoot,
     paths.projectsDir,

@@ -4,6 +4,7 @@ let active = null;
 let currentView = 'workspace';
 let readiness = null;
 let health = null;
+let managedMigrations = [];
 
 const qs = s => document.querySelector(s);
 const esc = (value = '') => String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
@@ -44,9 +45,10 @@ function statusBadge(status) {
 }
 
 async function load() {
-  const [settings, ws, ready, serviceHealth] = await Promise.all([api('/settings'), api('/workspaces'), api('/readiness'), api('/health')]);
+  const [settings, ws, ready, serviceHealth, migrations] = await Promise.all([api('/settings'), api('/workspaces'), api('/readiness'), api('/health'), api('/storage/managed-project-migrations')]);
   readiness = ready;
   health = serviceHealth;
+  managedMigrations = migrations;
   workspaces = ws;
   const versionLabel = qs('#versionLabel');
   if (versionLabel) versionLabel.textContent = `Version ${health?.version || 'unknown'}`;
@@ -55,9 +57,15 @@ async function load() {
   active = await api('/active-workspace');
   renderWorkspaceSelect();
   renderReadiness();
+  renderIntegrity();
   render();
   setInterval(async () => {
-    try { readiness = await api('/readiness'); renderReadiness(); } catch {}
+    try {
+      readiness = await api('/readiness');
+      if (active?.id) active.integrity = await api(`/workspaces/${encodeURIComponent(active.id)}/integrity`);
+      renderReadiness();
+      renderIntegrity();
+    } catch {}
   }, 10000);
 }
 
@@ -67,6 +75,17 @@ function renderReadiness() {
   el.classList.toggle('ready', Boolean(readiness.ready_for_native_workflow));
   el.querySelector('span:last-child').textContent = readiness.ready_for_native_workflow ? 'Harness ready' : 'Install/open companion';
   el.title = readiness.ready_for_native_workflow ? `Browser companion ${readiness.browser_companion_version || ''} seen ${readiness.browser_companion_last_seen || ''}` : 'The local service is running, but the browser companion has not checked in yet.';
+}
+
+function renderIntegrity() {
+  const el = qs('#integrityStatus');
+  if (!el || !active) return;
+  const integrity = active.integrity || {};
+  const status = String(integrity.freshness || active.freshness_status || 'stale').toLowerCase();
+  const labels = { current: 'Project Current', verifying: 'Verifying Project', stale: 'Context Stale', blocked: 'Context Blocked', error: 'Context Error' };
+  el.dataset.status = status;
+  el.querySelector('span:last-child').textContent = labels[status] || 'Context Stale';
+  el.title = integrity.last_verified_at ? `Last verified ${integrity.last_verified_at}. Guaranteed sends always verify again.` : 'No verified managed send snapshot yet.';
 }
 
 function renderWorkspaceSelect() {
@@ -121,6 +140,28 @@ function renderProjectResources() {
     </div>`;
 }
 
+function renderProjectIntegrity() {
+  const integrity = active.integrity || {};
+  const roots = active.roots || [];
+  const snapshot = integrity.latest_snapshot;
+  const reasons = snapshot?.details?.reasons || [];
+  const status = String(integrity.freshness || 'stale').toLowerCase();
+  const labels = { current: 'Project Current', verifying: 'Verifying Project', stale: 'Context Stale', blocked: 'Context Blocked', error: 'Context Error' };
+  return `
+    <div class="card integrity-card">
+      <div class="section-title"><div><div class="eyebrow">VERIFIED CONTEXT INTEGRITY</div><h3>${esc(labels[status] || 'Context Stale')}</h3></div><span class="badge ${status === 'current' ? 'safe' : ''}">${esc(status)}</span></div>
+      <p class="lede">${status === 'current' ? `Verified ${esc(integrity.last_verified_at || '')}. Every managed native send verifies again before it proceeds.` : 'The next managed native Send will reconcile every required source and will pause if currentness cannot be proven.'}</p>
+      <div class="integrity-grid">
+        <div><strong>Files/index</strong><span>generation ${esc(integrity.corpus_generation || 0)} / ${esc(integrity.index_generation || 0)}</span></div>
+        <div><strong>History coverage</strong><span>${esc(integrity.history_coverage || 'unknown')}</span></div>
+        <div><strong>Last snapshot</strong><span>${esc(snapshot?.id || 'none yet')}</span></div>
+      </div>
+      ${reasons.length ? `<div class="blocked-reasons">${reasons.map(reason => `<div><strong>${esc(reason.code)}</strong> ${esc(reason.message)}</div>`).join('')}</div>` : ''}
+      <div class="section-title source-head"><h3>Project Sources</h3><button class="tiny-button" id="addProjectRoot">Add linked source</button></div>
+      <div class="list">${roots.map(root => `<div class="list-row"><div><div class="list-title">${esc(root.label || root.root_kind)}</div><div class="list-sub">${esc(root.root_path)}<br>${root.required_for_freshness ? 'required' : 'optional'} · ${root.indexing_enabled ? 'indexed' : 'not indexed'} · ${root.provider_transmission_allowed ? 'provider allowed' : 'local only'}</div></div><span class="badge ${root.status === 'current' ? 'safe' : ''}">${esc(root.status || 'unknown')}</span></div>`).join('') || '<div class="empty">No approved roots.</div>'}</div>
+    </div>`;
+}
+
 function renderWorkspace() {
   const archive = active.archive || {};
   const recent = (active.sessions || []).slice(0, 6);
@@ -138,6 +179,7 @@ function renderWorkspace() {
         <div class="provider-actions">${providerButtons()}</div>
       </div>
     </div>
+    ${renderProjectIntegrity()}
     ${renderProjectResources()}
     <div class="metric-grid">
       ${metric('raw messages archived', archive.messages || 0)}
@@ -188,7 +230,8 @@ function renderSetup() {
     ['Local Harness service', service, service ? `v${health.version}` : 'not responding'],
     ['Persistent workspace root', Boolean(storage.workspace_root), storage.workspace_root || 'waiting for service'],
     ['SQLite archive', service, service ? `${health.archive?.messages || 0} messages indexed · ${storage.database_path || ''}` : 'waiting for service'],
-    ['Browser companion', companion, companion ? `v${readiness.browser_companion_version || 'unknown'} connected` : 'load the unpacked extension and refresh an AI tab'],
+    ['Browser companion pairing', Boolean(readiness?.browser_companion_paired), readiness?.browser_companion_paired ? `paired extension ${readiness.paired_extension_id || ''}` : 'pair the loaded extension below'],
+    ['Browser companion heartbeat', companion, companion ? `v${readiness.browser_companion_version || 'unknown'} connected` : 'refresh ChatGPT or Gemini after pairing'],
     ['Active project space', Boolean(active?.id && active?.root_path), active?.root_path || active?.name || 'create a project'],
   ];
   return `
@@ -209,8 +252,8 @@ function renderSetup() {
           <li>Drag a small PDF or image into Project Space and confirm it appears under resources.</li>
           <li>Open ChatGPT or Gemini, confirm the red AIH label appears, and send a short two-message exchange.</li>
           <li>Return here and confirm the chat appears under <strong>Chat History</strong>.</li>
-          <li>Start a fresh chat in the other AI service and use <strong>Insert workspace context</strong> in the companion.</li>
-          <li>Ask the second AI to identify the workspace objective/resource list. It should continue without you restating them.</li>
+          <li>Start a fresh chat in the other AI service and press the normal native Send button.</li>
+          <li>Harness should verify the Project Space, insert relevant cross-provider context, and then replay Send once.</li>
           <li>Do not delete either native chat yet unless its session status explicitly says <strong>safe to delete</strong>.</li>
         </ol>
       </div>
@@ -222,8 +265,10 @@ function renderSetup() {
     <div class="card" style="margin-top:18px">
       <div class="section-title"><h3>Browser companion installation</h3><span class="badge">Chrome / Edge</span></div>
       <div class="callout">Open the browser extensions page, enable Developer mode, choose <strong>Load unpacked</strong>, and select this repository's <code>extension</code> folder. After an extension update, press Reload on the extension and refresh ChatGPT/Gemini.</div>
+      <div class="pair-row"><button class="primary" id="pairCompanionButton">Pair browser companion</button><span id="pairCompanionStatus" class="list-sub">Pairing uses a one-time challenge; no token copying is required.</span></div>
       <p class="lede">Persistent projects, archive, and the database live under <code>${esc(storage.workspace_root || 'Documents\\AI Harness')}</code>, outside the updateable application checkout.</p>
-    </div>`;
+    </div>
+    ${managedMigrations.length ? `<div class="card" style="margin-top:18px"><div class="section-title"><h3>Move managed projects to AI Workspace</h3><span class="badge">${managedMigrations.length} pending</span></div><p class="lede">Harness copies and hash-verifies each managed project before updating its reference. The original remains as a recoverable fallback and conflicts are never overwritten.</p><div class="list">${managedMigrations.map(item => `<div class="list-row"><div><div class="list-title">${esc(item.name)}</div><div class="list-sub">${esc(item.root_path)}</div></div><button class="tiny-button" data-migrate-workspace="${esc(item.id)}">Migrate safely</button></div>`).join('')}</div></div>` : ''}`;
 }
 
 function render() {
@@ -277,6 +322,61 @@ async function uploadProjectFiles(files) {
 }
 
 function wireDynamicButtons() {
+  document.querySelectorAll('[data-migrate-workspace]').forEach(button => button.addEventListener('click', async e => {
+    const id = e.currentTarget.dataset.migrateWorkspace;
+    e.currentTarget.disabled = true;
+    e.currentTarget.textContent = 'Copying & verifying…';
+    try {
+      const result = await api(`/workspaces/${encodeURIComponent(id)}/migrate-managed-project`, { method: 'POST', body: '{}' });
+      e.currentTarget.textContent = result.migrated ? 'Migrated' : result.status;
+      managedMigrations = await api('/storage/managed-project-migrations');
+      if (active?.id === id) active = await api(`/workspaces/${encodeURIComponent(id)}`);
+      setTimeout(render, 500);
+    } catch (error) { e.currentTarget.textContent = `Blocked: ${error.message}`; }
+  }));
+
+  qs('#pairCompanionButton')?.addEventListener('click', async e => {
+    const button = e.currentTarget;
+    const status = qs('#pairCompanionStatus');
+    button.disabled = true;
+    try {
+      if (status) status.textContent = 'Creating one-time pairing challenge…';
+      const challenge = await api('/companion/pairing-challenge', { method: 'POST', body: '{}' });
+      const requestId = crypto.randomUUID();
+      const result = await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { window.removeEventListener('message', listener); reject(new Error('No loaded AI Harness extension answered the pairing request.')); }, 8000);
+        const listener = event => {
+          if (event.origin !== location.origin || event.data?.type !== 'aih-pair-result' || event.data.request_id !== requestId) return;
+          clearTimeout(timer);
+          window.removeEventListener('message', listener);
+          event.data.ok ? resolve(event.data) : reject(new Error(event.data.error || 'Pairing failed'));
+        };
+        window.addEventListener('message', listener);
+        window.postMessage({ type: 'aih-pair-request', request_id: requestId, challenge: challenge.challenge }, location.origin);
+      });
+      if (status) status.textContent = `Paired extension ${result.extension_id}. Refresh ChatGPT or Gemini.`;
+      readiness = await api('/readiness');
+      renderReadiness();
+    } catch (error) {
+      if (status) status.textContent = error.message;
+    } finally { button.disabled = false; }
+  });
+
+  qs('#addProjectRoot')?.addEventListener('click', async () => {
+    const folderPath = prompt('Paste the full path of the folder or repository to approve for this Project Space.');
+    if (!folderPath?.trim()) return;
+    const providerAllowed = confirm('Allow relevant non-secret material from this source to be sent to ChatGPT/Gemini? Choose Cancel to keep it local-only.');
+    try {
+      await api(`/workspaces/${encodeURIComponent(active.id)}/roots`, { method: 'POST', body: JSON.stringify({
+        path: folderPath.trim(), root_kind: 'linked_folder', required_for_freshness: true, indexing_enabled: true,
+        transmission_policy: providerAllowed ? 'provider_allowed' : 'local_only'
+      }) });
+      active = await api(`/workspaces/${encodeURIComponent(active.id)}`);
+      renderIntegrity();
+      render();
+    } catch (error) { alert(`Could not add source: ${error.message}`); }
+  });
+
   qs('#checkUpdatesButton')?.addEventListener('click', async e => {
     const button = e.currentTarget;
     const status = qs('#updateStatusText');
@@ -390,6 +490,7 @@ function wireDynamicButtons() {
 
 qs('#workspaceSelect').addEventListener('change', async e => {
   active = await api('/active-workspace', { method: 'PUT', body: JSON.stringify({ workspace_id: e.target.value }) });
+  renderIntegrity();
   render();
 });
 
@@ -411,18 +512,16 @@ qs('#nav').addEventListener('click', e => {
 });
 
 qs('#contextButton').addEventListener('click', async () => {
-  const packet = await api(`/workspaces/${active.id}/context`);
+  const runs = await api(`/workspaces/${encodeURIComponent(active.id)}/outgoing-context`);
+  const packet = runs.length ? await api(`/outgoing-context/${encodeURIComponent(runs[0].id)}`) : { integrity: await api(`/workspaces/${encodeURIComponent(active.id)}/integrity`), note: 'No managed send has prepared an outgoing context envelope yet.' };
   qs('#contextJson').textContent = JSON.stringify(packet, null, 2);
   qs('#contextDialog').showModal();
 });
 qs('#closeDialog').addEventListener('click', () => qs('#contextDialog').close());
 
 qs('#freshButton').addEventListener('click', async () => {
-  const packet = await api(`/workspaces/${active.id}/context`);
-  await navigator.clipboard.writeText(`WORKSPACE HANDOFF CONTEXT\n\n${JSON.stringify(packet, null, 2)}`);
   const gpt = active.providers.find(p => p.provider === 'chatgpt');
   if (gpt) window.open(gpt.url, '_blank', 'noopener');
-  alert('Workspace context copied. The browser companion can insert it into the fresh native chat.');
 });
 
 qs('#newWorkspaceButton').addEventListener('click', () => {
@@ -443,6 +542,7 @@ qs('#workspaceForm').addEventListener('submit', async e => {
   workspaces = await api('/workspaces');
   active = await api('/active-workspace', { method: 'PUT', body: JSON.stringify({ workspace_id: created.id }) });
   renderWorkspaceSelect();
+  renderIntegrity();
   qs('#workspaceDialog').close();
   currentView = 'workspace';
   document.querySelectorAll('.nav-item').forEach(item => item.classList.toggle('active', item.dataset.view === 'workspace'));

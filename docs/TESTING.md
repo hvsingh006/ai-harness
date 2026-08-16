@@ -1,100 +1,76 @@
-# Prototype 0.6 testing
+# AI Harness 0.8 testing
 
-This milestone is for validating the core continuity workflow. Do not judge `safe_to_delete` yet unless the UI explicitly marks a session safe. Live browser capture is intentionally conservative.
+## Automated gate
 
-## Before testing
-
-1. Install Node.js 22.5 or newer.
-2. From the repository, run `npm run doctor`.
-3. On Windows, double-click `start-harness.cmd` (or run `npm start`).
-4. Open Chrome or Edge extensions.
-5. Enable Developer mode.
-6. Load the repository's `extension/` folder as an unpacked extension.
-7. Refresh ChatGPT and/or Gemini.
-8. Open the Harness **Setup & Test** screen. A bright red **Harness ready** dot means the local service and companion are connected.
-
-## Test A: verify update-safe storage
-
-1. Open **Setup & Test** and confirm the persistent workspace root is outside the application checkout.
-2. Create a disposable Project Space.
-3. Confirm its project-folder path is under the persistent `Projects` directory.
-4. Drop in a small file and use **Open folder** to confirm the file exists as a normal filesystem file.
-5. Refresh the Harness and confirm the file remains indexed.
-
-Pass condition: application source and project storage are visibly separate, and the file exists outside the source checkout.
-
-## Test B: create a durable project space
-
-1. Click **New project**.
-2. Name it something disposable, such as `Harness smoke test`.
-3. Add a current focus.
-4. Drop in one small PDF, image, or text file.
-5. Confirm the resource appears and opens from Project Space.
-
-Pass condition: the project and file remain visible after refreshing the Harness dashboard.
-
-## Test C: native ChatGPT capture
-
-1. Open ChatGPT from Project Space.
-2. Confirm the red `AIH` label and companion card appear.
-3. Ask ChatGPT a short question that refers to the project focus.
-4. Send at least one follow-up.
-5. Wait about 15 seconds or press **Capture now**.
-6. Return to Harness > Sessions.
-
-Pass condition: the ChatGPT session appears with the expected provider, title, and message count.
-
-## Test D: provider switch without restating the project
-
-1. Open Gemini from the same Project Space.
-2. In the companion, press **Insert workspace context**.
-3. Ask Gemini: `What project am I working on, what is my current focus, and what resources are available?`
-
-Pass condition: Gemini can identify the project and resource inventory from Harness context without you manually restating it.
-
-This test validates workspace continuity. It does not yet guarantee that every historical transcript line or authenticated attachment is available to the second provider automatically.
-
-## Test E: archived chat reuse
-
-1. Return to the ChatGPT chat from Test B.
-2. Press **Bring this chat into prompt** in the companion.
-3. Confirm the archived-session context is inserted or copied.
-
-Pass condition: the Harness resolves the existing provider chat ID to the same internal session rather than creating an unrelated duplicate.
-
-## Test F: fresh session
-
-1. Start a new ChatGPT or Gemini native chat.
-2. Use **Insert workspace context**.
-3. Ask a question that depends on the project state.
-
-Pass condition: starting a new native conversation does not require reconstructing the project manually.
-
-## What is not yet a pass/fail criterion
-
-- automatic `safe_to_delete` for live chats
-- perfect capture of lazy-loaded very long conversations
-- every authenticated provider attachment
-- automatic context insertion with zero clicks
-- semantic chapter/jump navigation
-
-These are the next reliability targets after the first real-world smoke test.
-
-## If something fails
-
-Run:
+Run from the canonical repository:
 
 ```bash
+npm test
 npm run doctor
+npm run dev:status
 ```
 
-Record:
+The automated suite covers additive 0.7 database migration, storage isolation, safe legacy-project migration/conflicts, approved-root traversal/symlink security, immutable versions, deletion/new-file discovery, current-version-only retrieval, ChatGPT/Gemini/user weighting, repository state, chat reconciliation/coverage, secret blocking/redaction, companion pairing/auth/origin rules, outgoing audit/envelope cleanup, opaque current attachments, immediate pre-send disk changes, and unavailable-root HTTP 412 failure.
 
-- which provider/site failed
-- whether the AIH red label appeared
-- whether **Capture now** worked
-- the Harness session status
-- the browser version
-- the output of `npm run doctor`
+## Required live smoke setup
 
-Do not include private conversation content unless it is necessary to reproduce the issue.
+1. Start Harness from the canonical checkout.
+2. Load/reload `extension/` unpacked in Chrome or Edge.
+3. Open `http://127.0.0.1:4317/`, go to Setup, and pair the companion.
+4. Confirm **Harness ready**. This is connectivity only.
+5. Choose a disposable Project Space with a required text file and, optionally, a Git repository.
+
+## Live test A: current file without re-upload
+
+1. Open native ChatGPT directly.
+2. Ask a question that names the text file and press native Send.
+3. Inspect the outgoing context in Harness and confirm the current version/hash/provenance.
+4. Edit the file on disk without uploading or notifying the model.
+5. Ask again in the same or a new native chat.
+
+Pass: the second snapshot and context use the newest bytes/version. The old version remains archived but is not selected as current truth.
+
+## Live test B: cross-provider/new-chat continuity
+
+1. Record a user decision in ChatGPT.
+2. Continue in Gemini and add contradictory/new reasoning.
+3. Start a new ChatGPT chat directly and ask what to implement.
+
+Pass: selected evidence includes relevant reasoning from both providers, later evidence/current files, clean provenance, and honest history coverage without manual reconstruction.
+
+## Live test C: fail closed
+
+1. Complete one successful managed send.
+2. Rename or disconnect a required linked folder.
+3. Press native Send again.
+
+Pass: the user message remains intact, the native provider receives nothing, the companion shows `Context blocked`, HTTP preparation records `ROOT_UNAVAILABLE`, and the prior cached context is absent. Restore the root and retry; the new verification should succeed.
+
+## Live test D: native interaction safety
+
+Test ChatGPT and Gemini separately:
+
+- click Send;
+- Enter-to-send;
+- Shift+Enter newline;
+- double click / repeated Enter while preparing;
+- route change to a new chat;
+- provider response streaming state.
+
+Pass: exactly one native message is sent after a successful preparation, no recursion/double-send occurs, and failure restores/preserves the original composer text.
+
+## Live test E: long-history evidence
+
+Use a long lazy-loaded conversation. Choose **Capture & reconcile now**, then inspect session evidence: reached top, stable rounds, message count/fingerprints, timestamps, and adapter version.
+
+Pass: only evidence-backed captures become `COMPLETE`. Any uncertainty remains `PARTIAL`; `Project Current` may still describe current known sources but carries the coverage warning. Do not call a chat safe to delete until all preservation stages are complete.
+
+## Live test F: attachment confirmation
+
+Add an image once, then replace it on disk. Ask about its visual layout by name.
+
+Pass: the current version is prepared by opaque ID, the provider UI visibly confirms the filename before Send replay, and audit provenance identifies the current hash/version. If the provider control cannot confirm attachment, the send remains paused and the run is audited as failed.
+
+## Known environment limitation
+
+PDF text extraction uses local `pdftotext`. A missing executable or failed required-PDF extraction must produce `RESOURCE_INDEX_FAILED`; it is not an acceptable reason to claim Current from a cached/empty index. Provider DOM and attachment behavior require the live smoke tests above after browser/provider changes.

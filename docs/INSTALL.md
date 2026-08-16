@@ -1,67 +1,26 @@
-# Prototype 0.6.3 setup
+# AI Harness setup
 
-AI Harness keeps the updateable application separate from your permanent Project Spaces and chat archive.
+## Canonical checkout
 
-## Normal Windows use
-
-After installation, use the **AI Harness** Desktop or Start Menu shortcut. It runs `update-and-launch-harness.cmd`, which:
-
-1. checks `origin/main` for a newer version;
-2. if an update exists, creates a SQLite backup first;
-3. applies only a clean fast-forward update;
-4. installs required Node dependencies;
-5. runs diagnostics;
-6. rolls the application source back to the prior revision if validation fails;
-7. launches AI Harness.
-
-If GitHub cannot be reached, the Update & Launch wrapper opens the currently installed version instead.
-
-Application checkout:
+The normal Windows source/runtime checkout is:
 
 ```text
-%LOCALAPPDATA%\AI-Harness\app
+%USERPROFILE%\Documents\AI Workspace\Projects\ai-harness
 ```
 
-Persistent workspace:
+Private state remains under `%USERPROFILE%\Documents\AI Harness`; managed live projects default to `%USERPROFILE%\Documents\AI Workspace\Projects`. The setup/update scripts preserve this separation and do not create a duplicate installed source tree.
 
-```text
-%USERPROFILE%\Documents\AI Harness
-```
-
-The persistent location contains Projects, Archive, Backups, and `harness.db`. It is not part of the Git repository.
+Requires Node.js 22.5 or newer. Run `npm run doctor`, then use `start-harness.cmd` or `npm start` and open `http://127.0.0.1:4317/`.
 
 ## Browser companion
 
-Chrome: `chrome://extensions`
+1. Open `chrome://extensions` or `edge://extensions`.
+2. Enable Developer mode and load this checkout's `extension/` folder unpacked.
+3. Open Harness Setup and choose **Pair browser companion**.
+4. Refresh native ChatGPT/Gemini.
 
-Edge: `edge://extensions`
+`Harness ready` means the paired companion and service are connected. It does not mean a Project Space is current or a chat is safe to delete; those have separate indicators.
 
-Enable Developer mode, choose **Load unpacked**, and select the application's `extension` folder. Refresh ChatGPT or Gemini.
+## Updates
 
-A bright red **Harness ready** dot means the local service and browser companion can see one another. It does not mean every individual chat is safe to delete.
-
-## Manual controls
-
-Update without launching:
-
-```text
-update-harness.cmd
-```
-
-Launch without checking for updates:
-
-```text
-start-harness.cmd
-```
-
-Diagnostics:
-
-```bash
-npm run doctor
-```
-
-Manual backup:
-
-```bash
-npm run backup
-```
+Use `update-and-launch-harness.cmd`. It refuses a dirty `main`, backs up private metadata, fetches and fast-forwards only, validates, rolls source back on validation failure, and launches the same canonical checkout. If GitHub is unavailable it leaves source unchanged and can launch the current revision.

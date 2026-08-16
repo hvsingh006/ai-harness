@@ -1,46 +1,59 @@
 # Persistent storage model
 
-AI Harness 0.6 separates application code from user data.
+AI Harness 0.8 separates live project material, private continuity state, and application source.
 
-## Default Windows layout
+## Defaults
 
 ```text
-%LOCALAPPDATA%\AI-Harness\app\        # recommended Git checkout / application
+%USERPROFILE%\Documents\AI Workspace\Projects\
+├── ai-harness\               # canonical Git checkout and runtime source
+└── <managed Project Space>\  # live working files
 
-%USERPROFILE%\Documents\AI Harness\  # persistent workspace root
-├── Projects\
-├── Library\
+%USERPROFILE%\Documents\AI Harness\
+├── harness.db
 ├── Archive\
-│   ├── Vault\
+│   ├── Vault\blobs\         # content-addressed immutable bytes
 │   └── Imports\
 ├── Backups\
-├── .harness\                         # runtime staging only
-└── harness.db
+├── Library\
+└── .harness\                 # private credential, staging, runtime files
 ```
 
-The application checkout can be deleted, replaced, recloned, or updated with `git pull` without deleting the persistent workspace root.
+`HARNESS_WORKSPACE_ROOT` selects the private state root. `HARNESS_PROJECTS_ROOT` selects the managed live-project parent. An explicit `HARNESS_DB`/database path keeps portable/test projects beside that database unless `HARNESS_PROJECTS_ROOT` is also explicit.
 
-## Managed project folders
+The canonical repository and private Harness state must remain separate. Git never stores databases, provider exports, vault blobs, credentials, tokens, backups, or browser profiles.
 
-Creating a Project Space creates a normal directory under `Projects/`. Files dragged into the Harness are written to that directory. They remain ordinary user-visible files that can also be opened in Explorer, VS Code, or other applications.
+## Multiple roots
 
-The Harness separately creates immutable archive snapshots when files enter an AI workflow. The project filesystem and archive vault serve different purposes:
+`workspace_roots` records every approved source with canonical identity and independent policy:
 
-- **Project filesystem:** current human-facing working files.
-- **Archive vault:** preserved historical source bytes and chat/provider assets.
+- `primary`, `repository`, `linked_folder`, or `resources` label/kind;
+- required or optional for freshness;
+- indexing enabled or disabled;
+- provider allowed or local only.
 
-## Existing folders
+Kind is descriptive, not an authorization. Authorization comes from the explicit root record and canonical containment checks. Linked external folders stay where they are.
 
-A Project Space can be pointed at an existing folder. The Harness records the path and indexes it in place. It does not move or delete the folder.
+## Resources and versions
 
-## Updates
+`workspace_resources` is the stable logical identity `(root, relative path)`. `resource_versions` is immutable bytes/metadata identified by SHA-256. `current_version_id` selects current truth; old versions remain in the vault and are excluded from normal retrieval. Deletion marks the logical resource deleted without removing historical versions.
 
-`update-harness.ps1` performs a Harness database backup before `git pull --ff-only` and then runs diagnostics. Git only changes application source. Project folders and the archive are external.
+Text/PDF extraction produces rebuildable `resource_chunks` plus SQLite FTS5 rows with line/page/version provenance. Binary/image resources retain truthful metadata even when no text exists.
 
-## Legacy 0.5 migration
+## Snapshots and audits
 
-On first normal startup, if the new external `harness.db` does not exist but the old application-local `data/harness.db` does, 0.6 migrates it into the persistent workspace root and creates a backup of the legacy data. Artifact vault paths are reconciled to the new archive vault.
+`project_snapshots` stores the exact root/repository/generation/security evidence used by a preparation. `workspace_state` is a compact rebuildable current-state view. `outgoing_context_runs` and `outgoing_context_sources` record sanitized transmitted context, hashes, exclusions, attachment versions, scores, provenance, diagnostics, and blocked reasons. Raw detected secrets are not copied into security findings.
 
-## Override
+## Legacy managed-project migration
 
-Set `HARNESS_WORKSPACE_ROOT` to use a different persistent location. The Harness rejects a workspace root inside the application checkout because that would defeat update isolation.
+Older managed live folders under private `%USERPROFILE%\Documents\AI Harness\Projects` are migration candidates. Setup performs an explicit safe migration:
+
+1. refuse attached external folders;
+2. refuse an existing target conflict;
+3. copy to a unique staging directory under the live projects parent;
+4. compare file count/path/size/SHA-256 manifests;
+5. rename the verified staging tree into place;
+6. transactionally update workspace/root references and write a migration record;
+7. retain the original source tree as a recoverable fallback.
+
+The private archive/history is not moved or rewritten. No source tree is deleted automatically.

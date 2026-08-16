@@ -1,66 +1,20 @@
 (() => {
-  const API = 'http://127.0.0.1:4317/api';
   const AUTO_CAPTURE_INTERVAL_MS = 15000;
   const COMPANION_VERSION = chrome.runtime.getManifest().version;
-  if (document.getElementById('aih-companion')) return;
+  const provider = location.hostname === 'chatgpt.com' ? 'chatgpt' : location.hostname === 'gemini.google.com' ? 'gemini' : '';
+  const adapter = globalThis.AIH_PROVIDER_ADAPTERS?.[provider];
+  if (!adapter || document.getElementById('aih-companion')) return;
+  const pendingSessionRef = { ref_type: 'route', ref_value: `pending:${provider}:${crypto.randomUUID()}`, source: 'browser_companion' };
 
-  let lastFingerprint = '';
-  let autoCaptureEnabled = true;
-  let captureInFlight = false;
+  let workspace = null;
   let boundSession = null;
-  let boundWorkspace = null;
+  let lastFingerprint = '';
   let lastLocationHref = location.href;
-
-  function providerId() {
-    if (location.hostname === 'chatgpt.com') return 'chatgpt';
-    if (location.hostname === 'gemini.google.com') return 'gemini';
-    return 'unknown';
-  }
-
-  function providerRefs() {
-    const refs = [
-      { ref_type: 'route', ref_value: `${location.pathname}${location.search}`, source: 'browser_companion' },
-      { ref_type: 'native_url', ref_value: location.href, source: 'browser_companion' }
-    ];
-    let match = null;
-    if (providerId() === 'chatgpt') match = location.pathname.match(/\/c\/([^/?#]+)/);
-    if (providerId() === 'gemini') match = location.pathname.match(/\/app\/([^/?#]+)/);
-    if (match?.[1]) refs.unshift({ ref_type: 'chat_id', ref_value: match[1], source: 'browser_companion' });
-    return refs;
-  }
-
-  async function clientId() {
-    try {
-      const stored = await chrome.storage.local.get('aih_client_id');
-      if (stored.aih_client_id) return stored.aih_client_id;
-      const id = crypto.randomUUID();
-      await chrome.storage.local.set({ aih_client_id: id });
-      return id;
-    } catch {
-      return 'anonymous-companion';
-    }
-  }
-
-  async function heartbeat() {
-    return request('/companion/heartbeat', {
-      method: 'POST',
-      body: JSON.stringify({ client_id: await clientId(), version: COMPANION_VERSION, provider: providerId(), metadata: { hostname: location.hostname } })
-    });
-  }
-
-  async function resolveCurrentSession() {
-    const params = new URLSearchParams({ provider: providerId() });
-    for (const ref of providerRefs()) params.set(ref.ref_type, ref.ref_value);
-    try {
-      return await request(`/provider-session?${params.toString()}`);
-    } catch {
-      return null;
-    }
-  }
-
-  function providerName() {
-    return ({ chatgpt: 'ChatGPT', gemini: 'Gemini' })[providerId()] || 'AI service';
-  }
+  let captureInFlight = false;
+  let autoCaptureEnabled = true;
+  let sendState = 'idle';
+  let cardNote = null;
+  let pendingIdentityUsed = false;
 
   async function request(path, options = {}) {
     const result = await chrome.runtime.sendMessage({
@@ -69,56 +23,41 @@
       options: {
         method: options.method || 'GET',
         headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
-        body: typeof options.body === 'string' ? options.body : undefined
+        body: typeof options.body === 'string' ? options.body : options.body === undefined ? undefined : JSON.stringify(options.body)
       }
     });
     if (!result) throw new Error('Harness companion background unavailable');
     if (result.error) throw new Error(result.error);
-    if (!result.ok) throw new Error(result.text || `Harness request failed (${result.status})`);
-    if (result.status === 204 || !result.text) return null;
-    try { return JSON.parse(result.text); }
-    catch { throw new Error('Harness returned an invalid response'); }
-  }
-
-  function findComposer() {
-    if (providerId() === 'chatgpt') return document.querySelector('#prompt-textarea') || document.querySelector('[contenteditable="true"]');
-    if (providerId() === 'gemini') return document.querySelector('rich-textarea [contenteditable="true"]') || document.querySelector('[contenteditable="true"]');
-    return null;
-  }
-
-  function insertText(element, text) {
-    if (!element) return false;
-    element.focus();
-    if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
-      const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), 'value')?.set;
-      if (setter) setter.call(element, text); else element.value = text;
-      element.dispatchEvent(new Event('input', { bubbles: true }));
-      return true;
+    let payload = null;
+    try { payload = result.text ? JSON.parse(result.text) : null; } catch {}
+    if (!result.ok) {
+      const error = new Error(payload?.reasons?.map(item => item.message).join('; ') || payload?.error || `Harness request failed (${result.status})`);
+      error.payload = payload;
+      throw error;
     }
-    if (element.isContentEditable) {
-      element.textContent = text;
-      element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
-      return true;
-    }
-    return false;
+    return payload;
   }
 
-  async function contextText(workspace) {
-    const packet = await request(`/workspaces/${workspace.id}/context`);
-    return [
-      '[AI HARNESS WORKSPACE CONTEXT]',
-      'Use this as durable workspace background. Do not repeat it unless useful. Continue established work without requiring restatement. Use relevant prior user prompts, prior ChatGPT/Gemini responses, project files, PDFs, images, native tools, archive material, and current web information when useful. If the corpus is too large, retrieve progressively relevant subsets rather than ignoring material or flooding the context window. Preserve the user\'s critical thinking and judgment.',
-      JSON.stringify(packet),
-      '[/AI HARNESS WORKSPACE CONTEXT]',
-      '',
-      'Continue the workspace from here:'
-    ].join('\n');
+  async function sha256(value) {
+    const bytes = new TextEncoder().encode(String(value || ''));
+    const digest = await crypto.subtle.digest('SHA-256', bytes);
+    return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+  }
+
+  function providerName() {
+    return provider === 'chatgpt' ? 'ChatGPT' : 'Gemini';
+  }
+
+  function providerRefs() {
+    const refs = adapter.refs();
+    if (refs.some(ref => ref.ref_type === 'chat_id')) return pendingIdentityUsed ? [pendingSessionRef, ...refs] : refs;
+    return [pendingSessionRef];
   }
 
   function uniqueMessages(items) {
     const seen = new Set();
     return items.filter(item => {
-      const key = `${item.role}\0${item.content}`;
+      const key = item.provider_message_id || `${item.role}\0${item.content}`;
       if (!item.content || seen.has(key)) return false;
       seen.add(key);
       return true;
@@ -126,119 +65,117 @@
   }
 
   function captureMessages() {
-    const provider = providerId();
-    const messages = [];
-    if (provider === 'chatgpt') {
-      const nodes = [...document.querySelectorAll('[data-message-author-role]')];
-      nodes.forEach((node, index) => messages.push({
-        role: node.getAttribute('data-message-author-role') || 'unknown',
-        content: node.innerText?.trim() || '',
-        provider_message_id: node.getAttribute('data-message-id') || node.closest('[data-message-id]')?.getAttribute('data-message-id') || '',
-        raw: { index, html: node.outerHTML.slice(0, 250000) }
-      }));
-    } else if (provider === 'gemini') {
-      const nodes = [...document.querySelectorAll('user-query, model-response')];
-      nodes.forEach((node, index) => messages.push({
-        role: node.tagName.toLowerCase() === 'user-query' ? 'user' : 'assistant',
-        content: node.innerText?.trim() || '',
-        provider_message_id: node.id || '',
-        raw: { index, tag: node.tagName.toLowerCase(), html: node.outerHTML.slice(0, 250000) }
-      }));
-    }
-    return uniqueMessages(messages);
+    return uniqueMessages(adapter.captureMessages());
   }
 
-  function captureAssetReferences() {
+  function captureAssets() {
     const assets = [];
     const seen = new Set();
     const filePattern = /\.(pdf|docx?|xlsx?|pptx?|csv|txt|md|zip|png|jpe?g|webp|gif)(?:[?#]|$)/i;
     for (const anchor of document.querySelectorAll('a[href]')) {
       const url = anchor.href;
-      const name = anchor.getAttribute('download') || anchor.textContent?.trim() || url.split('/').pop() || 'linked asset';
-      if (!url || (!filePattern.test(url) && !anchor.hasAttribute('download') && !/file|download|attachment/i.test(anchor.getAttribute('aria-label') || ''))) continue;
-      if (seen.has(url)) continue;
+      if (!url || seen.has(url) || (!filePattern.test(url) && !anchor.hasAttribute('download') && !/file|download|attachment/i.test(anchor.getAttribute('aria-label') || ''))) continue;
       seen.add(url);
-      assets.push({ asset_type: 'file', name: name.slice(0, 240), url, native_id: anchor.dataset?.id || '' });
+      assets.push({ asset_type: 'file', name: (anchor.getAttribute('download') || anchor.textContent?.trim() || 'linked asset').slice(0, 240), url, native_id: anchor.dataset?.id || '' });
     }
-    for (const img of document.querySelectorAll('main img[src], [role="main"] img[src]')) {
-      const url = img.currentSrc || img.src;
-      if (!url || url.startsWith('data:') || (img.naturalWidth && img.naturalWidth < 120 && img.naturalHeight < 120) || seen.has(url)) continue;
+    for (const image of document.querySelectorAll('main img[src], [role="main"] img[src]')) {
+      const url = image.currentSrc || image.src;
+      if (!url || url.startsWith('data:') || seen.has(url) || (image.naturalWidth && image.naturalWidth < 120 && image.naturalHeight < 120)) continue;
       seen.add(url);
-      assets.push({ asset_type: 'image', name: img.alt || 'conversation image', url, mime_type: 'image/*' });
+      assets.push({ asset_type: 'image', name: image.alt || 'conversation image', url, mime_type: 'image/*' });
     }
     return assets;
   }
 
-  function fingerprint(messages, assets) {
-    const tail = messages.slice(-4).map(m => `${m.role}:${m.content}`).join('|');
-    return `${location.href}|${messages.length}|${assets.length}|${tail}`;
-  }
-
-  async function mirrorAssets(result) {
-    const pending = (result.asset_refs || []).filter(a => a.mirror_status !== 'captured' && a.source_url);
-    let mirrored = 0;
-    for (const asset of pending.slice(0, 12)) {
-      try {
-        const source = await fetch(asset.source_url, { credentials: 'include' });
-        if (!source.ok) continue;
-        const blob = await source.blob();
-        if (!blob.size) continue;
-        const response = await fetch(`${API}/session-assets/${encodeURIComponent(asset.id)}/content`, {
-          method: 'PUT',
-          headers: { 'Content-Type': blob.type || asset.mime_type || 'application/octet-stream' },
-          body: blob
-        });
-        if (response.ok) mirrored += 1;
-      } catch {
-        // An authenticated or cross-origin source may not be fetchable from a content script.
-        // It remains referenced and therefore blocks deletion-safe status.
+  async function visibleEvidence({ complete = false } = {}) {
+    const startedAt = new Date().toISOString();
+    const scroller = adapter.conversationScroller();
+    const previousTop = scroller?.scrollTop || 0;
+    let stableRounds = 0;
+    let previousFirst = '';
+    let previousCount = -1;
+    let reachedTop = !scroller || scroller.scrollTop <= 1;
+    if (complete && scroller) {
+      for (let round = 0; round < 16; round++) {
+        const messages = captureMessages();
+        const first = messages[0] ? await sha256(`${messages[0].role}\0${messages[0].content}`) : '';
+        if (messages.length === previousCount && first === previousFirst && !adapter.loadingVisible()) stableRounds += 1;
+        else stableRounds = 0;
+        previousCount = messages.length;
+        previousFirst = first;
+        reachedTop = scroller.scrollTop <= 1;
+        if (reachedTop && stableRounds >= 2) break;
+        scroller.scrollTop = 0;
+        await new Promise(resolve => setTimeout(resolve, 350));
       }
+      try { scroller.scrollTop = previousTop; } catch {}
     }
-    return mirrored;
+    const messages = captureMessages();
+    const firstMessageFingerprint = messages[0] ? await sha256(`${messages[0].role}\0${messages[0].content}`) : '';
+    const lastMessageFingerprint = messages.at(-1) ? await sha256(`${messages.at(-1).role}\0${messages.at(-1).content}`) : '';
+    if (!complete) stableRounds = 0;
+    if (!messages.length && reachedTop) stableRounds = 2;
+    return {
+      synchronized_visible: !adapter.loadingVisible(),
+      reached_top: reachedTop,
+      stable_rounds: stableRounds,
+      visible_message_count: messages.length,
+      first_message_fingerprint: firstMessageFingerprint,
+      last_message_fingerprint: lastMessageFingerprint,
+      capture_started_at: startedAt,
+      capture_completed_at: new Date().toISOString(),
+      provider_adapter_version: adapter.version,
+      reason_if_partial: reachedTop && stableRounds >= 2 ? '' : complete ? 'provider history did not reach a stable top boundary' : 'periodic visible-DOM capture'
+    };
   }
 
-  async function captureCurrent(workspace, { force = false } = {}) {
-    if (captureInFlight) return null;
+  async function capturePayload({ complete = false } = {}) {
+    const evidence = await visibleEvidence({ complete });
+    const refs = providerRefs();
+    if (!refs.some(ref => ref.ref_type === 'chat_id')) pendingIdentityUsed = true;
+    return {
+      workspace_id: workspace.id,
+      provider,
+      title: document.title.replace(/\s*[-|]\s*(ChatGPT|Gemini).*$/i, '').trim() || `${providerName()} session`,
+      native_url: location.href,
+      external_id: refs.find(ref => ref.ref_type === 'chat_id')?.ref_value || pendingSessionRef.ref_value,
+      provider_refs: refs,
+      messages: captureMessages(),
+      assets: captureAssets(),
+      capture_evidence: evidence
+    };
+  }
+
+  async function resolveCurrentSession() {
+    const params = new URLSearchParams({ provider });
+    for (const ref of providerRefs()) params.set(ref.ref_type, ref.ref_value);
+    try { return await request(`/companion/provider-session?${params.toString()}`); }
+    catch { return null; }
+  }
+
+  async function captureCurrent({ force = false, complete = false } = {}) {
+    if (captureInFlight || !workspace) return null;
     const messages = captureMessages();
-    const assets = captureAssetReferences();
-    const nextFingerprint = fingerprint(messages, assets);
-    if (!force && (!messages.length || nextFingerprint === lastFingerprint)) return null;
+    const assets = captureAssets();
+    const fingerprint = `${location.href}|${messages.length}|${assets.length}|${messages.slice(-3).map(item => item.content).join('|')}`;
+    if (!force && (!messages.length || fingerprint === lastFingerprint)) return null;
     captureInFlight = true;
     try {
-      const result = await request('/capture', {
-        method: 'POST',
-        body: JSON.stringify({
-          workspace_id: workspace.id,
-          provider: providerId(),
-          title: document.title.replace(/\s*[-|]\s*(ChatGPT|Gemini).*$/i, '').trim() || `${providerName()} session`,
-          native_url: location.href,
-          external_id: providerRefs().find(ref => ref.ref_type === 'chat_id')?.ref_value || location.pathname + location.search,
-          provider_refs: providerRefs(),
-          complete: false,
-          messages,
-          assets
-        })
-      });
-      lastFingerprint = nextFingerprint;
-      boundSession = result.session || boundSession;
-      boundWorkspace = result.workspace || boundWorkspace;
+      const result = await request('/companion/capture', { method: 'POST', body: await capturePayload({ complete }) });
+      lastFingerprint = fingerprint;
+      boundSession = result.session;
+      workspace = result.workspace || workspace;
       updateNativeLabel();
-      const mirrored = await mirrorAssets(result);
-      return { ...result, mirrored };
+      return result;
     } finally {
       captureInFlight = false;
     }
   }
 
-  async function getAutoCaptureSetting() {
-    try {
-      const value = await chrome.storage.local.get('aih_auto_capture');
-      return value.aih_auto_capture !== false;
-    } catch { return true; }
-  }
-
-  async function setAutoCaptureSetting(enabled) {
-    try { await chrome.storage.local.set({ aih_auto_capture: enabled }); } catch {}
+  function setStatus(message, status = '') {
+    if (!cardNote) return;
+    cardNote.textContent = message;
+    cardNote.dataset.status = status;
   }
 
   function updateNativeLabel() {
@@ -247,29 +184,88 @@
       label = document.createElement('button');
       label.id = 'aih-native-label';
       label.type = 'button';
-      label.title = 'AI Harness workspace label. Click to open the local archive.';
+      label.title = 'AI Harness Project Space association';
       label.addEventListener('click', () => window.open('http://127.0.0.1:4317/', '_blank'));
       document.body.appendChild(label);
     }
-    const workspaceName = boundWorkspace?.name || 'AI Harness';
     const chatId = providerRefs().find(ref => ref.ref_type === 'chat_id')?.ref_value || '';
-    const shortId = chatId ? chatId.slice(0, 8) : (boundSession?.id || '').replace(/^session-/, '').slice(0, 8);
-    label.textContent = `AIH · ${workspaceName}${shortId ? ` · ${shortId}` : ''}`;
+    const shortId = chatId ? chatId.slice(0, 8) : String(boundSession?.id || '').replace(/^session-/, '').slice(0, 8);
+    label.textContent = `AIH · ${workspace?.name || 'Unassociated'}${shortId ? ` · ${shortId}` : ''}`;
   }
 
-  async function archivedSessionText() {
-    if (!boundSession) {
-      const resolved = await resolveCurrentSession();
-      if (resolved) { boundSession = resolved; boundWorkspace = resolved.workspace; updateNativeLabel(); }
+  function decodeAttachment(base64, mimeType) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+    return new Blob([bytes], { type: mimeType });
+  }
+
+  async function attachPreparedFiles(attachments) {
+    for (const attachment of attachments || []) {
+      const result = await chrome.runtime.sendMessage({ type: 'aih-resource-request', path: attachment.download_path });
+      if (!result?.ok) throw new Error(result?.error || `Could not load current attachment ${attachment.name}`);
+      const file = new File([decodeAttachment(result.data_base64, attachment.mime_type)], attachment.name, { type: attachment.mime_type, lastModified: Date.now() });
+      const attached = await adapter.attachFile(file);
+      if (!attached.ok) throw new Error(`${attachment.name}: ${attached.reason}`);
     }
-    if (!boundSession) throw new Error('Capture this chat first');
-    const packet = await request(`/sessions/${encodeURIComponent(boundSession.id)}/context`);
-    return [
-      '[AI HARNESS ARCHIVED SESSION CONTEXT]',
-      'Use this archived session as source material for the current task. Prior assistant responses are fallible; retain the user prompts, reasoning, files, and provenance. If this packet is truncated, retrieve deeper archive material when needed.',
-      JSON.stringify(packet),
-      '[/AI HARNESS ARCHIVED SESSION CONTEXT]'
-    ].join('\n');
+  }
+
+  async function prepareAndReplay() {
+    if (sendState !== 'idle') return;
+    const composer = adapter.findComposer();
+    const originalText = adapter.composerText(composer).trim();
+    if (!composer || !originalText) return;
+    const sendButton = adapter.findSendButton();
+    if (!sendButton) {
+      setStatus('Context blocked: provider Send control was not recognized.', 'blocked');
+      return;
+    }
+    sendState = 'preparing';
+    setStatus('Verifying Project Space before send…', 'verifying');
+    let prepared = null;
+    try {
+      prepared = await request(`/companion/workspaces/${encodeURIComponent(workspace.id)}/prepare-send`, {
+        method: 'POST',
+        body: { provider, user_prompt: originalText, capture: await capturePayload({ complete: true }) }
+      });
+      await attachPreparedFiles(prepared.attachments);
+      if (!adapter.setComposerText(composer, prepared.provider_text)) throw new Error('provider composer could not receive verified context');
+      const replayButton = adapter.findSendButton();
+      if (!replayButton?.isConnected) throw new Error('provider Send control changed during context preparation');
+      sendState = 'replaying';
+      setStatus(`Project Current · snapshot ${prepared.snapshot_id.slice(-8)} · sending once`, 'current');
+      replayButton.click();
+      request(`/companion/outgoing-context/${encodeURIComponent(prepared.run_id)}/sent`, { method: 'POST', body: {} }).catch(() => {});
+      setTimeout(() => { if (sendState === 'replaying') sendState = 'idle'; }, 1500);
+    } catch (error) {
+      if (prepared?.run_id) request(`/companion/outgoing-context/${encodeURIComponent(prepared.run_id)}/failed`, { method: 'POST', body: { code: prepared.attachments?.length ? 'ATTACHMENT_PREP_FAILED' : 'NATIVE_SEND_PREP_FAILED', message: error.message } }).catch(() => {});
+      if (adapter.composerText(composer).includes('[AI HARNESS VERIFIED PROJECT CONTEXT]')) adapter.setComposerText(composer, originalText);
+      sendState = 'error';
+      const reasons = error.payload?.reasons || [];
+      setStatus(`Context blocked: ${reasons.map(item => item.message).join('; ') || error.message}`, 'blocked');
+      setTimeout(() => { if (sendState === 'error') sendState = 'idle'; }, 800);
+    }
+  }
+
+  function interceptClick(event) {
+    if (!adapter.matchesSendTarget(event.target)) return;
+    if (sendState === 'replaying') {
+      sendState = 'idle';
+      return;
+    }
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    prepareAndReplay();
+  }
+
+  function interceptKeydown(event) {
+    if (event.key !== 'Enter' || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey || event.isComposing) return;
+    const composer = adapter.findComposer();
+    if (!composer || !(event.target === composer || composer.contains(event.target))) return;
+    if (sendState === 'replaying') return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    prepareAndReplay();
   }
 
   async function refreshRouteBinding() {
@@ -277,128 +273,88 @@
     lastLocationHref = location.href;
     lastFingerprint = '';
     boundSession = null;
-    boundWorkspace = null;
     const resolved = await resolveCurrentSession();
-    if (resolved) { boundSession = resolved; boundWorkspace = resolved.workspace; }
+    if (resolved) {
+      boundSession = resolved;
+      workspace = resolved.workspace || workspace;
+    }
     updateNativeLabel();
   }
 
   async function mount() {
-    let workspace;
-    try { workspace = await request('/active-workspace'); } catch { return; }
-    if (!workspace) return;
-    autoCaptureEnabled = await getAutoCaptureSetting();
-    try { await heartbeat(); } catch {}
+    try {
+      workspace = await request('/companion/active-workspace');
+      await request('/companion/heartbeat', { method: 'POST', body: { version: COMPANION_VERSION, provider, metadata: { hostname: location.hostname, adapter_version: adapter.version } } });
+    } catch {
+      return;
+    }
     const resolved = await resolveCurrentSession();
-    if (resolved) { boundSession = resolved; boundWorkspace = resolved.workspace; }
+    if (resolved) {
+      boundSession = resolved;
+      workspace = resolved.workspace || workspace;
+    }
+    const stored = await chrome.storage.local.get('aih_auto_capture').catch(() => ({}));
+    autoCaptureEnabled = stored.aih_auto_capture !== false;
 
     const root = document.createElement('div');
     root.id = 'aih-companion';
     root.innerHTML = `
       <div class="aih-card">
-        <div class="aih-head">
-          <span class="aih-dot"></span>
-          <div class="aih-title"><strong></strong><span></span></div>
-          <button class="aih-toggle" title="Collapse">−</button>
-        </div>
+        <div class="aih-head"><span class="aih-dot"></span><div class="aih-title"><strong></strong><span></span></div><button class="aih-toggle" title="Collapse">−</button></div>
         <div class="aih-body">
-          <button class="aih-button aih-capture">Capture now</button>
+          <button class="aih-button aih-capture">Capture & reconcile now</button>
           <button class="aih-button aih-auto"></button>
-          <button class="aih-button aih-insert">Insert workspace context</button>
-          <button class="aih-button aih-use-chat">Bring this chat into prompt</button>
-          <button class="aih-button aih-copy">Copy context packet</button>
           <button class="aih-button aih-open">Open Harness</button>
-          <div class="aih-note">Loaded-page history is archived incrementally. A chat remains deletion-unsafe until the harness verifies transcript completeness and mirrors every discovered asset.</div>
+          <div class="aih-note">Managed native sends verify current files, repository state, chat synchronization, retrieval, and security before replaying Send.</div>
         </div>
       </div>`;
     root.querySelector('.aih-title strong').textContent = workspace.name;
-    root.querySelector('.aih-title span').textContent = `${providerName()} · persistent workspace connected`;
+    root.querySelector('.aih-title span').textContent = `${providerName()} · guaranteed managed send active`;
+    cardNote = root.querySelector('.aih-note');
     document.body.appendChild(root);
     updateNativeLabel();
 
     const autoButton = root.querySelector('.aih-auto');
-    const updateAutoLabel = () => { autoButton.textContent = `Auto capture: ${autoCaptureEnabled ? 'on' : 'off'}`; };
-    updateAutoLabel();
-
-    root.querySelector('.aih-toggle').addEventListener('click', e => {
+    const updateAuto = () => { autoButton.textContent = `Auto capture: ${autoCaptureEnabled ? 'on' : 'off'}`; };
+    updateAuto();
+    root.querySelector('.aih-toggle').addEventListener('click', event => {
       root.classList.toggle('aih-collapsed');
-      e.currentTarget.textContent = root.classList.contains('aih-collapsed') ? '+' : '−';
+      event.currentTarget.textContent = root.classList.contains('aih-collapsed') ? '+' : '−';
     });
     root.querySelector('.aih-open').addEventListener('click', () => window.open('http://127.0.0.1:4317/', '_blank'));
-
     autoButton.addEventListener('click', async () => {
       autoCaptureEnabled = !autoCaptureEnabled;
-      await setAutoCaptureSetting(autoCaptureEnabled);
-      updateAutoLabel();
-      if (autoCaptureEnabled) captureCurrent(workspace, { force: true }).catch(() => {});
+      await chrome.storage.local.set({ aih_auto_capture: autoCaptureEnabled });
+      updateAuto();
     });
-
-    root.querySelector('.aih-copy').addEventListener('click', async e => {
-      const original = e.currentTarget.textContent;
+    root.querySelector('.aih-capture').addEventListener('click', async event => {
+      const original = event.currentTarget.textContent;
+      event.currentTarget.textContent = 'Reconciling…';
       try {
-        await navigator.clipboard.writeText(await contextText(workspace));
-        e.currentTarget.textContent = 'Copied';
-      } catch { e.currentTarget.textContent = 'Copy failed'; }
-      setTimeout(() => e.currentTarget.textContent = original, 1400);
+        const result = await captureCurrent({ force: true, complete: true });
+        setStatus(`Captured ${result?.session?.message_count || 0} messages · history ${result?.session?.history_coverage || 'unknown'}.`, result?.raw_capture_complete ? 'current' : 'partial');
+      } catch (error) { setStatus(`Capture blocked: ${error.message}`, 'blocked'); }
+      event.currentTarget.textContent = original;
     });
 
-    root.querySelector('.aih-insert').addEventListener('click', async e => {
-      const original = e.currentTarget.textContent;
-      const text = await contextText(workspace);
-      const composer = findComposer();
-      if (insertText(composer, text)) e.currentTarget.textContent = 'Context inserted';
-      else {
-        await navigator.clipboard.writeText(text);
-        e.currentTarget.textContent = 'Copied, paste into chat';
-      }
-      setTimeout(() => e.currentTarget.textContent = original, 1600);
-    });
-
-    root.querySelector('.aih-use-chat').addEventListener('click', async e => {
-      const original = e.currentTarget.textContent;
-      e.currentTarget.textContent = 'Preparing archived chat…';
-      try {
-        const text = await archivedSessionText();
-        const composer = findComposer();
-        if (insertText(composer, text)) e.currentTarget.textContent = 'Chat context inserted';
-        else {
-          await navigator.clipboard.writeText(text);
-          e.currentTarget.textContent = 'Copied, paste into prompt';
-        }
-      } catch (error) {
-        e.currentTarget.textContent = 'Capture chat first';
-      }
-      setTimeout(() => e.currentTarget.textContent = original, 1800);
-    });
-
-    root.querySelector('.aih-capture').addEventListener('click', async e => {
-      const original = e.currentTarget.textContent;
-      e.currentTarget.textContent = 'Capturing…';
-      try {
-        const result = await captureCurrent(workspace, { force: true });
-        const count = result?.session?.message_count || 0;
-        const mirrored = result?.mirrored || 0;
-        e.currentTarget.textContent = `Saved ${count} messages`;
-        root.querySelector('.aih-note').textContent = `Snapshot saved${mirrored ? `; mirrored ${mirrored} new assets` : ''}. Status: ${String(result?.session?.capture_status || 'captured').replaceAll('_',' ')}.`;
-      } catch (error) {
-        console.error('[AI Harness] capture failed', error);
-        e.currentTarget.textContent = 'Capture failed';
-      }
-      setTimeout(() => e.currentTarget.textContent = original, 2200);
-    });
-
-    const interval = setInterval(() => {
-      if (autoCaptureEnabled && document.visibilityState === 'visible') captureCurrent(workspace).catch(() => {});
+    document.addEventListener('click', interceptClick, true);
+    document.addEventListener('keydown', interceptKeydown, true);
+    const captureTimer = setInterval(() => {
+      if (autoCaptureEnabled && document.visibilityState === 'visible' && sendState === 'idle') captureCurrent().catch(() => {});
     }, AUTO_CAPTURE_INTERVAL_MS);
-    const heartbeatInterval = setInterval(() => heartbeat().catch(() => {}), 60000);
-    const routeInterval = setInterval(() => refreshRouteBinding().catch(() => {}), 1500);
-
+    const heartbeatTimer = setInterval(() => request('/companion/heartbeat', { method: 'POST', body: { version: COMPANION_VERSION, provider, metadata: { adapter_version: adapter.version } } }).catch(() => {}), 60000);
+    const routeTimer = setInterval(() => refreshRouteBinding().catch(() => {}), 1500);
     document.addEventListener('visibilitychange', () => {
-      if (autoCaptureEnabled && document.visibilityState === 'hidden') captureCurrent(workspace, { force: true }).catch(() => {});
+      if (autoCaptureEnabled && document.visibilityState === 'hidden') captureCurrent({ force: true }).catch(() => {});
     });
-    window.addEventListener('pagehide', () => { clearInterval(interval); clearInterval(heartbeatInterval); clearInterval(routeInterval); }, { once: true });
-
-    if (autoCaptureEnabled) setTimeout(() => captureCurrent(workspace, { force: true }).catch(() => {}), 2500);
+    window.addEventListener('pagehide', () => {
+      clearInterval(captureTimer);
+      clearInterval(heartbeatTimer);
+      clearInterval(routeTimer);
+      document.removeEventListener('click', interceptClick, true);
+      document.removeEventListener('keydown', interceptKeydown, true);
+    }, { once: true });
+    if (autoCaptureEnabled) setTimeout(() => captureCurrent({ force: true }).catch(() => {}), 2000);
   }
 
   mount();

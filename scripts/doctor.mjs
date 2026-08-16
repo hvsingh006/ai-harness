@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { openDatabase, row, storageForDatabase } from '../src/db.mjs';
-import { workspaceStatus } from '../src/dev-workspace.mjs';
+import { workspaceStatus, isWithin } from '../src/dev-workspace.mjs';
 import { HARNESS_VERSION } from '../src/version.mjs';
 
 const checks = [];
@@ -31,6 +32,9 @@ try {
   storage = storageForDatabase(db);
   const workspaces = Number(row(db, 'SELECT COUNT(*) AS n FROM workspaces')?.n || 0);
   check('SQLite database', true, `${workspaces} workspace(s) · ${storage.dbPath}`);
+  const requiredTables = ['workspace_roots','workspace_resources','resource_versions','resource_chunks','project_snapshots','outgoing_context_runs','companion_pairings'];
+  const missing = requiredTables.filter(table => !row(db, `SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table));
+  check('Context-integrity schema', missing.length === 0, missing.length ? `Missing: ${missing.join(', ')}` : 'roots, versions, chunks, snapshots, audit, and pairing tables present');
 } catch (error) {
   check('SQLite database', false, error.message);
 }
@@ -38,7 +42,7 @@ try {
 if (storage) {
   for (const [name, dir] of [
     ['Persistent workspace root', storage.workspaceRoot],
-    ['Projects directory', storage.projectsDir],
+    ['Live Projects directory', storage.projectsDir],
     ['Archive directory', storage.archiveDir],
     ['Backups directory', storage.backupsDir],
     ['Vault directory', storage.vaultDir]
@@ -51,7 +55,13 @@ if (storage) {
       check(name, true, dir);
     } catch (error) { check(name, false, error.message); }
   }
+  const portableDatabase = Boolean(process.env.HARNESS_DB);
+  check('Live/private project separation', portableDatabase || !isWithin(storage.projectsDir, storage.workspaceRoot),
+    portableDatabase ? 'Explicit database keeps a portable project root.' : `${storage.projectsDir} | private: ${storage.workspaceRoot}`);
 }
+
+const pdfTool = spawnSync('pdftotext', ['-v'], { encoding: 'utf8', windowsHide: true, timeout: 3000 });
+check('PDF text extractor', !pdfTool.error && [0, 1].includes(pdfTool.status), !pdfTool.error ? 'pdftotext available' : 'Not installed; required PDF indexing will fail closed.');
 
 try {
   const response = await fetch('http://127.0.0.1:4317/api/health', { signal: AbortSignal.timeout(1200) });
@@ -71,7 +81,7 @@ try { db?.close(); } catch {}
 
 console.log(`\nAI Harness doctor v${HARNESS_VERSION}\n`);
 for (const item of checks) console.log(`${item.ok ? 'PASS' : 'WAIT'}  ${item.name}${item.detail ? ` - ${item.detail}` : ''}`);
-const nonBlocking = new Set(['Running Harness service', 'Browser companion detected']);
+const nonBlocking = new Set(['Running Harness service', 'Browser companion detected', 'PDF text extractor']);
 const transitional = new Set(['Canonical repository path']);
 const hardFailures = checks.filter(c => !c.ok && !nonBlocking.has(c.name) && !transitional.has(c.name));
 console.log(hardFailures.length ? `\n${hardFailures.length} blocking check(s) failed.` : '\nCore installation checks passed.');

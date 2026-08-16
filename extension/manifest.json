@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI Harness Companion",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Connect native ChatGPT and Gemini sessions to a shared persistent Project Space and lossless local archive.",
   "permissions": ["storage"],
   "background": {"service_worker": "background.js"},
@@ -10,10 +10,17 @@
     "https://chatgpt.com/*",
     "https://gemini.google.com/*"
   ],
-  "content_scripts": [{
-    "matches": ["https://chatgpt.com/*", "https://gemini.google.com/*"],
-    "js": ["content.js"],
-    "css": ["content.css"],
-    "run_at": "document_idle"
-  }]
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*", "https://gemini.google.com/*"],
+      "js": ["provider-adapters.js", "content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["http://127.0.0.1:4317/*"],
+      "js": ["pairing.js"],
+      "run_at": "document_start"
+    }
+  ]
 }

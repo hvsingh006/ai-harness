@@ -27,6 +27,9 @@
 #aih-companion .aih-button { border: 1px solid #dfe2e6; background: #f7f8fa; color: #17191d; border-radius: 8px; padding: 8px 9px; text-align: left; cursor: pointer; font: 600 11px/1.2 inherit; }
 #aih-companion .aih-button:hover { border-color: #7a9ce6; }
 #aih-companion .aih-note { color: #6d737d; font: 500 9px/1.35 inherit; }
+#aih-companion .aih-note[data-status="current"] { color: #19764a; font-weight: 700; }
+#aih-companion .aih-note[data-status="blocked"] { color: #b42318; font-weight: 700; }
+#aih-companion .aih-note[data-status="verifying"] { color: #8a5b00; }
 #aih-companion.aih-collapsed .aih-body { display: none; }
 @media (prefers-color-scheme: dark) {
   #aih-companion { color: #f2f3f5; }

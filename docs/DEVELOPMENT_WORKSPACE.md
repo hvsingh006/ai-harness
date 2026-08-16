@@ -1,35 +1,24 @@
 # Development workspace
 
-AI Harness uses two physically separate roots on Windows.
+AI Harness uses three explicit boundaries on Windows.
 
-## AI development workspace
+## Live development projects
 
-Default:
+Default parent:
 
 ```text
 %USERPROFILE%\Documents\AI Workspace\Projects
 ```
 
-Each coding project gets its own repository beneath that root:
-
-```text
-AI Workspace\Projects\
-  ai-harness\
-  fpga-project\
-  another-project\
-```
-
-The canonical AI Harness repository is:
+The canonical AI Harness checkout and runtime source is:
 
 ```text
 %USERPROFILE%\Documents\AI Workspace\Projects\ai-harness
 ```
 
-Override the parent with `AI_HARNESS_DEV_ROOT` or the exact AI Harness checkout with `AI_HARNESS_REPO_ROOT`.
+`AI_HARNESS_DEV_ROOT`/`AI_HARNESS_REPO_ROOT` continue to configure development tooling. `HARNESS_PROJECTS_ROOT` configures the managed live Project Space parent. Do not create another installed source copy.
 
-The running development copy and the Git checkout are intentionally the same tree. There is no separate installed source copy after migration.
-
-## Private Harness data
+## Private Harness state
 
 Default:
 
@@ -37,31 +26,16 @@ Default:
 %USERPROFILE%\Documents\AI Harness
 ```
 
-This contains the database, archive, backups, retained provider history, and managed Project Space files. It stays outside the development workspace so granting Codex or Antigravity access to a source repository does not automatically grant access to the private Harness archive.
+This contains SQLite, archives, imports, backups, derived indexes/audits, and `.harness` runtime credentials/staging. `HARNESS_WORKSPACE_ROOT` overrides it. It must remain a separate tree from the source checkout and is not a normal live-repository parent.
 
-## Native coding agents
+## Least privilege
 
-OpenAI Codex and Google Antigravity should normally be launched from the individual repository root, not from the entire `AI Workspace\Projects` parent. This preserves least-privilege project boundaries while keeping every repository in a predictable parent location.
-
-AI Harness includes:
-
-```text
-open-codex.cmd
-open-antigravity.cmd
-```
-
-Both launch the native CLI in the canonical repository when the CLI is installed. `AGENTS.md` provides shared repository instructions; Antigravity also recognizes repository-local `AGENTS.md` context.
+Open Codex/Antigravity from one repository root, not the entire Projects parent. Local coding agents may edit/test the current repository when explicitly granted. ChatGPT/Gemini companion operations are separately authenticated and only receive selected provider-allowed evidence or opaque current attachment bytes; they never receive generic filesystem/shell/Git operations or credentials.
 
 ## Git/runtime invariant
 
-The running AI Harness source should always correspond to the current Git checkout plus any visible local modifications. Check with:
+`npm run dev:status` reports the canonical path, branch, HEAD, worktree state, origin/upstream, and whether runtime source matches the checkout. `update-and-launch-harness.cmd` keeps the existing fail-closed workflow: dirty-worktree check, private metadata backup, fetch and fast-forward only, dependency/doctor validation, source rollback on failure, and restart from the same checkout.
 
-```text
-npm run dev:status
-```
+## Managed-project migration
 
-Normal updates remain fail-closed when the `main` worktree is dirty. `update-and-launch-harness.cmd` backs up Harness metadata, fast-forwards `main`, validates dependencies/diagnostics, rolls back source on validation failure, and launches the working revision.
-
-## Migration
-
-`setup-ai-workspace.ps1` or the current installer migrates the canonical source checkout from the legacy `%LOCALAPPDATA%\AI-Harness\app` location into the development workspace, updates environment variables and shortcuts, validates the checkout, and leaves private Harness data untouched.
+New managed Project Spaces use `AI Workspace\Projects`. Existing 0.7 managed folders under private `AI Harness\Projects` are not deleted or silently moved. Setup offers copy/hash-verify/transactional-reference migration and retains the source fallback. Attached external roots remain untouched.

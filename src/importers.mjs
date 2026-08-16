@@ -70,9 +70,9 @@ export function importChatGPTExport(db, { directory, workspaceId }) {
         const end = isoFromEpoch(conversation.update_time);
         if (!session) {
           const id = `session-${randomUUID()}`;
-          run(db, `INSERT INTO sessions (id,workspace_id,provider,title,native_url,summary,capture_status,started_at,ended_at,message_count,external_id,import_id,raw_complete,attachments_complete,derived_complete,last_captured_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-            id, workspaceId, 'chatgpt', conversation.title || 'Imported ChatGPT conversation', '', '', 'raw_archived', start, end, 0, externalId, importId, 1, 1, 0, createdAt);
+          run(db, `INSERT INTO sessions (id,workspace_id,provider,title,native_url,summary,capture_status,started_at,ended_at,message_count,external_id,import_id,raw_complete,attachments_complete,derived_complete,last_captured_at,history_coverage,capture_evidence_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            id, workspaceId, 'chatgpt', conversation.title || 'Imported ChatGPT conversation', '', '', 'raw_archived', start, end, 0, externalId, importId, 1, 1, 0, createdAt, 'complete', JSON.stringify({ source: 'chatgpt_export', raw_export_complete: true }));
           session = row(db, 'SELECT * FROM sessions WHERE id = ?', id);
           sessionCount += 1;
         }
@@ -96,14 +96,15 @@ export function importChatGPTExport(db, { directory, workspaceId }) {
             role,
             content_text: contentText
           };
-          run(db, `INSERT INTO messages (id,session_id,provider_message_id,parent_provider_message_id,ordinal,role,content_text,content_json,raw_json,content_hash,created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-            id, session.id, providerMessageId, String(node.parent || ''), ordinal++, role, contentText,
+          run(db, `INSERT INTO messages (id,session_id,provider_message_id,parent_provider_message_id,ordinal,role,content_text,clean_content_text,content_json,raw_json,content_hash,created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+            id, session.id, providerMessageId, String(node.parent || ''), ordinal++, role, contentText, contentText,
             JSON.stringify(node.message?.content || {}), JSON.stringify(node.message || {}), sha256Text(contentText), isoFromEpoch(node.message?.create_time));
           upsertFts(db, session, message);
           messageCount += 1;
         }
         run(db, 'UPDATE sessions SET message_count = (SELECT COUNT(*) FROM messages WHERE session_id = ?), last_captured_at = ? WHERE id = ?', session.id, createdAt, session.id);
+        run(db, `UPDATE sessions SET history_coverage='complete' WHERE id=?`, session.id);
         setCaptureStages(db, session.id, { raw: true, attachments: true, derived: false, search: true });
       }
     }
