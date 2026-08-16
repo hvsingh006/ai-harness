@@ -30,9 +30,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          export HARNESS_WORKSPACE_ROOT="$RUNNER_TEMP/ai-harness-workspace"
           npm test
-          npm run doctor
+          HARNESS_WORKSPACE_ROOT="$RUNNER_TEMP/ai-harness-workspace" npm run doctor
       - name: Commit validated source
         shell: bash
         run: |
