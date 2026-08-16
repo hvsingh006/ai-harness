@@ -1,6 +1,6 @@
 {
   "name": "ai-harness",
-  "version": "0.6.3",
+  "version": "0.7.0",
   "private": true,
   "type": "module",
   "description": "Local Project Spaces that retain files and ChatGPT/Gemini history across chats and services.",
@@ -10,7 +10,8 @@
     "test": "node --test",
     "import": "node scripts/import.mjs",
     "doctor": "node scripts/doctor.mjs",
-    "backup": "node scripts/backup.mjs"
+    "backup": "node scripts/backup.mjs",
+    "dev:status": "node scripts/dev-status.mjs"
   },
   "engines": {
     "node": ">=22.5.0"

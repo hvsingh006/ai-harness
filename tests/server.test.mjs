@@ -34,7 +34,7 @@ test('server supports first-run project and native continuity smoke flow', async
   const healthResponse = await waitFor(`${base}/health`);
   const health = await healthResponse.json();
   assert.equal(health.ok, true);
-  assert.equal(health.version, '0.6.3');
+  assert.equal(health.version, '0.7.0');
   assert.equal(path.resolve(health.storage.workspace_root), path.resolve(dir));
   assert.ok(health.storage.database_path.endsWith('test.db'));
 
