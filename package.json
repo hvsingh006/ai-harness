@@ -1,6 +1,6 @@
 {
   "name": "ai-harness",
-  "version": "0.6.0",
+  "version": "0.6.2",
   "private": true,
   "type": "module",
   "description": "Provider-neutral continuity, archive, learning, and development layer for native AI services.",
