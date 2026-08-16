@@ -1,0 +1,37 @@
+name: Apply AI Harness 0.6.3 patch
+
+on:
+  push:
+    branches: [agent/update-launch-0.6.3]
+    paths:
+      - '.aih-patch'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply validated patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --index .aih-patch
+          rm -f .aih-patch .github/workflows/apply-local-patch.yml
+          git add -A
+      - name: Validate
+        run: npm test
+      - name: Commit branch result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'prepare one-click update and launch'
+          git push origin HEAD:agent/update-launch-0.6.3
