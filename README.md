@@ -1,5 +1,7 @@
 # AI Harness
 
+> 0.8.0 pre-trial status: local implementation and automated hardening are complete; live signed-in ChatGPT/Gemini compatibility remains unverified. See [docs/PRETRIAL_ACCEPTANCE.md](docs/PRETRIAL_ACCEPTANCE.md).
+
 AI Harness is a local continuity layer for working in native ChatGPT and Gemini. Project Spaces retain authoritative files, repository state, provider history, and provenance while native chats remain replaceable working surfaces.
 
 ## 0.8 context-integrity contract

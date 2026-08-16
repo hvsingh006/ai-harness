@@ -69,7 +69,17 @@ export function verifyProjectFreshness(db, { workspaceId, captureResult }) {
   const status = reasons.length ? 'blocked' : 'current';
   const snapshotId = `snapshot-${randomUUID()}`;
   const createdAt = new Date().toISOString();
+  let captureEvidence = {};
+  try { captureEvidence = JSON.parse(captureResult?.session?.capture_evidence_json || '{}'); } catch {}
+  const captureStarted = Date.parse(captureEvidence.capture_started_at || '');
+  const captureCompleted = Date.parse(captureEvidence.capture_completed_at || '');
   const diagnostics = {
+    capture_sync_ms: Number.isFinite(captureStarted) && Number.isFinite(captureCompleted) ? Math.max(0, captureCompleted - captureStarted) : 0,
+    root_inventory_ms: Number(resources.diagnostics?.root_inventory_ms || 0),
+    hash_version_ms: Number(resources.diagnostics?.hash_version_ms || 0),
+    extraction_index_ms: Number(resources.diagnostics?.extraction_index_ms || 0),
+    repository_ms: repositoryRefreshMs,
+    snapshot_ms: 0,
     root_verification_ms: rootVerificationMs,
     changed_resource_indexing_ms: rootVerificationMs,
     repository_refresh_ms: repositoryRefreshMs,
@@ -84,12 +94,16 @@ export function verifyProjectFreshness(db, { workspaceId, captureResult }) {
     chat: { session_id: captureResult?.session?.id || null, synchronized_visible: Boolean(captureResult?.synchronized_visible), raw_capture_complete: Boolean(captureResult?.raw_capture_complete) },
     diagnostics
   };
+  const snapshotStart = performance.now();
   run(db, `INSERT INTO project_snapshots (id,workspace_id,created_at,status,corpus_generation,index_generation,chat_generation,root_state_hash,repo_state_hash,security_policy_version,history_coverage,details_json)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, snapshotId, workspaceId, createdAt, status,
     currentWorkspace.corpus_generation, currentWorkspace.index_generation, currentWorkspace.chat_generation,
     resources.root_state_hash, repository.repo_state_hash, SECURITY_POLICY_VERSION, coverage, JSON.stringify(details));
   run(db, `UPDATE workspaces SET freshness_status=?,last_verified_at=?,history_coverage=?,updated_at=? WHERE id=?`, status, createdAt, coverage, createdAt, workspaceId);
   const workingState = updateWorkingState(db, workspaceId, snapshotId, currentWorkspace.corpus_generation);
+  diagnostics.snapshot_ms = duration(snapshotStart);
+  diagnostics.total_verification_ms = duration(totalStart);
+  run(db, 'UPDATE project_snapshots SET details_json=? WHERE id=?', JSON.stringify(details), snapshotId);
   return {
     ok: status === 'current',
     freshness: status,

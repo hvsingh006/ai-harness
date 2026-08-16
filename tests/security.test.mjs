@@ -7,6 +7,7 @@ import { attachWorkspaceFolder, openDatabase, row, storageForDatabase } from '..
 import { canonicalizeExistingPath, normalizeRelativePath, resolveApprovedTarget, walkApprovedRoot } from '../src/security/paths.mjs';
 import { classifySensitivePath, scanOutgoingText } from '../src/security/secrets.mjs';
 import { createPairingChallenge, completePairing, authenticateCompanionRequest } from '../src/security/companion-auth.mjs';
+import { validateProviderAssetUrl } from '../src/chat-capture.mjs';
 
 function tempDir(t, prefix) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -31,6 +32,13 @@ test('filesystem security rejects traversal, alternate separators, and absolute 
   assert.throws(() => normalizeRelativePath('docs\\secret.txt'), /alternate-separator/);
   assert.throws(() => normalizeRelativePath(path.join(rootPath, 'absolute.txt')), /absolute/);
   assert.throws(() => resolveApprovedTarget(root, '../outside.txt'), /traversal/);
+});
+
+test('filesystem security rejects Windows ADS, reserved device names, trailing aliases, encoded traversal, and Unicode-normalizes ordinary names', () => {
+  for (const value of ['file.txt:secret', 'CON', 'nul.txt', 'name. ', '%2e%2e/file', 'folder//file']) {
+    assert.throws(() => normalizeRelativePath(value), error => error.code === 'ROOT_SECURITY_FAILURE');
+  }
+  assert.equal(normalizeRelativePath('notes/cafe\u0301.md'), 'notes/café.md');
 });
 
 test('recursive indexing skips symlinks and never follows an escape', t => {
@@ -74,6 +82,15 @@ test('outgoing secret scanner deterministically redacts lower-confidence JWT mat
   assert.match(result.text, /REDACTED:jwt-like-token/);
 });
 
+test('outgoing secret scanner blocks additional provider token families without returning plaintext', () => {
+  const samples = ['AIzaSyDUMMYDUMMYDUMMYDUMMYDUMMYDUMMY', 'xoxb-1234567890-abcdefghijklmnopqrstuvwxyz', 'sk_live_abcdefghijklmnopqrstuvwxyz', 'npm_abcdefghijklmnopqrstuvwxyz1234567890'];
+  for (const secret of samples) {
+    const result = scanOutgoingText(`credential=${secret}`, { source: 'adversarial' });
+    assert.equal(result.blocked, true, secret);
+    assert.equal(JSON.stringify(result.detections).includes(secret), false);
+  }
+});
+
 test('companion pairing challenges are one-use and authentication rejects missing, wrong, or foreign-origin credentials', t => {
   const dir = tempDir(t, 'aih-auth-');
   const db = openDatabase(path.join(dir, 'test.db'));
@@ -103,4 +120,14 @@ test('a rejected primary-folder change rolls back without losing the existing ap
   assert.equal(row(db, `SELECT root_path FROM workspaces WHERE id='ws-harness'`).root_path, beforeWorkspace.root_path);
   assert.deepEqual(row(db, `SELECT id,root_path FROM workspace_roots WHERE workspace_id='ws-harness' AND root_kind IN ('primary','repository')`), beforeRoot);
   db.close();
+});
+
+test('provider asset discovery accepts only scoped HTTPS or provider-origin blob URLs', () => {
+  assert.equal(validateProviderAssetUrl('chatgpt', 'https://files.oaiusercontent.com/file.pdf').ok, true);
+  assert.equal(validateProviderAssetUrl('gemini', 'https://lh3.googleusercontent.com/image.png').ok, true);
+  assert.equal(validateProviderAssetUrl('chatgpt', 'https://evil.example/file.pdf').code, 'ASSET_ORIGIN_REJECTED');
+  assert.equal(validateProviderAssetUrl('gemini', 'http://gemini.google.com/file.pdf').code, 'ASSET_URL_SCHEME_REJECTED');
+  assert.equal(validateProviderAssetUrl('chatgpt', 'blob:https://chatgpt.com/id').capture_strategy, 'page_blob');
+  assert.equal(validateProviderAssetUrl('chatgpt', 'blob:https://evil.example/id').code, 'ASSET_BLOB_ORIGIN_REJECTED');
+  assert.equal(validateProviderAssetUrl('chatgpt', 'file:///C:/secret.txt').code, 'ASSET_URL_SCHEME_REJECTED');
 });

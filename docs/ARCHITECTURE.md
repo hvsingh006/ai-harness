@@ -1,5 +1,13 @@
 # AI Harness architecture
 
+## Companion protocol and managed-send transaction
+
+Harness 0.8.0 uses companion protocol 3. The service reports the protocol in health/readiness, the companion reports it in heartbeat/capture/prepare/send acknowledgement, and a mismatch is not ready or current.
+
+Native send is a transaction rather than a click callback: `IDLE -> PREPARING -> PREPARED -> ATTACHING -> REPLAYING -> WAITING_FOR_PROVIDER_ACCEPT -> DONE|ERROR`. The prepared record binds the prompt hash, provider route, attempt, protocol, current snapshot, generations, source versions, attachments, and policy. Provider acceptance must be strong or corroborated, and the service performs another deterministic source/repository verification before recording sent.
+
+Provider-generated assets use discovered local asset IDs and provider-specific origin restrictions. There is no generic companion URL fetch or filesystem endpoint.
+
 ## Authority model
 
 ```text

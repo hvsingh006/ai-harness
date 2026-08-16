@@ -4,6 +4,31 @@ import { sha256Text } from './archive.mjs';
 import { setCaptureStages } from './importers.mjs';
 
 const PROVIDERS = new Set(['chatgpt', 'gemini']);
+const PROVIDER_ASSET_HOSTS = Object.freeze({
+  chatgpt: ['chatgpt.com', 'oaiusercontent.com', 'oaistatic.com'],
+  gemini: ['gemini.google.com', 'googleusercontent.com', 'gstatic.com']
+});
+
+function providerAssetHostAllowed(provider, hostname) {
+  const host = String(hostname || '').toLowerCase();
+  return (PROVIDER_ASSET_HOSTS[provider] || []).some(suffix => host === suffix || host.endsWith(`.${suffix}`));
+}
+
+export function validateProviderAssetUrl(provider, value) {
+  let parsed;
+  try { parsed = new URL(String(value || '')); } catch { return { ok: false, status: 'FAILED', code: 'ASSET_URL_INVALID' }; }
+  if (parsed.protocol === 'blob:') {
+    let embeddedOrigin;
+    try { embeddedOrigin = new URL(parsed.origin); } catch { return { ok: false, status: 'FAILED', code: 'ASSET_BLOB_ORIGIN_REJECTED' }; }
+    if (embeddedOrigin.protocol !== 'https:' || !providerAssetHostAllowed(provider, embeddedOrigin.hostname)) {
+      return { ok: false, status: 'FAILED', code: 'ASSET_BLOB_ORIGIN_REJECTED' };
+    }
+    return { ok: true, status: 'DISCOVERED', url: parsed.href, capture_strategy: 'page_blob' };
+  }
+  if (parsed.protocol !== 'https:') return { ok: false, status: 'FAILED', code: 'ASSET_URL_SCHEME_REJECTED' };
+  if (!providerAssetHostAllowed(provider, parsed.hostname)) return { ok: false, status: 'FAILED', code: 'ASSET_ORIGIN_REJECTED' };
+  return { ok: true, status: 'DISCOVERED', url: parsed.href, capture_strategy: 'background_https' };
+}
 
 export function cleanManagedUserText(content) {
   const text = String(content || '').trim();
@@ -78,6 +103,7 @@ export function captureBrowserSession(db, body) {
   for (const ref of providerRefs) upsertSessionExternalRef(db, { sessionId: session.id, provider, refType: ref.ref_type, refValue: ref.ref_value, source: ref.source || 'browser_companion' });
 
   let messagesAdded = 0;
+  let deliveriesReconciled = 0;
   const messages = Array.isArray(body.messages) ? body.messages : [];
   for (let index = 0; index < messages.length; index++) {
     const item = messages[index] || {};
@@ -88,12 +114,35 @@ export function captureBrowserSession(db, body) {
     const ordinal = Number(row(db, 'SELECT COALESCE(MAX(ordinal), -1) AS n FROM messages WHERE session_id=?', session.id)?.n ?? -1) + 1;
     const id = `msg-${randomUUID()}`;
     const cleanContent = item.role === 'user' ? cleanManagedUserText(rawContent) : rawContent;
-    const harnessManaged = cleanContent !== rawContent || Boolean(item.outgoing_context_run_id);
+    let outgoingContextRunId = item.outgoing_context_run_id || null;
+    if (item.role === 'user' && !outgoingContextRunId) {
+      const exactProviderTextHash = sha256Text(rawContent);
+      const uncertainRun = row(db, `SELECT * FROM outgoing_context_runs
+        WHERE workspace_id=? AND session_id=? AND provider=? AND final_context_hash=?
+          AND status IN ('prepared','blocked') AND delivery_state IN ('PREPARED','ERROR')
+        ORDER BY created_at DESC LIMIT 1`, workspaceId, session.id, provider, exactProviderTextHash);
+      if (uncertainRun) {
+        const acceptance = {
+          accepted: true,
+          certainty: 'reconciled',
+          observed_at: observedAt,
+          signals: { exact_provider_message_hash: true, provider_message_id: providerMessageId },
+          prior_failure_code: uncertainRun.failure_code || ''
+        };
+        const metadata = JSON.parse(uncertainRun.metadata_json || '{}');
+        metadata.delivery_recovery = { method: 'exact_provider_message_hash', observed_at: observedAt, provider_message_id: providerMessageId, prior_failure_code: uncertainRun.failure_code || '' };
+        run(db, `UPDATE outgoing_context_runs SET status='sent',delivery_state='DONE',failure_code='',acceptance_json=?,metadata_json=?,sent_at=COALESCE(sent_at,?) WHERE id=?`,
+          JSON.stringify(acceptance), JSON.stringify(metadata), observedAt, uncertainRun.id);
+        outgoingContextRunId = uncertainRun.id;
+        deliveriesReconciled += 1;
+      }
+    }
+    const harnessManaged = cleanContent !== rawContent || Boolean(outgoingContextRunId);
     run(db, `INSERT INTO messages (id,session_id,provider_message_id,parent_provider_message_id,ordinal,role,content_text,clean_content_text,content_json,raw_json,content_hash,created_at,outgoing_context_run_id,harness_managed)
              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       id, session.id, providerMessageId, '', ordinal, item.role || 'unknown', rawContent, cleanContent,
       JSON.stringify(item.content_json || {}), JSON.stringify(item.raw || {}), sha256Text(cleanContent), item.created_at || observedAt,
-      item.outgoing_context_run_id || null, harnessManaged ? 1 : 0);
+      outgoingContextRunId, harnessManaged ? 1 : 0);
     try {
       run(db, `INSERT INTO message_fts (message_id,session_id,workspace_id,provider,title,role,content) VALUES (?,?,?,?,?,?,?)`,
         id, session.id, workspaceId, provider, body.title || session.title, item.role || 'unknown', cleanContent);
@@ -103,18 +152,26 @@ export function captureBrowserSession(db, body) {
 
   const assets = Array.isArray(body.assets) ? body.assets : [];
   for (const asset of assets) {
+    const validated = validateProviderAssetUrl(provider, asset.url);
     const nativeId = String(asset.native_id || sha256Text(`${asset.url || ''}|${asset.name || ''}`).slice(0, 32));
-    if (row(db, 'SELECT id FROM session_assets WHERE session_id=? AND native_id=?', session.id, nativeId)) continue;
+    const existingAsset = row(db, 'SELECT * FROM session_assets WHERE session_id=? AND native_id=?', session.id, nativeId);
+    if (existingAsset) {
+      if (validated.ok && ['UNAVAILABLE','AUTH_REQUIRED','CORS_BLOCKED','EXPIRED','FAILED'].includes(String(existingAsset.mirror_status).toUpperCase())) {
+        run(db, `UPDATE session_assets SET source_url=?,mirror_status='DISCOVERED',updated_at=? WHERE id=?`, validated.url, observedAt, existingAsset.id);
+      }
+      continue;
+    }
     run(db, `INSERT INTO session_assets (id,session_id,provider,asset_type,name,source_url,native_id,mime_type,mirror_status,metadata_json,created_at,updated_at)
              VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
       `assetref-${randomUUID()}`, session.id, provider, asset.asset_type || 'file', asset.name || '', asset.url || '', nativeId,
-      asset.mime_type || 'application/octet-stream', 'referenced', JSON.stringify(asset.metadata || {}), observedAt, observedAt);
+      asset.mime_type || 'application/octet-stream', validated.status,
+      JSON.stringify({ ...(asset.metadata || {}), discovery_code: validated.code || '', discovered_url: validated.ok ? validated.url : '', capture_strategy: validated.capture_strategy || '' }), observedAt, observedAt);
   }
 
   const evidence = body.capture_evidence || {};
   const rawComplete = captureComplete(evidence);
   const assetRefs = Number(row(db, 'SELECT COUNT(*) AS n FROM session_assets WHERE session_id=?', session.id)?.n || 0);
-  const unmirrored = Number(row(db, `SELECT COUNT(*) AS n FROM session_assets WHERE session_id=? AND mirror_status!='captured'`, session.id)?.n || 0);
+  const unmirrored = Number(row(db, `SELECT COUNT(*) AS n FROM session_assets WHERE session_id=? AND UPPER(mirror_status)!='CAPTURED'`, session.id)?.n || 0);
   setCaptureStages(db, session.id, { raw: rawComplete, attachments: assetRefs === 0 || unmirrored === 0, derived: false, search: true });
   run(db, `UPDATE sessions SET message_count=(SELECT COUNT(*) FROM messages WHERE session_id=?),last_captured_at=?,history_coverage=?,capture_evidence_json=? WHERE id=?`,
     session.id, observedAt, rawComplete ? 'complete' : 'partial', JSON.stringify(evidence), session.id);
@@ -129,6 +186,7 @@ export function captureBrowserSession(db, body) {
     capture_stages: rows(db, 'SELECT stage,status,details,updated_at FROM capture_stages WHERE session_id=? ORDER BY stage', session.id),
     asset_refs: rows(db, 'SELECT * FROM session_assets WHERE session_id=? ORDER BY created_at', session.id),
     messages_added: messagesAdded,
+    deliveries_reconciled: deliveriesReconciled,
     synchronized_visible: evidence.synchronized_visible === true,
     raw_capture_complete: rawComplete
   };

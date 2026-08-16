@@ -34,7 +34,9 @@ Open Codex/Antigravity from one repository root, not the entire Projects parent.
 
 ## Git/runtime invariant
 
-`npm run dev:status` reports the canonical path, branch, HEAD, worktree state, origin/upstream, and whether runtime source matches the checkout. `update-and-launch-harness.cmd` keeps the existing fail-closed workflow: dirty-worktree check, private metadata backup, fetch and fast-forward only, dependency/doctor validation, source rollback on failure, and restart from the same checkout.
+`npm run dev:status` reports the canonical path, branch, HEAD, worktree state, origin/upstream, and whether runtime source matches the checkout. `update-and-launch-harness.cmd` keeps the fail-closed workflow: canonical clean-main check, ahead/behind/diverged classification, SQLite integrity backup, fetch and fast-forward only, dependency setup, tests/doctor/development-status validation, `--keep` source rollback on failure, and health-checked restart from the same checkout.
+
+The dashboard may launch Codex or Antigravity only for a repository root already registered to the selected Project Space. The request carries workspace/root IDs and a fixed tool name, never an arbitrary path or command. This local capability is not exposed to the browser companion.
 
 ## Managed-project migration
 

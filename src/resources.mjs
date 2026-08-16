@@ -48,6 +48,26 @@ function replaceVersionChunks(db, { workspaceId, resource, version, extraction }
   });
 }
 
+function retryFailedExtraction(db, { workspaceId, root, resource, version, metrics }) {
+  if (version?.indexing_status !== 'failed' || !version.archive_artifact_id) return version;
+  const artifact = row(db, 'SELECT vault_path FROM artifacts WHERE id=?', version.archive_artifact_id);
+  if (!artifact?.vault_path || !fs.existsSync(artifact.vault_path)) return version;
+  const extractionStart = performance.now();
+  const extraction = extractFile(artifact.vault_path, { logicalPath: path.join(root.root_path, ...resource.relative_path.split('/')) });
+  const metadata = { ...JSON.parse(version.metadata_json || '{}'), ...extraction.metadata, extraction_reason: extraction.reason || '', extraction_retried_at: now() };
+  const indexingStatus = extraction.status === 'complete' ? 'complete' : extraction.status === 'not_extractable' ? 'not_applicable' : 'failed';
+  const contentSecurity = extraction.status === 'complete' ? scanOutgoingText(extraction.chunks.map(chunk => chunk.content).join('\n'), { source: resource.id }) : { blocked: false, redacted: false, detections: [] };
+  const sensitive = classifySensitivePath(resource.relative_path);
+  const securityStatus = sensitive.sensitive ? `local_only:${sensitive.rule}` : contentSecurity.blocked ? 'local_only:content-secret' : contentSecurity.redacted ? 'redact_required' : 'clear';
+  metadata.security_findings = contentSecurity.detections;
+  if (extraction.status === 'complete') replaceVersionChunks(db, { workspaceId, resource, version, extraction });
+  run(db, 'UPDATE resource_versions SET extraction_status=?,indexing_status=?,security_status=?,metadata_json=? WHERE id=?', extraction.status, indexingStatus, securityStatus, JSON.stringify(metadata), version.id);
+  run(db, 'UPDATE workspace_resources SET provider_transmission_allowed=?,updated_at=? WHERE id=?', root.provider_transmission_allowed && !sensitive.sensitive && !contentSecurity.blocked ? 1 : 0, now(), resource.id);
+  if (indexingStatus === 'complete') run(db, 'UPDATE workspace_resources SET updated_at=? WHERE id=?', now(), resource.id);
+  metrics.extraction_index_ms += performance.now() - extractionStart;
+  return row(db, 'SELECT * FROM resource_versions WHERE id=?', version.id);
+}
+
 function archiveStableResource(db, { workspaceId, root, file, attempts = 3 }) {
   for (let attempt = 0; attempt < attempts; attempt++) {
     const artifact = archiveFile(db, {
@@ -65,22 +85,29 @@ function archiveStableResource(db, { workspaceId, root, file, attempts = 3 }) {
   throw Object.assign(new Error(`resource changed while it was being captured: ${file.relativePath}`), { code: 'ROOT_CHANGED_DURING_VERIFICATION' });
 }
 
-function versionResource(db, { workspaceId, root, file, existingResource }) {
+function versionResource(db, { workspaceId, root, file, existingResource, metrics }) {
   const classification = classifyResource(file.absolutePath);
+  const initialHashStart = performance.now();
   let sha256 = sha256File(file.absolutePath);
+  metrics.hash_version_ms += performance.now() - initialHashStart;
   const sensitive = classifySensitivePath(file.relativePath);
   const current = existingResource?.current_version_id
     ? row(db, 'SELECT * FROM resource_versions WHERE id=?', existingResource.current_version_id)
     : null;
   if (current?.sha256 === sha256) {
     const liveStat = fs.statSync(file.absolutePath);
+    const wasFailed = current.indexing_status === 'failed';
+    wasFailed && retryFailedExtraction(db, { workspaceId, root, resource: existingResource, version: current, metrics });
+    const refreshedCurrent = row(db, 'SELECT * FROM resource_versions WHERE id=?', current.id);
     run(db, `UPDATE workspace_resources SET status='active',mime_type=?,resource_type=?,provider_transmission_allowed=?,updated_at=? WHERE id=?`,
-      classification.mimeType, classification.resourceType, root.provider_transmission_allowed && !sensitive.sensitive && !String(current.security_status).startsWith('local_only') ? 1 : 0, now(), existingResource.id);
+      classification.mimeType, classification.resourceType, root.provider_transmission_allowed && !sensitive.sensitive && !String(refreshedCurrent.security_status).startsWith('local_only') ? 1 : 0, now(), existingResource.id);
     syncLegacyWorkspaceFile(db, { workspaceId, absolutePath: file.absolutePath, relativePath: file.relativePath, sha256, stat: liveStat, mimeType: classification.mimeType });
-    return { changed: false, resource: existingResource, version: current, extractionFailed: current.indexing_status === 'failed', inventory: { path: file.relativePath, sha256, size: liveStat.size } };
+    return { changed: false, indexRecovered: wasFailed && refreshedCurrent.indexing_status !== 'failed', resource: existingResource, version: refreshedCurrent, extractionFailed: refreshedCurrent.indexing_status === 'failed', inventory: { path: file.relativePath, sha256, size: liveStat.size } };
   }
 
+  const archiveStart = performance.now();
   const snapshot = archiveStableResource(db, { workspaceId, root, file });
+  metrics.hash_version_ms += performance.now() - archiveStart;
   sha256 = snapshot.sha256;
   if (current?.sha256 === sha256) {
     run(db, `UPDATE workspace_resources SET status='active',mime_type=?,resource_type=?,provider_transmission_allowed=?,updated_at=? WHERE id=?`,
@@ -111,6 +138,7 @@ function versionResource(db, { workspaceId, root, file, existingResource }) {
   }
   const resource = row(db, 'SELECT * FROM workspace_resources WHERE id=?', resourceId);
   const artifact = snapshot.artifact;
+  const extractionStart = performance.now();
   const extraction = extractFile(artifact.vault_path, { logicalPath: file.absolutePath });
   const contentSecurity = extraction.chunks?.length ? scanOutgoingText(extraction.chunks.map(chunk => chunk.content).join('\n'), { source: resourceId }) : { blocked: false, redacted: false, detections: [] };
   const transmissionAllowed = root.provider_transmission_allowed && !sensitive.sensitive && !contentSecurity.blocked;
@@ -130,6 +158,7 @@ function versionResource(db, { workspaceId, root, file, existingResource }) {
     JSON.stringify({ ...extraction.metadata, extraction_reason: extraction.reason || '', root_id: root.id, relative_path: file.relativePath, security_findings: contentSecurity.detections }));
   const version = row(db, 'SELECT * FROM resource_versions WHERE id=?', versionId);
   if (extraction.status === 'complete') replaceVersionChunks(db, { workspaceId, resource, version, extraction });
+  metrics.extraction_index_ms += performance.now() - extractionStart;
   run(db, `UPDATE workspace_resources SET current_version_id=?,status='active',resource_type=?,mime_type=?,provider_transmission_allowed=?,updated_at=? WHERE id=?`,
     versionId, classification.resourceType, classification.mimeType, transmissionAllowed ? 1 : 0, createdAt, resourceId);
   syncLegacyWorkspaceFile(db, { workspaceId, absolutePath: file.absolutePath, relativePath: file.relativePath, sha256, stat: snapshot.stat, mimeType: classification.mimeType });
@@ -152,6 +181,8 @@ export function reconcileWorkspaceResources(db, workspaceId, { maxFilesPerRoot =
   let deletedCount = 0;
   let indexedCount = 0;
   let extractionFailures = 0;
+  let indexRecoveredCount = 0;
+  const metrics = { root_inventory_ms: 0, hash_version_ms: 0, extraction_index_ms: 0 };
 
   for (const root of roots) {
     if (!root.indexing_enabled) {
@@ -161,7 +192,9 @@ export function reconcileWorkspaceResources(db, workspaceId, { maxFilesPerRoot =
       rootDetails.push({ root_id: root.id, status: verified.ok ? 'local_only_unindexed' : 'blocked', code: verified.code || '', message: verified.message || '', files: 0 });
       continue;
     }
+    const inventoryStart = performance.now();
     const scan = walkApprovedRoot(root, { maxFiles: maxFilesPerRoot });
+    metrics.root_inventory_ms += performance.now() - inventoryStart;
     if (!scan.ok) {
       run(db, `UPDATE workspace_roots SET status='blocked',last_verified_at=?,updated_at=? WHERE id=?`, now(), now(), root.id);
       rootDetails.push({ root_id: root.id, status: 'blocked', code: scan.code, message: scan.message });
@@ -176,8 +209,9 @@ export function reconcileWorkspaceResources(db, workspaceId, { maxFilesPerRoot =
       seen.add(file.relativePath);
       const existing = row(db, 'SELECT * FROM workspace_resources WHERE root_id=? AND relative_path=?', root.id, file.relativePath);
       try {
-        const result = versionResource(db, { workspaceId, root, file, existingResource: existing });
+        const result = versionResource(db, { workspaceId, root, file, existingResource: existing, metrics });
         if (result.changed) changedCount += 1;
+        if (result.indexRecovered) indexRecoveredCount += 1;
         if (result.extractionFailed) extractionFailures += 1;
         if (result.version?.indexing_status === 'complete') indexedCount += 1;
         inventory.push(result.inventory);
@@ -201,7 +235,9 @@ export function reconcileWorkspaceResources(db, workspaceId, { maxFilesPerRoot =
       deletedCount += 1;
     }
     const rootHash = hashJson(inventory.sort((a, b) => a.path.localeCompare(b.path)));
+    const verificationInventoryStart = performance.now();
     const verificationScan = walkApprovedRoot(root, { maxFiles: maxFilesPerRoot });
+    metrics.root_inventory_ms += performance.now() - verificationInventoryStart;
     if (!verificationScan.ok) {
       const failure = { code: verificationScan.code || 'ROOT_CHANGED_DURING_VERIFICATION', root_id: root.id, message: verificationScan.message || 'root changed during verification' };
       run(db, `UPDATE workspace_roots SET status='blocked',last_verified_at=?,updated_at=? WHERE id=?`, now(), now(), root.id);
@@ -211,7 +247,9 @@ export function reconcileWorkspaceResources(db, workspaceId, { maxFilesPerRoot =
     }
     let verifiedRootHash = '';
     try {
+      const finalHashStart = performance.now();
       verifiedRootHash = hashJson(verificationScan.files.map(item => ({ path: item.relativePath, sha256: sha256File(item.absolutePath), size: fs.statSync(item.absolutePath).size })).sort((a, b) => a.path.localeCompare(b.path)));
+      metrics.hash_version_ms += performance.now() - finalHashStart;
     } catch (error) {
       verificationFailure = { code: 'ROOT_CHANGED_DURING_VERIFICATION', root_id: root.id, message: `root changed during final hash verification: ${error.message}` };
     }
@@ -237,7 +275,7 @@ export function reconcileWorkspaceResources(db, workspaceId, { maxFilesPerRoot =
   const previousIndex = Number(workspace.index_generation || 0);
   const sourceChanged = Boolean(changedCount || deletedCount);
   const corpusGeneration = previousCorpus + (sourceChanged ? 1 : 0);
-  if (!sourceChanged && previousIndex !== previousCorpus) {
+  if (!sourceChanged && !indexRecoveredCount && previousIndex !== previousCorpus) {
     reasons.push({ code: 'INDEX_GENERATION_MISMATCH', message: 'the retrieval index generation does not match the known corpus generation' });
   }
   const indexGeneration = reasons.length ? previousIndex : corpusGeneration;
@@ -250,10 +288,12 @@ export function reconcileWorkspaceResources(db, workspaceId, { maxFilesPerRoot =
     deleted_count: deletedCount,
     indexed_count: indexedCount,
     extraction_failures: extractionFailures,
+    index_recovered_count: indexRecoveredCount,
     corpus_generation: corpusGeneration,
     index_generation: indexGeneration,
     root_state_hash: hashJson(rootDetails),
-    roots: rootDetails
+    roots: rootDetails,
+    diagnostics: Object.fromEntries(Object.entries(metrics).map(([key, value]) => [key, Number(value.toFixed(2))]))
   };
 }
 

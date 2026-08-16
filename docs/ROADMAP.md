@@ -1,5 +1,11 @@
 # AI Harness roadmap
 
+## 0.8.0 pre-trial hardening
+
+Implemented locally: fail-closed provider capability detection, protocol negotiation, acceptance-based native-send transactions, prepared-context invalidation, constrained provider asset capture, current-version native attachments with one-click retry, background service launcher/reconnect, safe update classification/backup/rollback/restart, Git/runtime diagnostics, registered-root Codex/Antigravity handoff, root lifecycle actions, extraction retry, capability/size reporting, crash recovery, expanded adversarial tests, and the acceptance matrix.
+
+Remaining gate: live signed-in ChatGPT/Gemini compatibility validation only. See `docs/PRETRIAL_ACCEPTANCE.md`; do not convert external unknowns into success claims.
+
 ## 0.8 context integrity and security — implemented
 
 - [x] separate private state and live `AI Workspace\Projects` roots

@@ -9,8 +9,12 @@ try {
   $health = Invoke-RestMethod -Uri 'http://127.0.0.1:4317/api/health' -TimeoutSec 2
   if ($health.pid) {
     Write-Host "Stopping running AI Harness process $($health.pid)..."
-    Stop-Process -Id ([int]$health.pid) -Force -ErrorAction Stop
-    Start-Sleep -Milliseconds 600
+    try { Invoke-RestMethod -Uri 'http://127.0.0.1:4317/api/shutdown' -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 2 | Out-Null } catch {}
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+      if (-not (Get-Process -Id ([int]$health.pid) -ErrorAction SilentlyContinue)) { break }
+      Start-Sleep -Milliseconds 200
+    }
+    if (Get-Process -Id ([int]$health.pid) -ErrorAction SilentlyContinue) { Stop-Process -Id ([int]$health.pid) -Force -ErrorAction Stop }
   }
 } catch {}
 
@@ -30,3 +34,14 @@ if (-not $updateSucceeded) {
 Write-Host ''
 Write-Host 'Launching AI Harness...'
 Start-Process -FilePath (Join-Path $PSScriptRoot 'start-harness.cmd')
+
+$healthy = $false
+for ($attempt = 0; $attempt -lt 20; $attempt++) {
+  Start-Sleep -Milliseconds 500
+  try {
+    $health = Invoke-RestMethod -Uri 'http://127.0.0.1:4317/api/health' -TimeoutSec 2
+    if ($health.ok) { $healthy = $true; break }
+  } catch {}
+}
+if (-not $healthy) { throw 'AI Harness did not become healthy after restart.' }
+Write-Host 'AI Harness is healthy after restart.' -ForegroundColor Green

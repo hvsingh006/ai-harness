@@ -8,7 +8,7 @@ import { sha256File, sha256Text } from '../src/archive.mjs';
 import { captureBrowserSession, cleanManagedUserText } from '../src/chat-capture.mjs';
 import { reconcileWorkspaceResources } from '../src/resources.mjs';
 import { retrieveWorkspaceEvidence } from '../src/retrieval.mjs';
-import { prepareManagedSend } from '../src/outgoing-context.mjs';
+import { prepareManagedSend, markContextRunSent, markContextRunFailed } from '../src/outgoing-context.mjs';
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aih-prepare-'));
@@ -103,6 +103,9 @@ test('prepare-send exercises latest disk state, cross-provider continuity, curre
   assert.equal(requirementsSource.resource_version_id, row(db, `SELECT current_version_id FROM workspace_resources WHERE relative_path='requirements.md'`).current_version_id);
   assert.equal(row(db, 'SELECT status FROM outgoing_context_runs WHERE id=?', first.run_id).status, 'prepared');
   assert.equal(row(db, 'SELECT status FROM project_snapshots WHERE id=?', first.snapshot_id).status, 'current');
+  for (const metric of ['capture_sync_ms','root_inventory_ms','hash_version_ms','extraction_index_ms','repository_ms','snapshot_ms','retrieval_ms','security_ms','context_build_ms','attachment_prepare_ms','total_ms']) {
+    assert.equal(typeof first.diagnostics[metric], 'number', metric);
+  }
 
   fs.writeFileSync(requirements, 'Use architecture D immediately');
   const second = prepareManagedSend(db, {
@@ -366,4 +369,111 @@ test('context budgeting omits whole sources with auditable zero transmission ins
   const excluded = rows(db, `SELECT * FROM outgoing_context_sources WHERE run_id=? AND excluded_reason='CONTEXT_BUDGET'`, result.run_id);
   assert.ok(excluded.length >= 1);
   assert.equal(excluded.every(item => item.transmitted_character_count === 0), true);
+});
+
+test('delivery acknowledgement requires exact prepared identity and strong or corroborated provider acceptance', t => {
+  const { db, root } = fixture(t);
+  fs.writeFileSync(path.join(root, 'current.md'), 'current evidence');
+  const prompt = 'Use current.md';
+  const attemptId = 'attempt-exact';
+  const route = 'https://chatgpt.com/c/delivery';
+  const prepared = prepareManagedSend(db, { workspaceId: 'ws-harness', provider: 'chatgpt', userPrompt: prompt,
+    capture: capture('chatgpt', 'delivery', []), attemptId, promptHash: sha256Text(prompt), providerRoute: route, protocolVersion: 3 });
+  assert.equal(prepared.ok, true);
+  assert.equal(markContextRunSent(db, prepared.run_id, { attemptId, promptHash: prepared.prompt_hash, providerRoute: route, protocolVersion: 3, acceptance: { accepted: false, certainty: 'uncertain' } }), false);
+  assert.equal(markContextRunSent(db, prepared.run_id, { attemptId: 'wrong', promptHash: prepared.prompt_hash, providerRoute: route, protocolVersion: 3, acceptance: { accepted: true, certainty: 'strong' } }), false);
+  assert.equal(row(db, 'SELECT status FROM outgoing_context_runs WHERE id=?', prepared.run_id).status, 'prepared');
+  assert.equal(markContextRunSent(db, prepared.run_id, { attemptId, promptHash: prepared.prompt_hash, providerRoute: route, protocolVersion: 3, acceptance: { accepted: true, certainty: 'strong', signals: { message_count_increased: true } } }), true);
+  const audit = row(db, 'SELECT status,delivery_state,acceptance_json FROM outgoing_context_runs WHERE id=?', prepared.run_id);
+  assert.equal(audit.status, 'sent');
+  assert.equal(audit.delivery_state, 'DONE');
+  assert.equal(JSON.parse(audit.acceptance_json).accepted, true);
+});
+
+test('a disk change after prepare prevents delivery acknowledgement and remains auditable', t => {
+  const { db, root } = fixture(t);
+  const file = path.join(root, 'volatile.md');
+  fs.writeFileSync(file, 'version one');
+  const prompt = 'Read volatile.md';
+  const route = 'https://gemini.google.com/app/volatile';
+  const prepared = prepareManagedSend(db, { workspaceId: 'ws-harness', provider: 'gemini', userPrompt: prompt,
+    capture: capture('gemini', 'volatile', []), attemptId: 'attempt-volatile', promptHash: sha256Text(prompt), providerRoute: route, protocolVersion: 3 });
+  fs.writeFileSync(file, 'version two changed after prepare');
+  assert.equal(markContextRunSent(db, prepared.run_id, { attemptId: 'attempt-volatile', promptHash: prepared.prompt_hash, providerRoute: route, protocolVersion: 3, acceptance: { accepted: true, certainty: 'strong', signals: { streaming_started: true } } }), false);
+  assert.equal(markContextRunFailed(db, prepared.run_id, { code: 'PREPARED_CONTEXT_INVALIDATED', message: 'source changed before acceptance was recorded' }), true);
+  assert.equal(row(db, 'SELECT failure_code FROM outgoing_context_runs WHERE id=?', prepared.run_id).failure_code, 'PREPARED_CONTEXT_INVALIDATED');
+});
+
+test('an uncertain accepted send is repaired only by an exact provider-message hash', t => {
+  const { db, root } = fixture(t);
+  fs.writeFileSync(path.join(root, 'recovery.md'), 'recovery evidence');
+  const prompt = 'Use recovery.md';
+  const prepared = prepareManagedSend(db, { workspaceId: 'ws-harness', provider: 'chatgpt', userPrompt: prompt,
+    capture: capture('chatgpt', 'recovery-chat', []), attemptId: 'attempt-recovery', promptHash: sha256Text(prompt), providerRoute: 'https://chatgpt.com/c/recovery-chat', protocolVersion: 3 });
+  assert.equal(markContextRunFailed(db, prepared.run_id, { code: 'PROVIDER_ACCEPTANCE_UNCERTAIN', message: 'acceptance timeout' }), true);
+  const mismatch = captureBrowserSession(db, capture('chatgpt', 'recovery-chat', [{ role: 'user', content: 'different message', provider_message_id: 'different-message' }]));
+  assert.equal(mismatch.deliveries_reconciled, 0);
+  assert.equal(row(db, 'SELECT status FROM outgoing_context_runs WHERE id=?', prepared.run_id).status, 'blocked');
+  const recovered = captureBrowserSession(db, capture('chatgpt', 'recovery-chat', [{ role: 'user', content: prepared.provider_text, provider_message_id: 'exact-managed-message' }]));
+  assert.equal(recovered.deliveries_reconciled, 1);
+  const audit = row(db, 'SELECT status,delivery_state,failure_code,acceptance_json FROM outgoing_context_runs WHERE id=?', prepared.run_id);
+  assert.equal(audit.status, 'sent');
+  assert.equal(audit.delivery_state, 'DONE');
+  assert.equal(audit.failure_code, '');
+  assert.equal(JSON.parse(audit.acceptance_json).certainty, 'reconciled');
+  assert.equal(row(db, 'SELECT outgoing_context_run_id FROM messages WHERE provider_message_id=?', 'exact-managed-message').outgoing_context_run_id, prepared.run_id);
+});
+
+test('attachment fallback reprepares the latest exact version and records fallback provenance', t => {
+  const { db, root } = fixture(t);
+  const officePath = path.join(root, 'current-plan.docx');
+  fs.writeFileSync(officePath, 'office-v1');
+  const prompt = 'Attach current-plan.docx';
+  const first = prepareManagedSend(db, { workspaceId: 'ws-harness', provider: 'gemini', userPrompt: prompt, capture: capture('gemini', 'fallback-chat', []) });
+  assert.equal(first.attachments.length, 1);
+  assert.equal(markContextRunFailed(db, first.run_id, { code: 'ATTACHMENT_PREP_FAILED', message: 'provider did not confirm the attachment' }), true);
+  fs.writeFileSync(officePath, 'office-v2-current');
+  const second = prepareManagedSend(db, { workspaceId: 'ws-harness', provider: 'gemini', userPrompt: prompt, capture: capture('gemini', 'fallback-chat', []),
+    attachmentMode: 'fallback', fallbackFromRunId: first.run_id, fallbackVersionIds: first.attachments.map(item => item.version_id) });
+  assert.equal(second.ok, true);
+  assert.equal(second.attachment_mode, 'fallback');
+  assert.equal(second.fallback_from_run_id, first.run_id);
+  assert.notEqual(second.attachments[0].version_id, first.attachments[0].version_id);
+  assert.equal(second.attachments[0].sha256, sha256File(officePath));
+  const metadata = JSON.parse(row(db, 'SELECT metadata_json FROM outgoing_context_runs WHERE id=?', second.run_id).metadata_json);
+  assert.equal(metadata.attachment_mode, 'fallback');
+  assert.equal(metadata.fallback_from_run_id, first.run_id);
+  assert.deepEqual(metadata.fallback_requested_versions, first.attachments.map(item => item.version_id));
+  assert.throws(() => prepareManagedSend(db, { workspaceId: 'ws-harness', provider: 'gemini', userPrompt: prompt, capture: capture('gemini', 'fallback-chat', []), attachmentMode: 'fallback', fallbackFromRunId: 'missing-run' }), error => error.code === 'ATTACHMENT_FALLBACK_SOURCE_INVALID');
+});
+
+test('retrieval intent ranks explicit user decisions and current code above fallible assistant claims while preserving historical queries', t => {
+  const { db, root } = fixture(t);
+  fs.writeFileSync(path.join(root, 'implementation.js'), 'export const architecture = "CURRENT_C";');
+  reconcileWorkspaceResources(db, 'ws-harness');
+  captureBrowserSession(db, capture('chatgpt', 'old-claim', [
+    { role: 'user', content: 'My explicit decision was to replace OLD_A after the reset race.' },
+    { role: 'assistant', content: 'OLD_A is definitely the current implementation.' }
+  ]));
+  const current = retrieveWorkspaceEvidence(db, { workspaceId: 'ws-harness', query: 'What is the current implementation architecture in code?', provider: 'gemini' });
+  const code = current.selected.find(item => item.source_type === 'repository_file' && item.content.includes('CURRENT_C'));
+  const assistant = current.selected.find(item => item.provenance?.role === 'assistant' && item.content.includes('OLD_A'));
+  const user = current.selected.find(item => item.provenance?.role === 'user' && item.content.includes('explicit decision'));
+  assert.ok(code && assistant && user);
+  assert.ok(code.score > assistant.score);
+  assert.ok(user.score > assistant.score);
+
+  const historical = retrieveWorkspaceEvidence(db, { workspaceId: 'ws-harness', query: 'Why did we previously replace OLD_A? Show the decision trail.', provider: 'gemini' });
+  assert.ok(historical.selected.some(item => item.provenance?.role === 'user' && item.content.includes('reset race')));
+});
+
+test('an explicitly requested native attachment above the companion transfer bound fails closed with an honest reason', t => {
+  const { db, root } = fixture(t);
+  const oversized = path.join(root, 'oversized-design.docx');
+  fs.closeSync(fs.openSync(oversized, 'w'));
+  fs.truncateSync(oversized, 25 * 1024 * 1024 + 1);
+  const result = prepareManagedSend(db, { workspaceId: 'ws-harness', provider: 'chatgpt', userPrompt: 'Attach oversized-design.docx', capture: capture('chatgpt', 'oversized-attachment', []) });
+  assert.equal(result.ok, false);
+  assert.ok(result.reasons.some(reason => reason.code === 'ATTACHMENT_TOO_LARGE'));
+  assert.equal(row(db, 'SELECT failure_code FROM outgoing_context_runs WHERE id=?', result.run_id).failure_code, 'ATTACHMENT_TOO_LARGE');
 });

@@ -1,5 +1,9 @@
 # AI Harness setup
 
+The Windows installer installs Git, GitHub CLI, Node.js 22.5+, and the Poppler `pdftotext` extractor when missing. The AI Harness shortcut starts a hidden localhost background process from the canonical checkout; the dashboard can be closed afterward. Service logs are written under the private Harness `Runtime` directory.
+
+After an extension update, reload the unpacked extension and refresh ChatGPT/Gemini. Readiness reports both service and companion protocol versions and shows `reload_required` on a mismatch.
+
 ## Canonical checkout
 
 The normal Windows source/runtime checkout is:

@@ -13,7 +13,7 @@
   "content_scripts": [
     {
       "matches": ["https://chatgpt.com/*", "https://gemini.google.com/*"],
-      "js": ["provider-adapters.js", "content.js"],
+      "js": ["provider-adapters.js", "send-transaction.js", "content.js"],
       "css": ["content.css"],
       "run_at": "document_idle"
     },

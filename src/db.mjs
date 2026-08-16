@@ -477,6 +477,17 @@ function migrate(db) {
   addColumn(db, 'messages', "clean_content_text TEXT NOT NULL DEFAULT ''");
   addColumn(db, 'messages', "outgoing_context_run_id TEXT REFERENCES outgoing_context_runs(id) ON DELETE SET NULL");
   addColumn(db, 'messages', "harness_managed INTEGER NOT NULL DEFAULT 0");
+  addColumn(db, 'outgoing_context_runs', "attempt_id TEXT NOT NULL DEFAULT ''");
+  addColumn(db, 'outgoing_context_runs', "prompt_hash TEXT NOT NULL DEFAULT ''");
+  addColumn(db, 'outgoing_context_runs', "provider_route TEXT NOT NULL DEFAULT ''");
+  addColumn(db, 'outgoing_context_runs', "protocol_version INTEGER NOT NULL DEFAULT 0");
+  addColumn(db, 'outgoing_context_runs', "delivery_state TEXT NOT NULL DEFAULT 'PREPARING'");
+  addColumn(db, 'outgoing_context_runs', "acceptance_json TEXT NOT NULL DEFAULT '{}'");
+
+  // A process crash must never promote an unacknowledged prepared send. Keep it
+  // inspectable and require a fresh prepare/reconciliation on the next attempt.
+  db.prepare(`UPDATE outgoing_context_runs SET status='blocked',delivery_state='ERROR',failure_code='SERVICE_RESTARTED_BEFORE_PROVIDER_ACCEPT'
+              WHERE status='prepared' AND delivery_state IN ('PREPARING','PREPARED','ATTACHING','REPLAYING','WAITING_FOR_PROVIDER_ACCEPT')`).run();
 
   try {
     db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(message_id UNINDEXED, session_id UNINDEXED, workspace_id UNINDEXED, provider UNINDEXED, title, role, content);`);

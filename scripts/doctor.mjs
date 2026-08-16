@@ -3,7 +3,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { openDatabase, row, storageForDatabase } from '../src/db.mjs';
 import { workspaceStatus, isWithin } from '../src/dev-workspace.mjs';
-import { HARNESS_VERSION } from '../src/version.mjs';
+import { HARNESS_VERSION, COMPANION_PROTOCOL_VERSION } from '../src/version.mjs';
 
 const checks = [];
 function check(name, ok, detail = '') { checks.push({ name, ok: Boolean(ok), detail }); }
@@ -35,6 +35,10 @@ try {
   const requiredTables = ['workspace_roots','workspace_resources','resource_versions','resource_chunks','project_snapshots','outgoing_context_runs','companion_pairings'];
   const missing = requiredTables.filter(table => !row(db, `SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table));
   check('Context-integrity schema', missing.length === 0, missing.length ? `Missing: ${missing.join(', ')}` : 'roots, versions, chunks, snapshots, audit, and pairing tables present');
+  const outgoingColumns = db.prepare('PRAGMA table_info(outgoing_context_runs)').all().map(item => item.name);
+  const requiredDeliveryColumns = ['attempt_id','prompt_hash','provider_route','protocol_version','delivery_state','acceptance_json'];
+  const missingDelivery = requiredDeliveryColumns.filter(name => !outgoingColumns.includes(name));
+  check('Native-send transaction schema', missingDelivery.length === 0, missingDelivery.length ? `Missing: ${missingDelivery.join(', ')}` : `protocol ${COMPANION_PROTOCOL_VERSION} attempt/route/acceptance fields present`);
 } catch (error) {
   check('SQLite database', false, error.message);
 }
@@ -61,7 +65,8 @@ if (storage) {
 }
 
 const pdfTool = spawnSync('pdftotext', ['-v'], { encoding: 'utf8', windowsHide: true, timeout: 3000 });
-check('PDF text extractor', !pdfTool.error && [0, 1].includes(pdfTool.status), !pdfTool.error ? 'pdftotext available' : 'Not installed; required PDF indexing will fail closed.');
+const pdfVersion = String(pdfTool.stderr || pdfTool.stdout || '').split(/\r?\n/).find(Boolean)?.trim() || '';
+check('PDF text extractor', !pdfTool.error && [0, 1].includes(pdfTool.status), !pdfTool.error ? `pdftotext available · ${pdfVersion || 'version unknown'}` : 'Not installed; run install-harness.ps1 to install Poppler automatically. Required PDF indexing fails closed.');
 
 try {
   const response = await fetch('http://127.0.0.1:4317/api/health', { signal: AbortSignal.timeout(1200) });
@@ -81,7 +86,7 @@ try { db?.close(); } catch {}
 
 console.log(`\nAI Harness doctor v${HARNESS_VERSION}\n`);
 for (const item of checks) console.log(`${item.ok ? 'PASS' : 'WAIT'}  ${item.name}${item.detail ? ` - ${item.detail}` : ''}`);
-const nonBlocking = new Set(['Running Harness service', 'Browser companion detected', 'PDF text extractor']);
+const nonBlocking = new Set(['Running Harness service', 'Browser companion detected']);
 const transitional = new Set(['Canonical repository path']);
 const hardFailures = checks.filter(c => !c.ok && !nonBlocking.has(c.name) && !transitional.has(c.name));
 console.log(hardFailures.length ? `\n${hardFailures.length} blocking check(s) failed.` : '\nCore installation checks passed.');

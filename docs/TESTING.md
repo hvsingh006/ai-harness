@@ -1,5 +1,9 @@
 # AI Harness 0.8 testing
 
+The pre-trial acceptance matrix is maintained in `docs/PRETRIAL_ACCEPTANCE.md`. The suite includes synthetic provider DOM fixtures, exact native-send delivery binding, crash recovery, asset origin rules, updater temp repositories, local-agent root scoping, advanced path/secret attacks, PDF recovery, Office attachment-only behavior, and real localhost HTTP integration. A skipped PDF retry case means the test process could not execute `pdftotext`; `npm run doctor` reports that condition separately and the installer remediates it.
+
+Passing local tests is not evidence that live ChatGPT/Gemini DOM integration works. Live provider compatibility is a separate external gate.
+
 ## Automated gate
 
 Run from the canonical repository:

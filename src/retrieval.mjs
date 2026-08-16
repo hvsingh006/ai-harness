@@ -94,7 +94,7 @@ function messageCandidates(db, workspaceId, terms, targetProvider, currentSessio
   return [...merged.values()].map(item => {
     const ageDays = Math.max(0, (now - Date.parse(item.created_at || item.started_at || 0)) / 86400000);
     const recency = Math.max(0, 18 - Math.log2(ageDays + 1) * 3);
-    const roleWeight = item.role === 'user' ? 32 : item.role === 'assistant' ? 10 : 4;
+    const roleWeight = item.role === 'user' ? 48 : item.role === 'assistant' ? 6 : 4;
     const crossProvider = item.provider && item.provider !== targetProvider ? 8 : 0;
     const currentSession = item.session_id === currentSessionId ? 10 : 0;
     return {
@@ -132,11 +132,17 @@ export function retrieveWorkspaceEvidence(db, {
   characterBudget = 24000
 }) {
   const terms = queryTerms(query);
+  const currentIntent = /\b(current|latest|now|today|repository|code|implementation|working state)\b/i.test(String(query || ''));
+  const historicalIntent = /\b(history|historical|earlier|previous|originally|why did|decision trail)\b/i.test(String(query || ''));
   const all = [
     ...structuredCandidates(db, workspaceId, terms),
     ...messageCandidates(db, workspaceId, terms, provider, currentSessionId),
     ...resourceCandidates(db, workspaceId, terms)
-  ].sort((a, b) => b.score - a.score || String(a.source_id).localeCompare(String(b.source_id)));
+  ].map(candidate => ({ ...candidate, score: candidate.score
+    + (currentIntent && ['file','pdf','repository_file'].includes(candidate.source_type) ? 45 : 0)
+    + (currentIntent && candidate.source_type === 'chat_message' && candidate.provenance?.role === 'assistant' ? -12 : 0)
+    + (historicalIntent && candidate.source_type === 'chat_message' ? 24 : 0) }))
+    .sort((a, b) => b.score - a.score || String(a.source_id).localeCompare(String(b.source_id)));
   const selected = [];
   const seen = new Set();
   let used = 0;

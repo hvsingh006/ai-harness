@@ -1,1 +1,3 @@
 export const HARNESS_VERSION = '0.8.0';
+export const COMPANION_PROTOCOL_VERSION = 3;
+export const COMPANION_PROTOCOL_MIN_VERSION = 3;

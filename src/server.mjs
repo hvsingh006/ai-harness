@@ -7,15 +7,17 @@ import { spawn } from 'node:child_process';
 import { openDatabase, rows, row, run, storageForDatabase, ensureWorkspaceProjectRoot, attachWorkspaceFolder, registerWorkspaceRoot, workspaceRoots } from './db.mjs';
 import { archiveFile, sha256File } from './archive.mjs';
 import { setCaptureStages, importChatGPTExport, importProviderArchive } from './importers.mjs';
-import { HARNESS_VERSION } from './version.mjs';
+import { HARNESS_VERSION, COMPANION_PROTOCOL_VERSION, COMPANION_PROTOCOL_MIN_VERSION } from './version.mjs';
 import { indexWorkspaceFile, scanWorkspaceFiles, projectFileDestination, storageSummary } from './project-space.mjs';
-import { captureBrowserSession as captureVerifiedBrowserSession, resolveSessionByRefs as resolveCapturedSession } from './chat-capture.mjs';
+import { captureBrowserSession as captureVerifiedBrowserSession, resolveSessionByRefs as resolveCapturedSession, validateProviderAssetUrl } from './chat-capture.mjs';
 import { prepareManagedSend, markContextRunSent, markContextRunFailed } from './outgoing-context.mjs';
 import { workspaceIntegrity, markWorkspaceStale } from './freshness.mjs';
 import { currentWorkspaceResources, reconcileWorkspaceResources } from './resources.mjs';
 import { createPairingChallenge, completePairing, authenticateCompanionRequest, ensureInstallCredential, isSameOriginDashboardRequest, pairedCompanionStatus } from './security/companion-auth.mjs';
 import { pendingManagedWorkspaceMigrations, migrateManagedWorkspaceProject } from './workspace-migration.mjs';
-import { isPathWithin } from './security/paths.mjs';
+import { isPathWithin, resolveApprovedTarget } from './security/paths.mjs';
+import { inspectSafeUpdate } from './update-safety.mjs';
+import { agentCapabilities, launchRegisteredAgent } from './agent-launcher.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
@@ -69,6 +71,12 @@ function refreshRootWatchers() {
 }
 
 refreshRootWatchers();
+const watcherRecoveryTimer = setInterval(() => {
+  refreshRootWatchers();
+  const affected = new Set(rows(db, `SELECT workspace_id,id FROM workspace_roots WHERE indexing_enabled=1`).filter(root => !rootWatchers.has(root.id)).map(root => root.workspace_id));
+  for (const workspaceId of affected) scheduleBackgroundIndex(workspaceId);
+}, 15000);
+watcherRecoveryTimer.unref?.();
 
 function gitOutput(args, timeoutMs = 8000) {
   return new Promise((resolve, reject) => {
@@ -90,33 +98,23 @@ function gitOutput(args, timeoutMs = 8000) {
   });
 }
 
-async function applicationUpdateStatus() {
-  if (!fs.existsSync(path.join(rootDir, '.git'))) {
-    return { supported: false, update_available: false, current_version: HARNESS_VERSION, message: 'This installation is not a Git checkout.' };
-  }
-  const currentCommit = await gitOutput(['rev-parse', 'HEAD']);
+async function applicationUpdateStatus({ fetch = false } = {}) {
   try {
-    await gitOutput(['fetch', '--quiet', 'origin', 'main'], 12000);
-    const remoteCommit = await gitOutput(['rev-parse', 'origin/main']);
-    const counts = (await gitOutput(['rev-list', '--left-right', '--count', `${currentCommit}...${remoteCommit}`])).split(/\s+/).map(Number);
+    const status = inspectSafeUpdate(rootDir, { fetch });
     let remoteVersion = null;
-    try {
+    if (status.supported && status.remote_commit) try {
       const versionSource = await gitOutput(['show', 'origin/main:src/version.mjs']);
       remoteVersion = versionSource.match(/HARNESS_VERSION\s*=\s*['\"]([^'\"]+)/)?.[1] || null;
     } catch {}
     return {
-      supported: true,
+      ...status,
       current_version: HARNESS_VERSION,
       remote_version: remoteVersion,
-      current_commit: currentCommit,
-      remote_commit: remoteCommit,
-      ahead: counts[0] || 0,
-      behind: counts[1] || 0,
-      update_available: (counts[1] || 0) > 0,
-      message: (counts[1] || 0) > 0 ? 'A newer version is available.' : 'AI Harness is up to date.'
+      current_commit: status.head,
+      message: status.code === 'SAFE_TO_UPDATE' ? 'A safe fast-forward update is available.' : status.code === 'UP_TO_DATE' ? 'AI Harness is up to date.' : `Automatic update blocked: ${status.code}`
     };
   } catch (error) {
-    return { supported: true, update_available: false, current_version: HARNESS_VERSION, current_commit: currentCommit, error: error.message, message: 'Could not check GitHub. The installed version is unchanged.' };
+    return { supported: true, eligible: false, update_available: false, current_version: HARNESS_VERSION, code: error.code || 'UPDATE_STATUS_FAILED', error: error.message, message: 'Could not check GitHub. The installed version is unchanged.' };
   }
 }
 
@@ -125,6 +123,15 @@ function safeRelativePath(value) {
   const parts = normalized.split('/').filter(Boolean);
   if (!parts.length || parts.some(part => part === '..')) throw new Error('invalid relative path');
   return parts.join(path.sep);
+}
+
+function providerAssetMimeCompatible(expected, received) {
+  const expectedType = String(expected || '').split(';')[0].trim().toLowerCase();
+  const receivedType = String(received || '').split(';')[0].trim().toLowerCase();
+  if (!receivedType || receivedType.includes('*')) return false;
+  if (!expectedType || expectedType === 'application/octet-stream') return true;
+  if (expectedType.endsWith('/*')) return receivedType.startsWith(expectedType.slice(0, -1));
+  return expectedType === receivedType;
 }
 
 async function streamRequestToFile(req, filePath, maxBytes = 1024 * 1024 * 1024) {
@@ -358,6 +365,9 @@ function buildSessionContextPacket(sessionId, maxChars = 60000) {
 function readiness() {
   const client = row(db, 'SELECT * FROM companion_clients ORDER BY last_seen_at DESC LIMIT 1');
   const pairing = pairedCompanionStatus(db);
+  const metadata = client ? JSON.parse(client.metadata_json || '{}') : {};
+  const protocolCompatible = Number(metadata.protocol_version || 0) >= COMPANION_PROTOCOL_MIN_VERSION && Number(metadata.protocol_version || 0) <= COMPANION_PROTOCOL_VERSION;
+  const adapterHealthy = metadata.capabilities?.ok === true;
   return {
     service_ready: true,
     database_ready: true,
@@ -366,8 +376,13 @@ function readiness() {
     paired_extension_id: pairing?.extension_id || null,
     browser_companion_last_seen: client?.last_seen_at || null,
     browser_companion_version: client?.version || null,
-    ready_for_native_workflow: Boolean(client && pairing),
-    indicator: client && pairing ? 'bright_red' : 'setup_required'
+    protocol_version: COMPANION_PROTOCOL_VERSION,
+    companion_protocol_version: Number(metadata.protocol_version || 0),
+    protocol_compatible: protocolCompatible,
+    adapter_health: metadata.capabilities || null,
+    ready_for_native_workflow: Boolean(client && pairing && protocolCompatible && adapterHealthy),
+    indicator: client && pairing && protocolCompatible && adapterHealthy ? 'bright_red' : 'setup_required',
+    reload_required: Boolean(client && (!protocolCompatible || !adapterHealthy))
   };
 }
 
@@ -390,9 +405,26 @@ async function handleApi(req, res, url) {
     return sendJson(res, 403, { ok: false, code: 'ORIGIN_REJECTED', error: 'request origin rejected' });
   }
 
-  if (url.pathname === '/api/health') return sendJson(res, 200, { ok: true, version: HARNESS_VERSION, pid: process.pid, database: 'sqlite', storage: storageSummary(db), archive: archiveStats(), pending_managed_project_migrations: pendingManagedWorkspaceMigrations(db).length });
-  if (url.pathname === '/api/update-status' && req.method === 'GET') return sendJson(res, 200, await applicationUpdateStatus());
+  if (url.pathname === '/api/health') return sendJson(res, 200, { ok: true, version: HARNESS_VERSION, protocol_version: COMPANION_PROTOCOL_VERSION, source_root: rootDir, pid: process.pid, database: 'sqlite', storage: storageSummary(db), archive: archiveStats(), pending_managed_project_migrations: pendingManagedWorkspaceMigrations(db).length });
+  if (url.pathname === '/api/update-status' && req.method === 'GET') return sendJson(res, 200, await applicationUpdateStatus({ fetch: url.searchParams.get('refresh') === '1' }));
+  if (url.pathname === '/api/update-and-restart' && req.method === 'POST') {
+    const status = await applicationUpdateStatus({ fetch: true });
+    if (!status.eligible) return sendJson(res, 409, { ok: false, code: status.code || 'UPDATE_BLOCKED', status });
+    const script = path.join(rootDir, 'update-and-launch-harness.ps1');
+    if (!fs.existsSync(script)) return sendJson(res, 500, { ok: false, code: 'UPDATE_HELPER_MISSING' });
+    const shell = process.platform === 'win32' ? 'powershell.exe' : 'pwsh';
+    const shellArgs = process.platform === 'win32' ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script] : ['-NoProfile', '-File', script];
+    const child = spawn(shell, shellArgs, { cwd: rootDir, detached: true, windowsHide: true, stdio: 'ignore' });
+    child.unref();
+    return sendJson(res, 202, { ok: true, code: 'UPDATE_STARTED', current_commit: status.current_commit, target_commit: status.remote_commit });
+  }
+  if (url.pathname === '/api/local-agents' && req.method === 'GET') return sendJson(res, 200, agentCapabilities());
   if (url.pathname === '/api/readiness' && req.method === 'GET') return sendJson(res, 200, readiness());
+  if (url.pathname === '/api/shutdown' && req.method === 'POST') {
+    sendJson(res, 202, { ok: true, code: 'SHUTDOWN_STARTED' });
+    setImmediate(() => shutdown('dashboard_request'));
+    return;
+  }
   if (url.pathname === '/api/companion/pairing-challenge' && req.method === 'POST') {
     return sendJson(res, 201, { ok: true, ...createPairingChallenge(db, { installSecret: companionCredential.secret }) });
   }
@@ -409,7 +441,8 @@ async function handleApi(req, res, url) {
     const body = await readJson(req);
     const clientId = req.aihCompanion.extensionId;
     const ts = new Date().toISOString();
-    run(db, `INSERT INTO companion_clients (client_id,version,provider,last_seen_at,metadata_json) VALUES (?,?,?,?,?) ON CONFLICT(client_id) DO UPDATE SET version=excluded.version,provider=excluded.provider,last_seen_at=excluded.last_seen_at,metadata_json=excluded.metadata_json`, clientId, body.version || '', body.provider || '', ts, JSON.stringify(body.metadata || {}));
+    const metadata = { ...(body.metadata || {}), protocol_version: Number(body.protocol_version || 0) };
+    run(db, `INSERT INTO companion_clients (client_id,version,provider,last_seen_at,metadata_json) VALUES (?,?,?,?,?) ON CONFLICT(client_id) DO UPDATE SET version=excluded.version,provider=excluded.provider,last_seen_at=excluded.last_seen_at,metadata_json=excluded.metadata_json`, clientId, body.version || '', body.provider || '', ts, JSON.stringify(metadata));
     return sendJson(res, 200, readiness());
   }
   if (url.pathname === '/api/companion/active-workspace' && req.method === 'GET') {
@@ -440,11 +473,29 @@ async function handleApi(req, res, url) {
   if (prepareSendMatch && req.method === 'POST') {
     try {
       const body = await readJson(req);
+      if (Number(body.protocol_version || 0) !== COMPANION_PROTOCOL_VERSION) {
+        return sendJson(res, 409, { ok: false, freshness: 'blocked', reasons: [{ code: 'COMPANION_PROTOCOL_MISMATCH', message: `browser companion protocol ${Number(body.protocol_version || 0)} is incompatible with service protocol ${COMPANION_PROTOCOL_VERSION}; reload the extension` }] });
+      }
+      const captureEvidence = body.capture?.capture_evidence;
+      const capabilities = captureEvidence?.capabilities;
+      if (Number(captureEvidence?.protocol_version || 0) !== COMPANION_PROTOCOL_VERSION || !capabilities) {
+        return sendJson(res, 409, { ok: false, freshness: 'blocked', reasons: [{ code: 'PROVIDER_CAPABILITY_EVIDENCE_MISSING', message: 'the browser companion did not provide compatible provider capability evidence; reload the extension' }] });
+      }
+      if (capabilities.ok !== true) {
+        return sendJson(res, 412, { ok: false, freshness: 'blocked', reasons: (capabilities.failures || []).map(item => ({ code: item.code || 'PROVIDER_CAPABILITY_FAILED', message: `required provider capability failed: ${item.capability || 'unknown'}` })) });
+      }
       const result = prepareManagedSend(db, {
         workspaceId: prepareSendMatch[1],
         provider: body.provider,
         userPrompt: body.user_prompt,
         capture: body.capture,
+        attemptId: body.attempt_id,
+        promptHash: body.prompt_hash,
+        providerRoute: body.route,
+        protocolVersion: body.protocol_version,
+        attachmentMode: body.attachment_mode,
+        fallbackFromRunId: body.fallback_from_run_id,
+        fallbackVersionIds: body.fallback_version_ids,
         contextCharacterBudget: Math.min(60000, Math.max(8000, Number(body.context_character_budget || 30000)))
       });
       return sendJson(res, result.ok ? 200 : 412, result);
@@ -455,7 +506,12 @@ async function handleApi(req, res, url) {
 
   const sentRunMatch = url.pathname.match(/^\/api\/companion\/outgoing-context\/([^/]+)\/sent$/);
   if (sentRunMatch && req.method === 'POST') {
-    return markContextRunSent(db, sentRunMatch[1]) ? sendJson(res, 200, { ok: true }) : sendJson(res, 409, { ok: false, code: 'RUN_NOT_PREPARED' });
+    const body = await readJson(req, 32 * 1024);
+    const deliveryRun = row(db, 'SELECT status FROM outgoing_context_runs WHERE id=?', sentRunMatch[1]);
+    if (!deliveryRun || deliveryRun.status !== 'prepared') return sendJson(res, 409, { ok: false, code: 'RUN_NOT_PREPARED' });
+    if (!body.acceptance?.accepted || !['strong','corroborated'].includes(body.acceptance?.certainty)) return sendJson(res, 409, { ok: false, code: 'PROVIDER_ACCEPTANCE_UNPROVEN' });
+    return markContextRunSent(db, sentRunMatch[1], { attemptId: body.attempt_id, promptHash: body.prompt_hash, providerRoute: body.route, protocolVersion: body.protocol_version, acceptance: body.acceptance })
+      ? sendJson(res, 200, { ok: true }) : sendJson(res, 409, { ok: false, code: 'PREPARED_CONTEXT_INVALIDATED' });
   }
 
   const failedRunMatch = url.pathname.match(/^\/api\/companion\/outgoing-context\/([^/]+)\/failed$/);
@@ -469,7 +525,7 @@ async function handleApi(req, res, url) {
   const resourceVersionContent = url.pathname.match(/^\/api\/companion\/resource-versions\/([^/]+)\/content$/);
   if (resourceVersionContent && req.method === 'GET') {
     const version = row(db, `SELECT v.*,r.relative_path,r.mime_type,r.current_version_id,r.provider_transmission_allowed,
-      wr.provider_transmission_allowed AS root_transmission_allowed,wr.status AS root_status,a.vault_path
+      wr.provider_transmission_allowed AS root_transmission_allowed,wr.status AS root_status,wr.root_path,wr.canonical_path,a.vault_path
       FROM resource_versions v
       JOIN workspace_resources r ON r.id=v.resource_id
       JOIN workspace_roots wr ON wr.id=r.root_id
@@ -480,6 +536,12 @@ async function handleApi(req, res, url) {
     }
     if (String(version.security_status).startsWith('local_only') || !isPathWithin(version.vault_path, storage.vaultDir) || !fs.existsSync(version.vault_path)) {
       return sendJson(res, 403, { ok: false, code: 'RESOURCE_TRANSMISSION_BLOCKED' });
+    }
+    try {
+      const live = resolveApprovedTarget(version, version.relative_path, { expectedType: 'file' });
+      if (sha256File(live.absolutePath) !== version.sha256) return sendJson(res, 409, { ok: false, code: 'PREPARED_ATTACHMENT_INVALIDATED' });
+    } catch (error) {
+      return sendJson(res, 409, { ok: false, code: 'PREPARED_ATTACHMENT_INVALIDATED', error: error.message });
     }
     const stat = fs.statSync(version.vault_path);
     if (stat.size > 100 * 1024 * 1024) return sendJson(res, 413, { ok: false, code: 'RESOURCE_TOO_LARGE' });
@@ -523,15 +585,59 @@ async function handleApi(req, res, url) {
     }
   }
 
-  const assetContentMatch = url.pathname.match(/^\/api\/session-assets\/([^/]+)\/content$/);
+  const assetSourceMatch = url.pathname.match(/^\/api\/companion\/session-assets\/([^/]+)\/source$/);
+  if (assetSourceMatch && req.method === 'GET') {
+    const asset = row(db, `SELECT a.*,s.provider AS session_provider,s.workspace_id FROM session_assets a JOIN sessions s ON s.id=a.session_id WHERE a.id=?`, assetSourceMatch[1]);
+    if (!asset) return sendJson(res, 404, { ok: false, code: 'ASSET_NOT_DISCOVERED' });
+    const validated = validateProviderAssetUrl(asset.session_provider, asset.source_url);
+    if (!validated.ok) return sendJson(res, 403, { ok: false, code: validated.code, status: validated.status });
+    if (String(asset.mirror_status).toUpperCase() === 'CAPTURED') return sendJson(res, 409, { ok: false, code: 'ASSET_ALREADY_CAPTURED' });
+    if (!['DISCOVERED', 'FETCHING'].includes(String(asset.mirror_status).toUpperCase())) return sendJson(res, 409, { ok: false, code: 'ASSET_STATE_REJECTED', status: asset.mirror_status });
+    return sendJson(res, 200, {
+      ok: true,
+      asset_id: asset.id,
+      session_id: asset.session_id,
+      workspace_id: asset.workspace_id,
+      provider: asset.session_provider,
+      source_url: validated.url,
+      capture_strategy: validated.capture_strategy,
+      mime_type: asset.mime_type,
+      max_bytes: validated.capture_strategy === 'page_blob' ? 25 * 1024 * 1024 : 100 * 1024 * 1024
+    });
+  }
+
+  const assetContentMatch = url.pathname.match(/^\/api\/companion\/session-assets\/([^/]+)\/content$/);
   if (assetContentMatch && req.method === 'PUT') {
     const asset = row(db, `SELECT a.*, s.workspace_id, s.provider AS session_provider FROM session_assets a JOIN sessions s ON s.id=a.session_id WHERE a.id=?`, assetContentMatch[1]);
-    if (!asset) return sendJson(res, 404, { error: 'asset reference not found' });
+    if (!asset) return sendJson(res, 404, { ok: false, code: 'ASSET_NOT_DISCOVERED', error: 'asset reference not found' });
+    if (!['DISCOVERED', 'FETCHING'].includes(String(asset.mirror_status).toUpperCase())) return sendJson(res, 409, { ok: false, code: 'ASSET_STATE_REJECTED', status: asset.mirror_status });
+    const validatedUrl = validateProviderAssetUrl(asset.session_provider, asset.source_url);
+    if (!validatedUrl.ok) return sendJson(res, 403, { ok: false, code: validatedUrl.code, status: validatedUrl.status });
+    const suppliedSource = String(req.headers['x-aih-asset-source-url'] || '');
+    if (suppliedSource !== asset.source_url) return sendJson(res, 403, { ok: false, code: 'ASSET_SOURCE_MISMATCH' });
+    const captureStrategy = String(req.headers['x-aih-asset-capture-strategy'] || 'background_https');
+    if (captureStrategy !== validatedUrl.capture_strategy) return sendJson(res, 403, { ok: false, code: 'ASSET_CAPTURE_STRATEGY_MISMATCH' });
+    const declaredLength = Number(req.headers['content-length'] || 0);
+    const assetLimit = captureStrategy === 'page_blob' ? 25 * 1024 * 1024 : 100 * 1024 * 1024;
+    if (declaredLength > assetLimit) {
+      run(db, `UPDATE session_assets SET mirror_status='FAILED',metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.capture_error',?),updated_at=? WHERE id=?`, `asset exceeds ${assetLimit} byte capture limit`, new Date().toISOString(), asset.id);
+      setCaptureStages(db, asset.session_id, { attachments: false });
+      return sendJson(res, 413, { ok: false, code: 'ASSET_TOO_LARGE' });
+    }
+    const receivedType = String(req.headers['content-type'] || 'application/octet-stream').split(';')[0].trim().toLowerCase();
+    const allowedTypes = /^(?:image\/|application\/(?:pdf|zip|octet-stream|vnd\.)|text\/)/;
+    if (!allowedTypes.test(receivedType) || !providerAssetMimeCompatible(asset.mime_type, receivedType)) {
+      run(db, `UPDATE session_assets SET mirror_status='FAILED',metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.capture_error',?),updated_at=? WHERE id=?`, `received MIME ${receivedType || '(missing)'} did not match ${asset.mime_type || '(unspecified)'}`, new Date().toISOString(), asset.id);
+      setCaptureStages(db, asset.session_id, { attachments: false });
+      return sendJson(res, 415, { ok: false, code: 'ASSET_MIME_REJECTED' });
+    }
+    run(db, `UPDATE session_assets SET mirror_status='FETCHING',updated_at=? WHERE id=?`, new Date().toISOString(), asset.id);
     const tempDir = path.join(storage.runtimeDir, 'mirror');
     fs.mkdirSync(tempDir, { recursive: true });
     const tempPath = path.join(tempDir, `${randomUUID()}.bin`);
     try {
-      const size = await streamRequestToFile(req, tempPath);
+      const size = await streamRequestToFile(req, tempPath, assetLimit);
+      if (!size) throw Object.assign(new Error('empty provider asset rejected'), { code: 'ASSET_EMPTY' });
       const artifact = archiveFile(db, {
         filePath: tempPath,
         workspaceId: asset.workspace_id,
@@ -541,15 +647,17 @@ async function handleApi(req, res, url) {
         sourceUrl: asset.source_url,
         nativeId: asset.native_id,
         sourcePathOverride: `live:${asset.session_provider}:${asset.session_id}:${asset.id}`,
-        metadata: { original_name: asset.name, declared_mime_type: asset.mime_type, captured_via: 'browser_companion' }
+        metadata: { original_name: asset.name, declared_mime_type: asset.mime_type, captured_via: 'browser_companion', capture_strategy: captureStrategy }
       });
-      run(db, `UPDATE artifacts SET name=?, mime_type=? WHERE id=?`, asset.name || artifact.name, asset.mime_type || artifact.mime_type, artifact.id);
-      run(db, `UPDATE session_assets SET mirror_status='captured',artifact_id=?,updated_at=? WHERE id=?`, artifact.id, new Date().toISOString(), asset.id);
-      const unmirrored = Number(row(db, `SELECT COUNT(*) AS n FROM session_assets WHERE session_id=? AND mirror_status!='captured'`, asset.session_id)?.n || 0);
+      run(db, `UPDATE artifacts SET name=?, mime_type=? WHERE id=?`, asset.name || artifact.name, receivedType || asset.mime_type || artifact.mime_type, artifact.id);
+      run(db, `UPDATE session_assets SET mirror_status='CAPTURED',artifact_id=?,updated_at=? WHERE id=?`, artifact.id, new Date().toISOString(), asset.id);
+      const unmirrored = Number(row(db, `SELECT COUNT(*) AS n FROM session_assets WHERE session_id=? AND UPPER(mirror_status)!='CAPTURED'`, asset.session_id)?.n || 0);
       if (unmirrored === 0) setCaptureStages(db, asset.session_id, { attachments: true });
       return sendJson(res, 201, { artifact_id: artifact.id, size_bytes: size, sha256: artifact.sha256, attachments_complete: unmirrored === 0 });
     } catch (error) {
-      return sendJson(res, 400, { error: error.message });
+      run(db, `UPDATE session_assets SET mirror_status='FAILED',metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.capture_error',?),updated_at=? WHERE id=?`, String(error.message || '').slice(0, 500), new Date().toISOString(), asset.id);
+      setCaptureStages(db, asset.session_id, { attachments: false });
+      return sendJson(res, error.message === 'file too large' ? 413 : 400, { ok: false, code: error.code || 'ASSET_CAPTURE_FAILED', error: error.message });
     } finally {
       try { fs.unlinkSync(tempPath); } catch {}
     }
@@ -732,6 +840,18 @@ async function handleApi(req, res, url) {
     return sendJson(res, 401, { ok: false, code: 'COMPANION_UNAUTHENTICATED', error: 'use the authenticated companion capture endpoint' });
   }
 
+  const assetStatusMatch = url.pathname.match(/^\/api\/companion\/session-assets\/([^/]+)\/status$/);
+  if (assetStatusMatch && req.method === 'POST') {
+    const asset = row(db, `SELECT a.*,s.provider AS session_provider FROM session_assets a JOIN sessions s ON s.id=a.session_id WHERE a.id=?`, assetStatusMatch[1]);
+    if (!asset) return sendJson(res, 404, { ok: false, code: 'ASSET_NOT_DISCOVERED' });
+    const body = await readJson(req, 16 * 1024);
+    const status = String(body.status || '').toUpperCase();
+    if (!['UNAVAILABLE','AUTH_REQUIRED','CORS_BLOCKED','EXPIRED','FAILED'].includes(status)) return sendJson(res, 400, { ok: false, code: 'ASSET_STATUS_INVALID' });
+    run(db, `UPDATE session_assets SET mirror_status=?,metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.capture_error',?),updated_at=? WHERE id=?`, status, String(body.message || '').slice(0, 500), new Date().toISOString(), asset.id);
+    setCaptureStages(db, asset.session_id, { attachments: false });
+    return sendJson(res, 200, { ok: true, status });
+  }
+
   if (url.pathname === '/api/storage/managed-project-migrations' && req.method === 'GET') {
     return sendJson(res, 200, pendingManagedWorkspaceMigrations(db));
   }
@@ -777,6 +897,34 @@ async function handleApi(req, res, url) {
     markWorkspaceStale(db, root.workspace_id, 'root_policy_changed');
     refreshRootWatchers();
     return sendJson(res, 200, row(db, 'SELECT * FROM workspace_roots WHERE id=?', root.id));
+  }
+
+  const removeRootMatch = url.pathname.match(/^\/api\/workspace-roots\/([^/]+)$/);
+  if (removeRootMatch && req.method === 'DELETE') {
+    const root = row(db, 'SELECT * FROM workspace_roots WHERE id=?', removeRootMatch[1]);
+    if (!root) return sendJson(res, 404, { ok: false, code: 'ROOT_NOT_FOUND' });
+    if (root.root_kind === 'primary') return sendJson(res, 409, { ok: false, code: 'PRIMARY_ROOT_REMOVAL_BLOCKED', error: 'attach or designate another primary root before removing this root' });
+    run(db, 'DELETE FROM workspace_roots WHERE id=?', root.id);
+    markWorkspaceStale(db, root.workspace_id, 'approved_root_removed');
+    refreshRootWatchers();
+    return sendJson(res, 200, { ok: true, root_id: root.id, archive_preserved: true });
+  }
+
+  const retryVerificationMatch = url.pathname.match(/^\/api\/workspaces\/([^/]+)\/retry-verification$/);
+  if (retryVerificationMatch && req.method === 'POST') {
+    try {
+      const resources = reconcileWorkspaceResources(db, retryVerificationMatch[1]);
+      markWorkspaceStale(db, retryVerificationMatch[1], 'manual_verification_completed_pending_native_chat_sync');
+      return sendJson(res, resources.ok ? 200 : 412, { ok: resources.ok, freshness: 'stale', message: 'Source verification completed. The next managed native send will re-synchronize the provider chat and create a CURRENT snapshot.', resources });
+    } catch (error) { return sendJson(res, 400, { ok: false, code: error.code || 'VERIFICATION_FAILED', error: error.message }); }
+  }
+
+  const launchAgentMatch = url.pathname.match(/^\/api\/workspaces\/([^/]+)\/roots\/([^/]+)\/open-agent$/);
+  if (launchAgentMatch && req.method === 'POST') {
+    try {
+      const body = await readJson(req, 16 * 1024);
+      return sendJson(res, 202, launchRegisteredAgent(db, { workspaceId: launchAgentMatch[1], rootId: launchAgentMatch[2], agent: body.agent }));
+    } catch (error) { return sendJson(res, 409, { ok: false, code: error.code || 'AGENT_LAUNCH_FAILED', error: error.message }); }
   }
 
   const outgoingRunsMatch = url.pathname.match(/^\/api\/workspaces\/([^/]+)\/outgoing-context$/);
@@ -860,4 +1008,27 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(port, '127.0.0.1', () => {
   console.log(`AI Harness running at http://127.0.0.1:${port}`);
+});
+
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  clearInterval(watcherRecoveryTimer);
+  for (const timer of indexingTimers.values()) clearTimeout(timer);
+  for (const watcher of rootWatchers.values()) try { watcher.close(); } catch {}
+  server.close(() => {
+    try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch {}
+    try { db.close(); } catch {}
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(1), 5000).unref();
+  console.log(`AI Harness shutting down (${signal})`);
+}
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+server.on('error', error => {
+  if (error.code === 'EADDRINUSE') console.error(`AI Harness did not start: 127.0.0.1:${port} is already in use. Check /api/health before starting another copy.`);
+  else console.error(error);
+  process.exitCode = 1;
 });

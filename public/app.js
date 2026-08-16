@@ -5,6 +5,7 @@ let currentView = 'workspace';
 let readiness = null;
 let health = null;
 let managedMigrations = [];
+let localAgents = {};
 
 const qs = s => document.querySelector(s);
 const esc = (value = '') => String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
@@ -45,10 +46,11 @@ function statusBadge(status) {
 }
 
 async function load() {
-  const [settings, ws, ready, serviceHealth, migrations] = await Promise.all([api('/settings'), api('/workspaces'), api('/readiness'), api('/health'), api('/storage/managed-project-migrations')]);
+  const [settings, ws, ready, serviceHealth, migrations, agents] = await Promise.all([api('/settings'), api('/workspaces'), api('/readiness'), api('/health'), api('/storage/managed-project-migrations'), api('/local-agents')]);
   readiness = ready;
   health = serviceHealth;
   managedMigrations = migrations;
+  localAgents = agents;
   workspaces = ws;
   const versionLabel = qs('#versionLabel');
   if (versionLabel) versionLabel.textContent = `Version ${health?.version || 'unknown'}`;
@@ -73,8 +75,8 @@ function renderReadiness() {
   const el = qs('#readyStatus');
   if (!el || !readiness) return;
   el.classList.toggle('ready', Boolean(readiness.ready_for_native_workflow));
-  el.querySelector('span:last-child').textContent = readiness.ready_for_native_workflow ? 'Harness ready' : 'Install/open companion';
-  el.title = readiness.ready_for_native_workflow ? `Browser companion ${readiness.browser_companion_version || ''} seen ${readiness.browser_companion_last_seen || ''}` : 'The local service is running, but the browser companion has not checked in yet.';
+  el.querySelector('span:last-child').textContent = readiness.ready_for_native_workflow ? 'Harness ready' : readiness.reload_required ? 'Reload companion' : 'Install/open companion';
+  el.title = readiness.ready_for_native_workflow ? `Browser companion ${readiness.browser_companion_version || ''} seen ${readiness.browser_companion_last_seen || ''}` : readiness.reload_required ? `Protocol/adapter mismatch. Service protocol ${readiness.protocol_version}, companion ${readiness.companion_protocol_version}. Reload the extension.` : 'The local service is running, but the browser companion has not checked in yet.';
 }
 
 function renderIntegrity() {
@@ -149,7 +151,7 @@ function renderProjectIntegrity() {
   const labels = { current: 'Project Current', verifying: 'Verifying Project', stale: 'Context Stale', blocked: 'Context Blocked', error: 'Context Error' };
   return `
     <div class="card integrity-card">
-      <div class="section-title"><div><div class="eyebrow">VERIFIED CONTEXT INTEGRITY</div><h3>${esc(labels[status] || 'Context Stale')}</h3></div><span class="badge ${status === 'current' ? 'safe' : ''}">${esc(status)}</span></div>
+      <div class="section-title"><div><div class="eyebrow">VERIFIED CONTEXT INTEGRITY</div><h3>${esc(labels[status] || 'Context Stale')}</h3></div><div><button class="tiny-button" id="retryVerification">Retry verification</button> <span class="badge ${status === 'current' ? 'safe' : ''}">${esc(status)}</span></div></div>
       <p class="lede">${status === 'current' ? `Verified ${esc(integrity.last_verified_at || '')}. Every managed native send verifies again before it proceeds.` : 'The next managed native Send will reconcile every required source and will pause if currentness cannot be proven.'}</p>
       <div class="integrity-grid">
         <div><strong>Files/index</strong><span>generation ${esc(integrity.corpus_generation || 0)} / ${esc(integrity.index_generation || 0)}</span></div>
@@ -158,7 +160,7 @@ function renderProjectIntegrity() {
       </div>
       ${reasons.length ? `<div class="blocked-reasons">${reasons.map(reason => `<div><strong>${esc(reason.code)}</strong> ${esc(reason.message)}</div>`).join('')}</div>` : ''}
       <div class="section-title source-head"><h3>Project Sources</h3><button class="tiny-button" id="addProjectRoot">Add linked source</button></div>
-      <div class="list">${roots.map(root => `<div class="list-row"><div><div class="list-title">${esc(root.label || root.root_kind)}</div><div class="list-sub">${esc(root.root_path)}<br>${root.required_for_freshness ? 'required' : 'optional'} · ${root.indexing_enabled ? 'indexed' : 'not indexed'} · ${root.provider_transmission_allowed ? 'provider allowed' : 'local only'}</div></div><span class="badge ${root.status === 'current' ? 'safe' : ''}">${esc(root.status || 'unknown')}</span></div>`).join('') || '<div class="empty">No approved roots.</div>'}</div>
+      <div class="list">${roots.map(root => `<div class="list-row"><div><div class="list-title">${esc(root.label || root.root_kind)}</div><div class="list-sub">${esc(root.root_path)}<br>${root.required_for_freshness ? 'required' : 'optional'} · ${root.indexing_enabled ? 'indexed' : 'not indexed'} · ${root.provider_transmission_allowed ? 'provider allowed' : 'local only'}</div></div><div>${root.root_kind === 'repository' ? `<button class="tiny-button" data-open-agent="codex" data-root-id="${esc(root.id)}" ${localAgents.codex?.available ? '' : 'disabled'}>Open in Codex</button> <button class="tiny-button" data-open-agent="antigravity" data-root-id="${esc(root.id)}" ${localAgents.antigravity?.available ? '' : 'disabled'}>Open in Antigravity</button> ` : ''}${root.root_kind !== 'primary' ? `<button class="tiny-button" data-remove-root="${esc(root.id)}">Remove</button> ` : ''}<span class="badge ${root.status === 'current' ? 'safe' : ''}">${esc(root.status || 'unknown')}</span></div></div>`).join('') || '<div class="empty">No approved roots.</div>'}</div>
     </div>`;
 }
 
@@ -231,7 +233,7 @@ function renderSetup() {
     ['Persistent workspace root', Boolean(storage.workspace_root), storage.workspace_root || 'waiting for service'],
     ['SQLite archive', service, service ? `${health.archive?.messages || 0} messages indexed · ${storage.database_path || ''}` : 'waiting for service'],
     ['Browser companion pairing', Boolean(readiness?.browser_companion_paired), readiness?.browser_companion_paired ? `paired extension ${readiness.paired_extension_id || ''}` : 'pair the loaded extension below'],
-    ['Browser companion heartbeat', companion, companion ? `v${readiness.browser_companion_version || 'unknown'} connected` : 'refresh ChatGPT or Gemini after pairing'],
+    ['Browser companion heartbeat', companion && readiness?.protocol_compatible, companion ? `v${readiness.browser_companion_version || 'unknown'} · protocol ${readiness.companion_protocol_version || 'unknown'} / ${readiness.protocol_version || 'unknown'}${readiness.reload_required ? ' · reload required' : ''}` : 'refresh ChatGPT or Gemini after pairing'],
     ['Active project space', Boolean(active?.id && active?.root_path), active?.root_path || active?.name || 'create a project'],
   ];
   return `
@@ -259,12 +261,12 @@ function renderSetup() {
       </div>
     </div>
     <div class="card" style="margin-top:18px">
-      <div class="section-title"><div><div class="eyebrow">APPLICATION</div><h3>Version ${esc(health?.version || 'unknown')}</h3></div><button class="secondary" id="checkUpdatesButton">Check for updates</button></div>
+      <div class="section-title"><div><div class="eyebrow">APPLICATION</div><h3>Version ${esc(health?.version || 'unknown')} · protocol ${esc(health?.protocol_version || 'unknown')}</h3><div class="list-sub">Running source: ${esc(health?.source_root || 'unknown')}</div></div><div><button class="secondary" id="checkUpdatesButton">Refresh Git status</button> <button class="primary" id="updateRestartButton" hidden>Update & Restart</button></div></div>
       <div id="updateStatusText" class="callout">Use the <strong>AI Harness</strong> desktop or Start Menu shortcut to check for an update and launch in one action. If GitHub is unavailable, it launches the currently installed version.</div>
     </div>
     <div class="card" style="margin-top:18px">
       <div class="section-title"><h3>Browser companion installation</h3><span class="badge">Chrome / Edge</span></div>
-      <div class="callout">Open the browser extensions page, enable Developer mode, choose <strong>Load unpacked</strong>, and select this repository's <code>extension</code> folder. After an extension update, press Reload on the extension and refresh ChatGPT/Gemini.</div>
+      <div class="callout">Open <code>chrome://extensions</code> or <code>edge://extensions</code>, enable Developer mode, choose <strong>Load unpacked</strong>, and select <code>${esc(health?.source_root || '')}\\extension</code>. Service protocol is ${esc(health?.protocol_version || 'unknown')}; companion protocol is ${esc(readiness?.companion_protocol_version || 'not connected')}. After an extension update, press Reload and refresh ChatGPT/Gemini.</div>
       <div class="pair-row"><button class="primary" id="pairCompanionButton">Pair browser companion</button><span id="pairCompanionStatus" class="list-sub">Pairing uses a one-time challenge; no token copying is required.</span></div>
       <p class="lede">Persistent projects, archive, and the database live under <code>${esc(storage.workspace_root || 'Documents\\AI Harness')}</code>, outside the updateable application checkout.</p>
     </div>
@@ -377,6 +379,35 @@ function wireDynamicButtons() {
     } catch (error) { alert(`Could not add source: ${error.message}`); }
   });
 
+  qs('#retryVerification')?.addEventListener('click', async e => {
+    const button = e.currentTarget;
+    button.disabled = true;
+    button.textContent = 'Verifying…';
+    try {
+      await api(`/workspaces/${encodeURIComponent(active.id)}/retry-verification`, { method: 'POST', body: '{}' });
+      active = await api(`/workspaces/${encodeURIComponent(active.id)}`);
+      renderIntegrity();
+      render();
+    } catch (error) { alert(`Verification remains blocked: ${error.message}`); }
+    finally { button.disabled = false; }
+  });
+
+  document.querySelectorAll('[data-remove-root]').forEach(button => button.addEventListener('click', async () => {
+    if (!confirm('Remove this source from current retrieval? Retained archive artifacts will be preserved.')) return;
+    try {
+      await api(`/workspace-roots/${encodeURIComponent(button.dataset.removeRoot)}`, { method: 'DELETE', body: '{}' });
+      active = await api(`/workspaces/${encodeURIComponent(active.id)}`);
+      render();
+    } catch (error) { alert(`Could not remove source: ${error.message}`); }
+  }));
+
+  document.querySelectorAll('[data-open-agent]').forEach(button => button.addEventListener('click', async () => {
+    try {
+      const result = await api(`/workspaces/${encodeURIComponent(active.id)}/roots/${encodeURIComponent(button.dataset.rootId)}/open-agent`, { method: 'POST', body: JSON.stringify({ agent: button.dataset.openAgent }) });
+      alert(`${button.dataset.openAgent} opened on ${result.repository}`);
+    } catch (error) { alert(`Could not open coding agent: ${error.message}`); }
+  }));
+
   qs('#checkUpdatesButton')?.addEventListener('click', async e => {
     const button = e.currentTarget;
     const status = qs('#updateStatusText');
@@ -385,19 +416,34 @@ function wireDynamicButtons() {
     button.textContent = 'Checking…';
     if (status) status.textContent = 'Checking GitHub for origin/main…';
     try {
-      const result = await api('/update-status');
+      const result = await api('/update-status?refresh=1');
       if (result.error) {
         if (status) status.textContent = `${result.message} ${result.error}`;
       } else if (result.update_available) {
-        if (status) status.innerHTML = `Update available: <strong>v${esc(result.remote_version || 'newer')}</strong>. Close Harness and use the <strong>AI Harness</strong> desktop/Start Menu shortcut to update and relaunch safely.`;
+        if (status) status.innerHTML = `Git: branch <strong>${esc(result.branch)}</strong> · HEAD ${esc(String(result.current_commit || '').slice(0, 12))} · ahead ${esc(result.ahead)} · behind ${esc(result.behind)} · ${esc(result.code)}.`;
+        const updateButton = qs('#updateRestartButton');
+        if (updateButton) updateButton.hidden = !result.eligible;
       } else {
-        if (status) status.innerHTML = `<strong>${esc(result.message || 'AI Harness is up to date.')}</strong> Installed v${esc(result.current_version || health?.version || 'unknown')}.`;
+        if (status) status.innerHTML = `<strong>${esc(result.message || 'AI Harness is up to date.')}</strong> Installed v${esc(result.current_version || health?.version || 'unknown')} · branch ${esc(result.branch || 'unknown')} · HEAD ${esc(String(result.current_commit || '').slice(0, 12))} · clean ${result.dirty ? 'no' : 'yes'} · ahead ${esc(result.ahead ?? 'unknown')} · behind ${esc(result.behind ?? 'unknown')}.`;
       }
     } catch (error) {
       if (status) status.textContent = `Update check failed: ${error.message}`;
     } finally {
       button.disabled = false;
       button.textContent = original;
+    }
+  });
+  qs('#updateRestartButton')?.addEventListener('click', async e => {
+    if (!confirm('Back up Harness metadata, fast-forward main, validate, and restart the same canonical source?')) return;
+    e.currentTarget.disabled = true;
+    const status = qs('#updateStatusText');
+    if (status) status.textContent = 'Starting safe update. This page will briefly disconnect and then reload.';
+    try {
+      await api('/update-and-restart', { method: 'POST', body: '{}' });
+      setTimeout(() => location.reload(), 12000);
+    } catch (error) {
+      if (status) status.textContent = `Update blocked: ${error.message}`;
+      e.currentTarget.disabled = false;
     }
   });
   const dropZone = qs('#projectDropZone');
@@ -514,7 +560,24 @@ qs('#nav').addEventListener('click', e => {
 qs('#contextButton').addEventListener('click', async () => {
   const runs = await api(`/workspaces/${encodeURIComponent(active.id)}/outgoing-context`);
   const packet = runs.length ? await api(`/outgoing-context/${encodeURIComponent(runs[0].id)}`) : { integrity: await api(`/workspaces/${encodeURIComponent(active.id)}/integrity`), note: 'No managed send has prepared an outgoing context envelope yet.' };
-  qs('#contextJson').textContent = JSON.stringify(packet, null, 2);
+  if (!packet.sources) qs('#contextJson').textContent = JSON.stringify(packet, null, 2);
+  else {
+    const metadata = packet.metadata || {};
+    const lines = [
+      `RUN ${packet.id}`,
+      `Status: ${packet.status} / ${packet.delivery_state || 'unknown'}`,
+      `Provider: ${packet.provider}`,
+      `Snapshot: ${packet.snapshot_id || 'none'}`,
+      `Security: ${packet.security_status}${packet.failure_code ? ` · ${packet.failure_code}` : ''}`,
+      `Created: ${packet.created_at}${packet.sent_at ? ` · sent ${packet.sent_at}` : ''}`,
+      '', 'ORIGINAL USER PROMPT', packet.original_user_text || '[withheld by secret policy]',
+      '', 'TIMINGS', JSON.stringify(metadata.diagnostics || {}, null, 2),
+      '', `SOURCES (${packet.sources.length})`,
+      ...packet.sources.map(source => `${source.excluded_reason ? 'EXCLUDED' : 'INCLUDED'} · ${source.source_type} · ${source.source_id} · score ${source.retrieval_score}\n  reason: ${source.selection_reason}\n  provenance: ${source.provenance_json}`),
+      '', 'EXACT PROVIDER TEXT', packet.final_context_text || '[none]'
+    ];
+    qs('#contextJson').textContent = lines.join('\n');
+  }
   qs('#contextDialog').showModal();
 });
 qs('#closeDialog').addEventListener('click', () => qs('#contextDialog').close());

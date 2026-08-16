@@ -154,3 +154,21 @@ test('additive migration preserves an older 0.7-style workspace, session, and ar
   db.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('startup recovery never treats a crash-left prepared native send as sent', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aih-crash-recovery-'));
+  const dbPath = path.join(dir, 'harness.db');
+  let db = openDatabase(dbPath);
+  const ts = new Date().toISOString();
+  run(db, `INSERT INTO outgoing_context_runs (id,workspace_id,provider,user_query_hash,original_user_text,status,security_status,created_at,delivery_state)
+           VALUES ('crash-run','ws-harness','chatgpt','hash','prompt','prepared','clear',?,'WAITING_FOR_PROVIDER_ACCEPT')`, ts);
+  db.close();
+  db = openDatabase(dbPath);
+  const recovered = row(db, `SELECT status,delivery_state,failure_code,sent_at FROM outgoing_context_runs WHERE id='crash-run'`);
+  assert.equal(recovered.status, 'blocked');
+  assert.equal(recovered.delivery_state, 'ERROR');
+  assert.equal(recovered.failure_code, 'SERVICE_RESTARTED_BEFORE_PROVIDER_ACCEPT');
+  assert.equal(recovered.sent_at, null);
+  db.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});

@@ -1,9 +1,12 @@
 (() => {
   const AUTO_CAPTURE_INTERVAL_MS = 15000;
   const COMPANION_VERSION = chrome.runtime.getManifest().version;
+  const PROTOCOL_VERSION = 3;
+  const transactionModel = globalThis.AIH_SEND_TRANSACTION;
+  const SEND_STATES = transactionModel?.STATES;
   const provider = location.hostname === 'chatgpt.com' ? 'chatgpt' : location.hostname === 'gemini.google.com' ? 'gemini' : '';
   const adapter = globalThis.AIH_PROVIDER_ADAPTERS?.[provider];
-  if (!adapter || document.getElementById('aih-companion')) return;
+  if (!adapter || !transactionModel || document.getElementById('aih-companion')) return;
   const pendingSessionRef = { ref_type: 'route', ref_value: `pending:${provider}:${crypto.randomUUID()}`, source: 'browser_companion' };
 
   let workspace = null;
@@ -12,9 +15,18 @@
   let lastLocationHref = location.href;
   let captureInFlight = false;
   let autoCaptureEnabled = true;
-  let sendState = 'idle';
+  let sendState = SEND_STATES.IDLE;
+  let sendAttempt = null;
   let cardNote = null;
+  let attachmentFallbackButton = null;
+  let pendingAttachmentFallback = null;
   let pendingIdentityUsed = false;
+  let associationConfirmed = false;
+
+  function moveSendState(next) {
+    if (sendAttempt?.transaction && sendAttempt.transaction.state !== next) sendAttempt.transaction.transition(next);
+    sendState = next;
+  }
 
   async function request(path, options = {}) {
     const result = await chrome.runtime.sendMessage({
@@ -33,6 +45,7 @@
     if (!result.ok) {
       const error = new Error(payload?.reasons?.map(item => item.message).join('; ') || payload?.error || `Harness request failed (${result.status})`);
       error.payload = payload;
+      error.code = payload?.code || payload?.reasons?.[0]?.code || 'HARNESS_REQUEST_FAILED';
       throw error;
     }
     return payload;
@@ -74,7 +87,8 @@
     const filePattern = /\.(pdf|docx?|xlsx?|pptx?|csv|txt|md|zip|png|jpe?g|webp|gif)(?:[?#]|$)/i;
     for (const anchor of document.querySelectorAll('a[href]')) {
       const url = anchor.href;
-      if (!url || seen.has(url) || (!filePattern.test(url) && !anchor.hasAttribute('download') && !/file|download|attachment/i.test(anchor.getAttribute('aria-label') || ''))) continue;
+      const providerFileEvidence = anchor.hasAttribute('download') || /file|download|attachment/i.test(anchor.getAttribute('aria-label') || '') || Boolean(anchor.closest?.('[data-testid*="file"], [data-testid*="attachment"], [class*="attachment"]'));
+      if (!url || seen.has(url) || !providerFileEvidence || (!filePattern.test(url) && !anchor.hasAttribute('download'))) continue;
       seen.add(url);
       assets.push({ asset_type: 'file', name: (anchor.getAttribute('download') || anchor.textContent?.trim() || 'linked asset').slice(0, 240), url, native_id: anchor.dataset?.id || '' });
     }
@@ -131,6 +145,13 @@
 
   async function capturePayload({ complete = false } = {}) {
     const evidence = await visibleEvidence({ complete });
+    const capabilities = adapter.capabilities();
+    evidence.capabilities = capabilities;
+    evidence.protocol_version = PROTOCOL_VERSION;
+    if (complete && !capabilities.ok) {
+      evidence.synchronized_visible = false;
+      evidence.reason_if_partial = capabilities.failures.map(item => item.code).join(', ');
+    }
     const refs = providerRefs();
     if (!refs.some(ref => ref.ref_type === 'chat_id')) pendingIdentityUsed = true;
     return {
@@ -154,7 +175,7 @@
   }
 
   async function captureCurrent({ force = false, complete = false } = {}) {
-    if (captureInFlight || !workspace) return null;
+    if (captureInFlight || !workspace || !associationConfirmed) return null;
     const messages = captureMessages();
     const assets = captureAssets();
     const fingerprint = `${location.href}|${messages.length}|${assets.length}|${messages.slice(-3).map(item => item.content).join('|')}`;
@@ -162,6 +183,10 @@
     captureInFlight = true;
     try {
       const result = await request('/companion/capture', { method: 'POST', body: await capturePayload({ complete }) });
+      for (const asset of result.asset_refs || []) {
+        if (String(asset.mirror_status).toUpperCase() !== 'DISCOVERED' || !asset.source_url) continue;
+        mirrorDiscoveredAsset(asset).catch(() => {});
+      }
       lastFingerprint = fingerprint;
       boundSession = result.session;
       workspace = result.workspace || workspace;
@@ -200,18 +225,49 @@
     return new Blob([bytes], { type: mimeType });
   }
 
-  async function attachPreparedFiles(attachments) {
+  function encodeAssetBytes(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    const stride = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += stride) binary += String.fromCharCode(...bytes.subarray(offset, offset + stride));
+    return btoa(binary);
+  }
+
+  async function mirrorDiscoveredAsset(asset) {
+    if (!String(asset.source_url).startsWith('blob:')) {
+      return chrome.runtime.sendMessage({ type: 'aih-mirror-asset', asset_id: asset.id, provider });
+    }
+    try {
+      const source = await fetch(asset.source_url, { cache: 'no-store' });
+      if (!source.ok) throw new Error(`provider blob unavailable (${source.status})`);
+      const buffer = await source.arrayBuffer();
+      if (buffer.byteLength > 25 * 1024 * 1024) throw new Error('provider blob exceeds the page capture limit');
+      const result = await chrome.runtime.sendMessage({ type: 'aih-mirror-asset-bytes', asset_id: asset.id, provider, mime_type: source.headers.get('content-type') || asset.mime_type, data_base64: encodeAssetBytes(buffer) });
+      if (result?.error) throw new Error(result.error);
+      return result;
+    } catch (error) {
+      await request(`/companion/session-assets/${encodeURIComponent(asset.id)}/status`, { method: 'POST', body: { status: /exceeds/i.test(error.message) ? 'FAILED' : 'CORS_BLOCKED', message: error.message } }).catch(() => {});
+      throw error;
+    }
+  }
+
+  async function attachPreparedFiles(attachments, attempt) {
     for (const attachment of attachments || []) {
+      if (attempt.invalidated) throw Object.assign(new Error('prompt or provider route changed during attachment preparation'), { code: 'PREPARED_CONTEXT_INVALIDATED' });
       const result = await chrome.runtime.sendMessage({ type: 'aih-resource-request', path: attachment.download_path });
       if (!result?.ok) throw new Error(result?.error || `Could not load current attachment ${attachment.name}`);
       const file = new File([decodeAttachment(result.data_base64, attachment.mime_type)], attachment.name, { type: attachment.mime_type, lastModified: Date.now() });
       const attached = await adapter.attachFile(file);
-      if (!attached.ok) throw new Error(`${attachment.name}: ${attached.reason}`);
+      if (!attached.ok) throw Object.assign(new Error(`${attachment.name}: ${attached.reason}`), { code: attached.code || 'ATTACHMENT_PREP_FAILED' });
     }
   }
 
-  async function prepareAndReplay() {
-    if (sendState !== 'idle') return;
+  async function prepareAndReplay({ attachmentMode = 'automatic', fallbackFrom = null } = {}) {
+    if (sendState !== SEND_STATES.IDLE) return;
+    if (!associationConfirmed) {
+      setStatus('Context blocked: explicitly associate this provider chat with a Project Space first.', 'blocked');
+      return;
+    }
     const composer = adapter.findComposer();
     const originalText = adapter.composerText(composer).trim();
     if (!composer || !originalText) return;
@@ -220,37 +276,77 @@
       setStatus('Context blocked: provider Send control was not recognized.', 'blocked');
       return;
     }
-    sendState = 'preparing';
+    const capabilities = adapter.capabilities();
+    if (!capabilities.ok) {
+      setStatus(`Context blocked: ${capabilities.failures.map(item => item.code).join(', ')}`, 'blocked');
+      return;
+    }
+    const attempt = sendAttempt = { id: crypto.randomUUID(), originalText, originalHash: await sha256(originalText), route: location.href, invalidated: false, replayBypass: false, prepared: null, attachmentMode, fallbackFrom };
+    attempt.transaction = transactionModel.createAttempt({ attempt_id: attempt.id, prompt_hash: attempt.originalHash, route: attempt.route });
+    moveSendState(SEND_STATES.PREPARING);
     setStatus('Verifying Project Space before send…', 'verifying');
     let prepared = null;
     try {
       prepared = await request(`/companion/workspaces/${encodeURIComponent(workspace.id)}/prepare-send`, {
         method: 'POST',
-        body: { provider, user_prompt: originalText, capture: await capturePayload({ complete: true }) }
+        body: { provider, user_prompt: originalText, capture: await capturePayload({ complete: true }), attempt_id: attempt.id, prompt_hash: attempt.originalHash, route: attempt.route, protocol_version: PROTOCOL_VERSION, attachment_mode: attachmentMode, fallback_from_run_id: fallbackFrom?.run_id || '', fallback_version_ids: fallbackFrom?.version_ids || [] }
       });
-      await attachPreparedFiles(prepared.attachments);
-      if (!adapter.setComposerText(composer, prepared.provider_text)) throw new Error('provider composer could not receive verified context');
+      attempt.prepared = prepared;
+      moveSendState(SEND_STATES.PREPARED);
+      if (attempt.invalidated || sendAttempt !== attempt || location.href !== attempt.route || adapter.composerText(composer).trim() !== originalText) {
+        throw Object.assign(new Error('the prompt or provider route changed while context was being prepared; send again to verify the new state'), { code: 'PREPARED_CONTEXT_INVALIDATED' });
+      }
+      moveSendState(SEND_STATES.ATTACHING);
+      const attachmentStarted = performance.now();
+      await attachPreparedFiles(prepared.attachments, attempt);
+      attempt.attachmentPrepareMs = Number((performance.now() - attachmentStarted).toFixed(2));
+      attempt.internalComposerWrite = true;
+      const composerSet = adapter.setComposerText(composer, prepared.provider_text);
+      attempt.internalComposerWrite = false;
+      if (!composerSet) throw new Error('provider composer could not receive verified context');
       const replayButton = adapter.findSendButton();
       if (!replayButton?.isConnected) throw new Error('provider Send control changed during context preparation');
-      sendState = 'replaying';
+      const acceptanceBaseline = adapter.acceptanceBaseline();
+      moveSendState(SEND_STATES.REPLAYING);
+      attempt.replayBypass = true;
+      if (!attempt.transaction.armReplay()) throw new Error('native replay was not armed exactly once');
       setStatus(`Project Current · snapshot ${prepared.snapshot_id.slice(-8)} · sending once`, 'current');
       replayButton.click();
-      request(`/companion/outgoing-context/${encodeURIComponent(prepared.run_id)}/sent`, { method: 'POST', body: {} }).catch(() => {});
-      setTimeout(() => { if (sendState === 'replaying') sendState = 'idle'; }, 1500);
+      attempt.replayBypass = false;
+      moveSendState(SEND_STATES.WAITING_FOR_PROVIDER_ACCEPT);
+      setStatus('Waiting for provider acceptance evidence…', 'verifying');
+      const acceptance = await adapter.observeProviderAcceptance(acceptanceBaseline);
+      acceptance.attachment_prepare_ms = attempt.attachmentPrepareMs;
+      acceptance.attachment_mode = prepared.attachments?.length ? attachmentMode : 'none';
+      acceptance.fallback_from_run_id = fallbackFrom?.run_id || '';
+      if (!acceptance.accepted) throw Object.assign(new Error('provider acceptance could not be proven; Harness will not record this attempt as sent'), { code: acceptance.code });
+      await request(`/companion/outgoing-context/${encodeURIComponent(prepared.run_id)}/sent`, { method: 'POST', body: { attempt_id: attempt.id, prompt_hash: attempt.originalHash, route: attempt.route, protocol_version: PROTOCOL_VERSION, acceptance } });
+      moveSendState(SEND_STATES.DONE);
+      pendingAttachmentFallback = null;
+      setStatus(`Sent with verified provider acceptance · snapshot ${prepared.snapshot_id.slice(-8)}`, 'current');
+      setTimeout(() => { if (sendAttempt === attempt && sendState === SEND_STATES.DONE) { moveSendState(SEND_STATES.IDLE); sendAttempt = null; } }, 1000);
     } catch (error) {
-      if (prepared?.run_id) request(`/companion/outgoing-context/${encodeURIComponent(prepared.run_id)}/failed`, { method: 'POST', body: { code: prepared.attachments?.length ? 'ATTACHMENT_PREP_FAILED' : 'NATIVE_SEND_PREP_FAILED', message: error.message } }).catch(() => {});
+      if (prepared?.run_id) request(`/companion/outgoing-context/${encodeURIComponent(prepared.run_id)}/failed`, { method: 'POST', body: { code: error.code || (prepared.attachments?.length ? 'ATTACHMENT_PREP_FAILED' : 'NATIVE_SEND_PREP_FAILED'), message: error.message, attempt_id: attempt.id } }).catch(() => {});
       if (adapter.composerText(composer).includes('[AI HARNESS VERIFIED PROJECT CONTEXT]')) adapter.setComposerText(composer, originalText);
-      sendState = 'error';
+      moveSendState(SEND_STATES.ERROR);
       const reasons = error.payload?.reasons || [];
       setStatus(`Context blocked: ${reasons.map(item => item.message).join('; ') || error.message}`, 'blocked');
-      setTimeout(() => { if (sendState === 'error') sendState = 'idle'; }, 800);
+      if (attachmentFallbackButton && /ATTACHMENT|attachment|file input/i.test(`${error.code || ''} ${error.message || ''}`)) {
+        pendingAttachmentFallback = prepared?.attachments?.length ? { run_id: prepared.run_id, version_ids: prepared.attachments.map(item => item.version_id) } : null;
+        attachmentFallbackButton.hidden = false;
+        attachmentFallbackButton.textContent = 'Reverify current project source, attach & send';
+      }
+      setTimeout(() => { if (sendAttempt === attempt && sendState === SEND_STATES.ERROR) { moveSendState(SEND_STATES.IDLE); sendAttempt = null; } }, 800);
     }
   }
 
   function interceptClick(event) {
     if (!adapter.matchesSendTarget(event.target)) return;
-    if (sendState === 'replaying') {
-      sendState = 'idle';
+    if (sendState === SEND_STATES.REPLAYING && sendAttempt?.replayBypass) {
+      if (!sendAttempt.transaction.consumeReplay()) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
       return;
     }
     event.preventDefault();
@@ -259,10 +355,10 @@
   }
 
   function interceptKeydown(event) {
-    if (event.key !== 'Enter' || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey || event.isComposing) return;
     const composer = adapter.findComposer();
-    if (!composer || !(event.target === composer || composer.contains(event.target))) return;
-    if (sendState === 'replaying') return;
+    const insideComposer = Boolean(composer && (event.target === composer || composer.contains(event.target)));
+    if (!transactionModel.shouldManageEnter(event, insideComposer)) return;
+    if (sendState === SEND_STATES.REPLAYING && sendAttempt?.replayBypass) return;
     event.preventDefault();
     event.stopImmediatePropagation();
     prepareAndReplay();
@@ -271,12 +367,14 @@
   async function refreshRouteBinding() {
     if (location.href === lastLocationHref) return;
     lastLocationHref = location.href;
+    if (sendAttempt && sendState !== SEND_STATES.IDLE) { sendAttempt.invalidated = true; sendAttempt.transaction?.invalidate(); }
     lastFingerprint = '';
     boundSession = null;
     const resolved = await resolveCurrentSession();
     if (resolved) {
       boundSession = resolved;
       workspace = resolved.workspace || workspace;
+      associationConfirmed = true;
     }
     updateNativeLabel();
   }
@@ -284,7 +382,7 @@
   async function mount() {
     try {
       workspace = await request('/companion/active-workspace');
-      await request('/companion/heartbeat', { method: 'POST', body: { version: COMPANION_VERSION, provider, metadata: { hostname: location.hostname, adapter_version: adapter.version } } });
+      await request('/companion/heartbeat', { method: 'POST', body: { version: COMPANION_VERSION, protocol_version: PROTOCOL_VERSION, provider, metadata: { hostname: location.hostname, adapter_version: adapter.version, capabilities: adapter.capabilities() } } });
     } catch {
       return;
     }
@@ -292,6 +390,7 @@
     if (resolved) {
       boundSession = resolved;
       workspace = resolved.workspace || workspace;
+      associationConfirmed = true;
     }
     const stored = await chrome.storage.local.get('aih_auto_capture').catch(() => ({}));
     autoCaptureEnabled = stored.aih_auto_capture !== false;
@@ -303,6 +402,8 @@
         <div class="aih-head"><span class="aih-dot"></span><div class="aih-title"><strong></strong><span></span></div><button class="aih-toggle" title="Collapse">−</button></div>
         <div class="aih-body">
           <button class="aih-button aih-capture">Capture & reconcile now</button>
+          <button class="aih-button aih-associate">Associate this chat with active Project Space</button>
+          <button class="aih-button aih-attach" hidden></button>
           <button class="aih-button aih-auto"></button>
           <button class="aih-button aih-open">Open Harness</button>
           <div class="aih-note">Managed native sends verify current files, repository state, chat synchronization, retrieval, and security before replaying Send.</div>
@@ -311,6 +412,7 @@
     root.querySelector('.aih-title strong').textContent = workspace.name;
     root.querySelector('.aih-title span').textContent = `${providerName()} · guaranteed managed send active`;
     cardNote = root.querySelector('.aih-note');
+    attachmentFallbackButton = root.querySelector('.aih-attach');
     document.body.appendChild(root);
     updateNativeLabel();
 
@@ -336,17 +438,47 @@
       } catch (error) { setStatus(`Capture blocked: ${error.message}`, 'blocked'); }
       event.currentTarget.textContent = original;
     });
+    const associateButton = root.querySelector('.aih-associate');
+    const updateAssociation = () => {
+      associateButton.hidden = associationConfirmed;
+      root.querySelector('.aih-title span').textContent = associationConfirmed ? `${providerName()} · guaranteed managed send active` : `${providerName()} · association required`;
+    };
+    updateAssociation();
+    associateButton.addEventListener('click', async () => {
+      associationConfirmed = true;
+      try {
+        await captureCurrent({ force: true, complete: true });
+        updateAssociation();
+        setStatus(`Associated with ${workspace.name}.`, 'current');
+      } catch (error) {
+        associationConfirmed = false;
+        updateAssociation();
+        setStatus(`Association failed: ${error.message}`, 'blocked');
+      }
+    });
+    attachmentFallbackButton.addEventListener('click', () => {
+      const fallbackFrom = pendingAttachmentFallback;
+      attachmentFallbackButton.hidden = true;
+      if (!fallbackFrom) return setStatus('Attachment fallback expired; press Send to prepare the current source again.', 'blocked');
+      if (sendState === SEND_STATES.IDLE) prepareAndReplay({ attachmentMode: 'fallback', fallbackFrom });
+      else setTimeout(() => prepareAndReplay({ attachmentMode: 'fallback', fallbackFrom }), 900);
+    });
 
     document.addEventListener('click', interceptClick, true);
     document.addEventListener('keydown', interceptKeydown, true);
     const captureTimer = setInterval(() => {
-      if (autoCaptureEnabled && document.visibilityState === 'visible' && sendState === 'idle') captureCurrent().catch(() => {});
+      if (autoCaptureEnabled && document.visibilityState === 'visible' && sendState === SEND_STATES.IDLE) captureCurrent().catch(() => {});
     }, AUTO_CAPTURE_INTERVAL_MS);
-    const heartbeatTimer = setInterval(() => request('/companion/heartbeat', { method: 'POST', body: { version: COMPANION_VERSION, provider, metadata: { adapter_version: adapter.version } } }).catch(() => {}), 60000);
+    const heartbeatTimer = setInterval(() => request('/companion/heartbeat', { method: 'POST', body: { version: COMPANION_VERSION, protocol_version: PROTOCOL_VERSION, provider, metadata: { adapter_version: adapter.version, capabilities: adapter.capabilities() } } }).catch(() => {}), 60000);
     const routeTimer = setInterval(() => refreshRouteBinding().catch(() => {}), 1500);
     document.addEventListener('visibilitychange', () => {
       if (autoCaptureEnabled && document.visibilityState === 'hidden') captureCurrent({ force: true }).catch(() => {});
     });
+    document.addEventListener('input', event => {
+      if (!sendAttempt || sendAttempt.internalComposerWrite || sendState === SEND_STATES.IDLE || sendState === SEND_STATES.REPLAYING) return;
+      const composer = adapter.findComposer();
+      if (composer && (event.target === composer || composer.contains?.(event.target))) { sendAttempt.invalidated = true; sendAttempt.transaction?.invalidate(); }
+    }, true);
     window.addEventListener('pagehide', () => {
       clearInterval(captureTimer);
       clearInterval(heartbeatTimer);

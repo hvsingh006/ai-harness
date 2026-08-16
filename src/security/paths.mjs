@@ -27,7 +27,7 @@ export function canonicalizeExistingPath(target) {
 }
 
 export function normalizeRelativePath(value) {
-  const input = String(value || '');
+  const input = String(value || '').normalize('NFC');
   if (!input || input.includes('\0') || /%2f|%5c|%2e/i.test(input)) {
     throw Object.assign(new Error('invalid relative path'), { code: 'ROOT_SECURITY_FAILURE' });
   }
@@ -37,7 +37,8 @@ export function normalizeRelativePath(value) {
     throw Object.assign(new Error('absolute or alternate-separator path rejected'), { code: 'ROOT_SECURITY_FAILURE' });
   }
   const parts = input.split('/');
-  if (parts.some(part => !part || part === '.' || part === '..')) {
+  const windowsReserved = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
+  if (parts.some(part => !part || part === '.' || part === '..' || part.includes(':') || /[. ]$/.test(part) || windowsReserved.test(part))) {
     throw Object.assign(new Error('path traversal rejected'), { code: 'ROOT_SECURITY_FAILURE' });
   }
   return parts.join('/');

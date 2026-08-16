@@ -3,11 +3,12 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { openDatabase, ensureWorkspaceProjectRoot, row, rows, run, registerWorkspaceRoot, storageForDatabase } from '../src/db.mjs';
 import { reconcileWorkspaceResources, currentWorkspaceResources } from '../src/resources.mjs';
 import { inspectRepositoryRoot, refreshWorkspaceRepositories } from '../src/repository.mjs';
 import { migrateManagedWorkspaceProject } from '../src/workspace-migration.mjs';
+import { classifyResource, extractFile } from '../src/resource-extractors.mjs';
 
 function fixture(t, prefix = 'aih-resources-') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -169,4 +170,65 @@ test('managed-project migration reports a target conflict without overwriting ei
   assert.equal(fs.readFileSync(path.join(legacy, 'source.txt'), 'utf8'), 'source survives');
   assert.equal(fs.readFileSync(path.join(target, 'target.txt'), 'utf8'), 'target survives');
   assert.equal(fs.existsSync(path.join(target, 'source.txt')), false);
+});
+
+test('unchanged failed PDF versions are retried after the extractor becomes available without re-adding the file', t => {
+  const available = spawnSync('pdftotext', ['-v'], { windowsHide: true });
+  if (available.error) { t.skip('pdftotext is not installed in this test environment'); return; }
+  const { db, root, dir } = fixture(t);
+  const pdf = path.join(root, 'retry.pdf');
+  const objects = [
+    '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n',
+    '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n',
+    '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n',
+    '4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n',
+    '5 0 obj\n<< /Length 55 >>\nstream\nBT /F1 12 Tf 72 720 Td (extracted retried pdf) Tj ET\nendstream\nendobj\n'
+  ];
+  let pdfText = '%PDF-1.4\n';
+  const offsets = [0];
+  for (const object of objects) { offsets.push(Buffer.byteLength(pdfText)); pdfText += object; }
+  const xref = Buffer.byteLength(pdfText);
+  pdfText += `xref\n0 6\n0000000000 65535 f \n${offsets.slice(1).map(offset => `${String(offset).padStart(10, '0')} 00000 n `).join('\n')}\ntrailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  fs.writeFileSync(pdf, pdfText);
+  const originalPath = process.env.PATH;
+  const emptyTools = path.join(dir, 'empty-tools');
+  fs.mkdirSync(emptyTools);
+  try {
+    process.env.PATH = emptyTools;
+    const first = reconcileWorkspaceResources(db, 'ws-harness');
+    assert.equal(first.ok, false);
+    assert.equal(row(db, `SELECT indexing_status FROM resource_versions v JOIN workspace_resources r ON r.current_version_id=v.id WHERE r.relative_path='retry.pdf'`).indexing_status, 'failed');
+    process.env.PATH = originalPath;
+    const retried = reconcileWorkspaceResources(db, 'ws-harness');
+    assert.equal(retried.ok, true, JSON.stringify(retried.reasons));
+    assert.equal(row(db, `SELECT indexing_status FROM resource_versions v JOIN workspace_resources r ON r.current_version_id=v.id WHERE r.relative_path='retry.pdf'`).indexing_status, 'complete');
+    assert.equal(row(db, `SELECT COUNT(*) AS n FROM resource_versions v JOIN workspace_resources r ON r.id=v.resource_id WHERE r.relative_path='retry.pdf'`).n, 1);
+  } finally { process.env.PATH = originalPath; }
+});
+
+test('Office formats are explicit immutable attachment-only resources instead of silently pretending extraction', t => {
+  const { db, root } = fixture(t);
+  const office = path.join(root, 'design.docx');
+  fs.writeFileSync(office, Buffer.from('synthetic office binary'));
+  const classification = classifyResource(office);
+  assert.equal(classification.resourceType, 'office');
+  assert.equal(classification.attachmentOnly, true);
+  assert.equal(extractFile(office).status, 'not_extractable');
+  const result = reconcileWorkspaceResources(db, 'ws-harness');
+  assert.equal(result.ok, true);
+  const resource = row(db, `SELECT r.resource_type,v.indexing_status FROM workspace_resources r JOIN resource_versions v ON v.id=r.current_version_id WHERE r.relative_path='design.docx'`);
+  assert.equal(resource.resource_type, 'office');
+  assert.equal(resource.indexing_status, 'not_applicable');
+});
+
+test('PDF extraction rejects oversized input before invoking the external extractor', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aih-pdf-bound-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const pdf = path.join(dir, 'oversized.pdf');
+  fs.closeSync(fs.openSync(pdf, 'w'));
+  fs.truncateSync(pdf, 100 * 1024 * 1024 + 1);
+  const result = extractFile(pdf);
+  assert.equal(result.status, 'failed');
+  assert.match(result.reason, /exceeds/);
+  assert.equal(result.metadata.size_bytes, 100 * 1024 * 1024 + 1);
 });

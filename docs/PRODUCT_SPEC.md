@@ -1,5 +1,11 @@
 # AI Harness Product Spec
 
+## 0.8.0 deterministic native-send rule
+
+`Project Current` and `sent` are separate claims. Project Current requires verified current sources/index/repository/chat/security. Sent additionally requires provider acceptance evidence tied to the exact prepared attempt. A click, composer mutation, timer, or optimistic API response is insufficient. Protocol mismatch, missing capability evidence, established-chat zero-message extraction, source mutation, uncertain attachment confirmation, or uncertain provider acceptance fails closed.
+
+Office files are intentionally attachment-only in 0.8.0; no Office text-extraction claim is made. Images are immutable/current but have no OCR claim. These are capabilities, not silent degradation.
+
 ## Product goal
 
 AI Harness is a local Project Space layer for using native ChatGPT and Gemini without losing continuity.

@@ -14,6 +14,9 @@ export function classifyResource(filePath) {
   const extension = path.extname(filePath).toLowerCase();
   const mimeType = mimeFromName(filePath);
   if (extension === '.pdf') return { resourceType: 'pdf', mimeType, extractable: true };
+  if (['.docx', '.pptx', '.xlsx', '.doc', '.ppt', '.xls'].includes(extension)) {
+    return { resourceType: 'office', mimeType, extractable: false, attachmentOnly: true };
+  }
   if (extension === '.svg') return { resourceType: 'image', mimeType, extractable: true };
   if (mimeType.startsWith('image/')) return { resourceType: 'image', mimeType, extractable: false };
   if (TEXT_EXTENSIONS.has(extension) || mimeType.startsWith('text/') || /(?:json|xml|yaml)/.test(mimeType)) {
@@ -92,11 +95,14 @@ function extractPdf(filePath, maxBytes) {
   return { status: 'complete', chunks, metadata: { extractor: 'pdftotext', page_count: pages.length } };
 }
 
-export function extractFile(filePath, { maxTextBytes = 8 * 1024 * 1024, maxPdfOutputBytes = 32 * 1024 * 1024, logicalPath = filePath } = {}) {
+export function extractFile(filePath, { maxTextBytes = 8 * 1024 * 1024, maxPdfInputBytes = 100 * 1024 * 1024, maxPdfOutputBytes = 32 * 1024 * 1024, logicalPath = filePath } = {}) {
   const classification = classifyResource(logicalPath);
   const stat = fs.statSync(filePath);
   if (!classification.extractable) return { ...classification, status: 'not_extractable', chunks: [], metadata: classification.resourceType === 'image' ? imageMetadata(filePath, classification.mimeType) : {} };
-  if (classification.resourceType === 'pdf') return { ...classification, ...extractPdf(filePath, maxPdfOutputBytes) };
+  if (classification.resourceType === 'pdf') {
+    if (stat.size > maxPdfInputBytes) return { ...classification, status: 'failed', reason: `PDF exceeds ${maxPdfInputBytes} byte extraction limit`, chunks: [], metadata: { size_bytes: stat.size, extractor: 'pdftotext' } };
+    return { ...classification, ...extractPdf(filePath, maxPdfOutputBytes) };
+  }
   if (stat.size > maxTextBytes) return { ...classification, status: 'failed', reason: `text resource exceeds ${maxTextBytes} byte extraction limit`, chunks: [], metadata: { size_bytes: stat.size } };
   const buffer = fs.readFileSync(filePath);
   if (looksBinary(buffer)) return { ...classification, status: 'failed', reason: 'resource classified as text contains binary data', chunks: [], metadata: {} };

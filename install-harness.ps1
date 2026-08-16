@@ -42,12 +42,13 @@ function Within($child, $parent) {
   return $c.Equals($p, [StringComparison]::OrdinalIgnoreCase) -or $c.StartsWith($p + '\', [StringComparison]::OrdinalIgnoreCase)
 }
 
-Write-Host "`nAI Harness Bootstrap Installer 0.7.0" -ForegroundColor White
+Write-Host "`nAI Harness Bootstrap Installer 0.8.0" -ForegroundColor White
 Write-Host 'One canonical development repository; private Harness data remains outside the AI coding workspace.' -ForegroundColor DarkGray
 
 Ensure-Package 'git' 'Git.Git' 'Git'
 Ensure-Package 'gh' 'GitHub.cli' 'GitHub CLI'
 Ensure-Package 'node' 'OpenJS.NodeJS.LTS' 'Node.js LTS'
+Ensure-Package 'pdftotext' 'oschwartz10612.Poppler' 'Poppler PDF text extractor'
 
 $nodeVersionText = (node --version).Trim().TrimStart('v')
 if ([version]$nodeVersionText -lt [version]'22.5.0') {
