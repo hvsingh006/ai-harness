@@ -13,8 +13,6 @@ jobs:
   apply:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      HARNESS_WORKSPACE_ROOT: ${{ runner.temp }}/ai-harness-workspace
     steps:
       - name: Checkout staged payload
         uses: actions/checkout@v4
@@ -29,7 +27,10 @@ jobs:
           tar -xzf /tmp/aih-sync.tar.gz -C .
           rm -rf .aih-sync
       - name: Validate 0.6 source
+        shell: bash
         run: |
+          set -euo pipefail
+          export HARNESS_WORKSPACE_ROOT="$RUNNER_TEMP/ai-harness-workspace"
           npm test
           npm run doctor
       - name: Commit validated source
