@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI Harness</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">H</div>
+        <div>
+          <strong>AI Harness</strong>
+          <span>Local control plane</span>
+        </div>
+      </div>
+
+      <nav id="nav">
+        <button class="nav-item active" data-view="workspace">Project Space</button>
+        <button class="nav-item" data-view="learning">Learning</button>
+        <button class="nav-item" data-view="development">Development</button>
+        <button class="nav-item" data-view="sessions">Sessions</button>
+        <button class="nav-item" data-view="archive">Archive</button>
+        <button class="nav-item" data-view="knowledge">Knowledge</button>
+        <button class="nav-item" data-view="integrations">Integrations</button>
+        <button class="nav-item" data-view="setup">Setup & Test</button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <label for="themeSelect">Appearance</label>
+        <select id="themeSelect">
+          <option value="system">System</option>
+          <option value="light">Light</option>
+          <option value="dark">Dark</option>
+        </select>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <div class="eyebrow">ACTIVE WORKSPACE</div>
+          <select id="workspaceSelect" class="workspace-select"></select>
+        </div>
+        <div class="top-actions"><button class="secondary" id="newWorkspaceButton">New project</button><div id="readyStatus" class="ready-status"><span class="ready-dot"></span><span>Checking setup…</span></div>
+          <button class="secondary" id="contextButton">Inspect context</button>
+          <button class="primary" id="freshButton">Fresh session</button>
+        </div>
+      </header>
+
+      <section id="view"></section>
+    </main>
+  </div>
+
+  <dialog id="contextDialog">
+    <div class="dialog-head">
+      <div>
+        <div class="eyebrow">PROVIDER-NEUTRAL HANDOFF</div>
+        <h2>Context packet</h2>
+      </div>
+      <button id="closeDialog" class="icon-button" aria-label="Close">×</button>
+    </div>
+    <p class="muted">This is the compact workspace state a fresh AI session can receive. The full archive remains searchable behind it.</p>
+    <pre id="contextJson"></pre>
+  </dialog>
+
+  <dialog id="workspaceDialog">
+    <form id="workspaceForm" method="dialog">
+      <div class="dialog-head">
+        <div>
+          <div class="eyebrow">NEW PROJECT SPACE</div>
+          <h2>Create workspace</h2>
+        </div>
+        <button type="button" id="closeWorkspaceDialog" class="icon-button" aria-label="Close">×</button>
+      </div>
+      <label class="form-field">
+        <span>Name</span>
+        <input id="workspaceName" required maxlength="120" placeholder="ECE 352, FPGA project, research…" />
+      </label>
+      <label class="form-field">
+        <span>Type</span>
+        <select id="workspaceKind">
+          <option value="mixed">Mixed</option>
+          <option value="learning">Learning</option>
+          <option value="development">Development</option>
+          <option value="direction">Direction / planning</option>
+        </select>
+      </label>
+      <label class="form-field">
+        <span>Current focus</span>
+        <textarea id="workspaceFocus" rows="3" placeholder="What are you working on right now?"></textarea>
+      </label>
+      <div class="dialog-actions">
+        <button type="button" class="secondary" id="cancelWorkspaceButton">Cancel</button>
+        <button type="submit" class="primary">Create project</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
