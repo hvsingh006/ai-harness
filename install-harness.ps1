@@ -1,6 +1,5 @@
 $ErrorActionPreference = 'Stop'
 
-$Repo = 'hvsingh006/ai-harness'
 $RepoUrl = 'https://github.com/hvsingh006/ai-harness.git'
 $BaseDir = Join-Path $env:LOCALAPPDATA 'AI-Harness'
 $AppDir = Join-Path $BaseDir 'app'
@@ -29,21 +28,40 @@ function Ensure-Package($Command, $PackageId, $DisplayName) {
         Write-Host "$DisplayName already installed." -ForegroundColor Green
         return
     }
+
     Write-Step "Installing $DisplayName"
     Ensure-Winget
     winget install --id $PackageId -e --accept-package-agreements --accept-source-agreements
     if ($LASTEXITCODE -ne 0) {
         throw "$DisplayName installation failed."
     }
+
     Refresh-Path
     if (-not (Get-Command $Command -ErrorAction SilentlyContinue)) {
         throw "$DisplayName was installed but is not available yet. Restart Windows and run this installer again."
     }
 }
 
+function Test-GitHubAuth {
+    # gh writes its normal "not logged in" message to stderr. Under Windows PowerShell
+    # with ErrorActionPreference=Stop that can otherwise become a terminating error.
+    $oldPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'SilentlyContinue'
+        & gh auth status --hostname github.com *> $null
+        return ($LASTEXITCODE -eq 0)
+    }
+    catch {
+        return $false
+    }
+    finally {
+        $ErrorActionPreference = $oldPreference
+    }
+}
+
 Write-Host ""
-Write-Host "AI Harness Bootstrap Installer" -ForegroundColor White
-Write-Host "This installs application code separately from your permanent workspace." -ForegroundColor DarkGray
+Write-Host "AI Harness Bootstrap Installer 0.6.3" -ForegroundColor White
+Write-Host "Application updates and your permanent workspace remain physically separate." -ForegroundColor DarkGray
 
 Ensure-Package 'git' 'Git.Git' 'Git'
 Ensure-Package 'gh' 'GitHub.cli' 'GitHub CLI'
@@ -53,8 +71,13 @@ $nodeVersionText = (node --version).Trim().TrimStart('v')
 $nodeVersion = [version]$nodeVersionText
 if ($nodeVersion -lt [version]'22.5.0') {
     Write-Step "Upgrading Node.js to a supported version"
+    Ensure-Winget
     winget upgrade --id OpenJS.NodeJS.LTS -e --accept-package-agreements --accept-source-agreements
+    if ($LASTEXITCODE -ne 0) {
+        throw "Node.js upgrade failed."
+    }
     Refresh-Path
+
     $nodeVersionText = (node --version).Trim().TrimStart('v')
     $nodeVersion = [version]$nodeVersionText
     if ($nodeVersion -lt [version]'22.5.0') {
@@ -63,21 +86,33 @@ if ($nodeVersion -lt [version]'22.5.0') {
 }
 
 Write-Step "Signing in to GitHub if needed"
-& gh auth status --hostname github.com *> $null
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "A GitHub browser sign-in will open. Complete it once, then return here." -ForegroundColor Yellow
+if (-not (Test-GitHubAuth)) {
+    Write-Host "GitHub sign-in is required once because ai-harness is private." -ForegroundColor Yellow
+    Write-Host "Your browser will open. Complete the GitHub authorization, then return to this window."
+    Write-Host ""
+
     & gh auth login --hostname github.com --git-protocol https --web
     if ($LASTEXITCODE -ne 0) {
-        throw "GitHub sign-in failed."
+        throw "GitHub sign-in failed or was cancelled."
+    }
+
+    if (-not (Test-GitHubAuth)) {
+        throw "GitHub still reports that you are not authenticated after login."
     }
 }
-& gh auth setup-git *> $null
+
+& gh auth setup-git
+if ($LASTEXITCODE -ne 0) {
+    throw "GitHub CLI could not configure Git authentication."
+}
+Write-Host "GitHub authentication ready." -ForegroundColor Green
 
 Write-Step "Preparing permanent workspace"
 New-Item -ItemType Directory -Force -Path $WorkspaceRoot | Out-Null
 foreach ($name in @('Projects','Library','Archive','Backups')) {
     New-Item -ItemType Directory -Force -Path (Join-Path $WorkspaceRoot $name) | Out-Null
 }
+
 [Environment]::SetEnvironmentVariable('HARNESS_WORKSPACE_ROOT', $WorkspaceRoot, 'User')
 $env:HARNESS_WORKSPACE_ROOT = $WorkspaceRoot
 
@@ -93,8 +128,10 @@ New-Item -ItemType Directory -Force -Path $BaseDir | Out-Null
 if (Test-Path (Join-Path $AppDir '.git')) {
     git -C $AppDir fetch origin main
     if ($LASTEXITCODE -ne 0) { throw "Could not fetch the AI Harness repository." }
+
     git -C $AppDir checkout main
     if ($LASTEXITCODE -ne 0) { throw "Could not switch AI Harness to main." }
+
     git -C $AppDir pull --ff-only origin main
     if ($LASTEXITCODE -ne 0) { throw "Could not update AI Harness cleanly." }
 }
@@ -106,6 +143,7 @@ elseif (Test-Path $AppDir) {
         Write-Host "Existing non-Git app folder found. Moving it to: $backupDir" -ForegroundColor Yellow
         Move-Item $AppDir $backupDir
     }
+
     git clone $RepoUrl $AppDir
     if ($LASTEXITCODE -ne 0) { throw "Could not clone the private AI Harness repository." }
 }
@@ -122,11 +160,16 @@ try {
     } else {
         npm install --no-audit --no-fund
     }
-    if ($LASTEXITCODE -ne 0) { throw "npm dependency setup failed." }
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "npm dependency setup failed."
+    }
 
     Write-Step "Running AI Harness diagnostics"
     npm run doctor
-    if ($LASTEXITCODE -ne 0) { throw "AI Harness diagnostics failed." }
+    if ($LASTEXITCODE -ne 0) {
+        throw "AI Harness diagnostics failed."
+    }
 }
 finally {
     Pop-Location
@@ -144,9 +187,13 @@ function New-Shortcut($Path, $Target, $WorkingDirectory, $Description) {
     $shortcut.Save()
 }
 
-New-Shortcut (Join-Path $desktop 'AI Harness.lnk') (Join-Path $AppDir 'start-harness.cmd') $AppDir 'Start AI Harness'
-New-Shortcut (Join-Path $desktop 'Update AI Harness.lnk') (Join-Path $AppDir 'update-harness.cmd') $AppDir 'Backup, update, and validate AI Harness'
+New-Shortcut (Join-Path $desktop 'AI Harness.lnk') (Join-Path $AppDir 'update-and-launch-harness.cmd') $AppDir 'Update if available, then launch AI Harness'
 New-Shortcut (Join-Path $desktop 'AI Harness Projects.lnk') $WorkspaceRoot $WorkspaceRoot 'Open AI Harness persistent workspace'
+
+$startMenuDir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\AI Harness'
+New-Item -ItemType Directory -Force -Path $startMenuDir | Out-Null
+New-Shortcut (Join-Path $startMenuDir 'AI Harness.lnk') (Join-Path $AppDir 'update-and-launch-harness.cmd') $AppDir 'Update if available, then launch AI Harness'
+New-Shortcut (Join-Path $startMenuDir 'AI Harness Projects.lnk') $WorkspaceRoot $WorkspaceRoot 'Open AI Harness persistent workspace'
 
 Write-Step "Launching AI Harness"
 Start-Process -FilePath (Join-Path $AppDir 'start-harness.cmd')
@@ -170,6 +217,7 @@ if (-not $browser) {
 if ($browser) {
     Start-Process -FilePath $browser -ArgumentList 'chrome://extensions/'
 }
+
 Start-Process explorer.exe -ArgumentList "`"$ExtensionDir`""
 try { Set-Clipboard -Value $ExtensionDir } catch {}
 
@@ -182,7 +230,7 @@ Write-Host "Extension folder: $ExtensionDir"
 Write-Host ""
 Write-Host "One browser security step remains:" -ForegroundColor Yellow
 Write-Host "Enable Developer mode, choose 'Load unpacked', and select the extension folder."
-Write-Host "The extension folder has been opened and its path was copied to your clipboard."
+Write-Host "The extension folder has been opened and its path copied to your clipboard."
 Write-Host ""
 Write-Host "After that, refresh ChatGPT/Gemini and look for the bright red Harness ready indicator."
 Write-Host ""
