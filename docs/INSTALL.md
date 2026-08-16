@@ -1,16 +1,20 @@
-# Prototype 0.6 setup
+# Prototype 0.6.3 setup
 
-Prototype 0.6 separates the application from your permanent AI workspace.
+AI Harness keeps the updateable application separate from your permanent Project Spaces and chat archive.
 
-## Requirements
+## Normal Windows use
 
-- Windows, macOS, or Linux with Node.js 22.5 or newer
-- Chrome or Microsoft Edge
-- Git if you want `git pull` updates
+After installation, use the **AI Harness** Desktop or Start Menu shortcut. It runs `update-and-launch-harness.cmd`, which:
 
-No provider API key is required for the current browser-companion workflow.
+1. checks `origin/main` for a newer version;
+2. if an update exists, creates a SQLite backup first;
+3. applies only a clean fast-forward update;
+4. installs required Node dependencies;
+5. runs diagnostics;
+6. rolls the application source back to the prior revision if validation fails;
+7. launches AI Harness.
 
-## Recommended Windows locations
+If GitHub cannot be reached, the Update & Launch wrapper opens the currently installed version instead.
 
 Application checkout:
 
@@ -18,23 +22,13 @@ Application checkout:
 %LOCALAPPDATA%\AI-Harness\app
 ```
 
-Persistent data, created automatically:
+Persistent workspace:
 
 ```text
 %USERPROFILE%\Documents\AI Harness
 ```
 
-The second location contains Projects, Archive, Backups, and `harness.db`. It is not part of the Git repository.
-
-## Start
-
-From the application checkout, double-click `start-harness.cmd`, or run:
-
-```bash
-npm start
-```
-
-Open `http://127.0.0.1:4317/`.
+The persistent location contains Projects, Archive, Backups, and `harness.db`. It is not part of the Git repository.
 
 ## Browser companion
 
@@ -46,28 +40,28 @@ Enable Developer mode, choose **Load unpacked**, and select the application's `e
 
 A bright red **Harness ready** dot means the local service and browser companion can see one another. It does not mean every individual chat is safe to delete.
 
-## Update the application
+## Manual controls
 
-If this is a Git checkout, run `update-harness.cmd` or `update-harness.ps1`. It:
+Update without launching:
 
-1. creates a clean SQLite backup under the persistent `Backups` folder;
-2. runs `git pull --ff-only` on application source;
-3. runs diagnostics.
+```text
+update-harness.cmd
+```
 
-Your project folders and archive are outside the Git checkout and are not replaced by the pull.
+Launch without checking for updates:
 
-## Diagnostics
+```text
+start-harness.cmd
+```
+
+Diagnostics:
 
 ```bash
 npm run doctor
 ```
 
-## Manual backup
+Manual backup:
 
 ```bash
 npm run backup
 ```
-
-## First test
-
-Follow `docs/TESTING.md`.

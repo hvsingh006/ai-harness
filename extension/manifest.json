@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI Harness Companion",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "Connect native ChatGPT and Gemini sessions to a shared persistent Project Space and lossless local archive.",
   "permissions": [
     "storage"

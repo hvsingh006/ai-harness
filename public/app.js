@@ -48,6 +48,8 @@ async function load() {
   readiness = ready;
   health = serviceHealth;
   workspaces = ws;
+  const versionLabel = qs('#versionLabel');
+  if (versionLabel) versionLabel.textContent = `Version ${health?.version || 'unknown'}`;
   qs('#themeSelect').value = settings.theme || 'system';
   applyTheme(settings.theme || 'system');
   active = await api('/active-workspace');
@@ -214,9 +216,13 @@ function renderSetup() {
       </div>
     </div>
     <div class="card" style="margin-top:18px">
+      <div class="section-title"><div><div class="eyebrow">APPLICATION</div><h3>Version ${esc(health?.version || 'unknown')}</h3></div><button class="secondary" id="checkUpdatesButton">Check for updates</button></div>
+      <div id="updateStatusText" class="callout">Use the <strong>AI Harness</strong> desktop or Start Menu shortcut to check for an update and launch in one action. If GitHub is unavailable, it launches the currently installed version.</div>
+    </div>
+    <div class="card" style="margin-top:18px">
       <div class="section-title"><h3>Browser companion installation</h3><span class="badge">Chrome / Edge</span></div>
-      <div class="callout">Open the browser extensions page, enable Developer mode, choose <strong>Load unpacked</strong>, and select this repository's <code>extension</code> folder. After any extension update, press Reload on the extension and refresh ChatGPT/Gemini.</div>
-      <p class="lede">Windows shortcut: double-click <code>start-harness.cmd</code> to start the service and open this dashboard. Application code may be updated independently; persistent projects, archive, and the database live under <code>${esc(storage.workspace_root || 'Documents\\AI Harness')}</code>. Run <code>npm run doctor</code> if something is not connecting.</p>
+      <div class="callout">Open the browser extensions page, enable Developer mode, choose <strong>Load unpacked</strong>, and select this repository's <code>extension</code> folder. After an extension update, press Reload on the extension and refresh ChatGPT/Gemini.</div>
+      <p class="lede">Persistent projects, archive, and the database live under <code>${esc(storage.workspace_root || 'Documents\\AI Harness')}</code>, outside the updateable application checkout.</p>
     </div>`;
 }
 
@@ -271,6 +277,29 @@ async function uploadProjectFiles(files) {
 }
 
 function wireDynamicButtons() {
+  qs('#checkUpdatesButton')?.addEventListener('click', async e => {
+    const button = e.currentTarget;
+    const status = qs('#updateStatusText');
+    const original = button.textContent;
+    button.disabled = true;
+    button.textContent = 'Checking…';
+    if (status) status.textContent = 'Checking GitHub for origin/main…';
+    try {
+      const result = await api('/update-status');
+      if (result.error) {
+        if (status) status.textContent = `${result.message} ${result.error}`;
+      } else if (result.update_available) {
+        if (status) status.innerHTML = `Update available: <strong>v${esc(result.remote_version || 'newer')}</strong>. Close Harness and use the <strong>AI Harness</strong> desktop/Start Menu shortcut to update and relaunch safely.`;
+      } else {
+        if (status) status.innerHTML = `<strong>${esc(result.message || 'AI Harness is up to date.')}</strong> Installed v${esc(result.current_version || health?.version || 'unknown')}.`;
+      }
+    } catch (error) {
+      if (status) status.textContent = `Update check failed: ${error.message}`;
+    } finally {
+      button.disabled = false;
+      button.textContent = original;
+    }
+  });
   const dropZone = qs('#projectDropZone');
   const stopDrop = e => { e.preventDefault(); e.stopPropagation(); };
   if (dropZone) {
