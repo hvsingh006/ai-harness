@@ -19,13 +19,8 @@
 
       <nav id="nav">
         <button class="nav-item active" data-view="workspace">Project Space</button>
-        <button class="nav-item" data-view="learning">Learning</button>
-        <button class="nav-item" data-view="development">Development</button>
-        <button class="nav-item" data-view="sessions">Sessions</button>
-        <button class="nav-item" data-view="archive">Archive</button>
-        <button class="nav-item" data-view="knowledge">Knowledge</button>
-        <button class="nav-item" data-view="integrations">Integrations</button>
-        <button class="nav-item" data-view="setup">Setup & Test</button>
+        <button class="nav-item" data-view="history">Chat History</button>
+        <button class="nav-item" data-view="setup">Setup</button>
       </nav>
 
       <div class="sidebar-footer">
@@ -57,7 +52,7 @@
   <dialog id="contextDialog">
     <div class="dialog-head">
       <div>
-        <div class="eyebrow">PROVIDER-NEUTRAL HANDOFF</div>
+        <div class="eyebrow">SHARED PROJECT HANDOFF</div>
         <h2>Context packet</h2>
       </div>
       <button id="closeDialog" class="icon-button" aria-label="Close">×</button>
@@ -65,6 +60,7 @@
     <p class="muted">This is the compact workspace state a fresh AI session can receive. The full archive remains searchable behind it.</p>
     <pre id="contextJson"></pre>
   </dialog>
+
 
   <dialog id="workspaceDialog">
     <form id="workspaceForm" method="dialog">
@@ -78,15 +74,6 @@
       <label class="form-field">
         <span>Name</span>
         <input id="workspaceName" required maxlength="120" placeholder="ECE 352, FPGA project, research…" />
-      </label>
-      <label class="form-field">
-        <span>Type</span>
-        <select id="workspaceKind">
-          <option value="mixed">Mixed</option>
-          <option value="learning">Learning</option>
-          <option value="development">Development</option>
-          <option value="direction">Direction / planning</option>
-        </select>
       </label>
       <label class="form-field">
         <span>Current focus</span>
