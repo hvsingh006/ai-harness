@@ -1,4 +1,4 @@
-# Prototype 0.5 testing
+# Prototype 0.6 testing
 
 This milestone is for validating the core continuity workflow. Do not judge `safe_to_delete` yet unless the UI explicitly marks a session safe. Live browser capture is intentionally conservative.
 
@@ -13,7 +13,17 @@ This milestone is for validating the core continuity workflow. Do not judge `saf
 7. Refresh ChatGPT, Gemini, and/or NotebookLM.
 8. Open the Harness **Setup & Test** screen. A bright red **Harness ready** dot means the local service and companion are connected.
 
-## Test A: create a durable project space
+## Test A: verify update-safe storage
+
+1. Open **Setup & Test** and confirm the persistent workspace root is outside the application checkout.
+2. Create a disposable Project Space.
+3. Confirm its project-folder path is under the persistent `Projects` directory.
+4. Drop in a small file and use **Open folder** to confirm the file exists as a normal filesystem file.
+5. Refresh the Harness and confirm the file remains indexed.
+
+Pass condition: application source and project storage are visibly separate, and the file exists outside the source checkout.
+
+## Test B: create a durable project space
 
 1. Click **New project**.
 2. Name it something disposable, such as `Harness smoke test`.
@@ -23,7 +33,7 @@ This milestone is for validating the core continuity workflow. Do not judge `saf
 
 Pass condition: the project and file remain visible after refreshing the Harness dashboard.
 
-## Test B: native ChatGPT capture
+## Test C: native ChatGPT capture
 
 1. Open ChatGPT from Project Space.
 2. Confirm the red `AIH` label and companion card appear.
@@ -34,7 +44,7 @@ Pass condition: the project and file remain visible after refreshing the Harness
 
 Pass condition: the ChatGPT session appears with the expected provider, title, and message count.
 
-## Test C: provider switch without restating the project
+## Test D: provider switch without restating the project
 
 1. Open Gemini from the same Project Space.
 2. In the companion, press **Insert workspace context**.
@@ -44,7 +54,7 @@ Pass condition: Gemini can identify the project and resource inventory from Harn
 
 This test validates workspace continuity. It does not yet guarantee that every historical transcript line or authenticated attachment is available to the second provider automatically.
 
-## Test D: archived chat reuse
+## Test E: archived chat reuse
 
 1. Return to the ChatGPT chat from Test B.
 2. Press **Bring this chat into prompt** in the companion.
@@ -52,7 +62,7 @@ This test validates workspace continuity. It does not yet guarantee that every h
 
 Pass condition: the Harness resolves the existing provider chat ID to the same internal session rather than creating an unrelated duplicate.
 
-## Test E: fresh session
+## Test F: fresh session
 
 1. Start a new ChatGPT or Gemini native chat.
 2. Use **Insert workspace context**.

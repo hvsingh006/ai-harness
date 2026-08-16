@@ -1,7 +1,7 @@
 (() => {
   const API = 'http://127.0.0.1:4317/api';
   const AUTO_CAPTURE_INTERVAL_MS = 15000;
-  const COMPANION_VERSION = '0.5.0';
+  const COMPANION_VERSION = chrome.runtime.getManifest().version;
   if (document.getElementById('aih-companion')) return;
 
   let lastFingerprint = '';

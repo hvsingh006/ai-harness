@@ -166,3 +166,20 @@ pre { max-height: 55vh; overflow: auto; padding: 14px; border-radius: 10px; back
 .test-steps li { padding: 5px 0; }
 .test-steps strong, .callout strong { color: var(--text); }
 code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .92em; }
+
+.project-path-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 12px 0 14px;
+}
+.project-path-row code {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 9px 10px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}

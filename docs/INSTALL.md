@@ -1,18 +1,34 @@
-# Prototype setup
+# Prototype 0.6 setup
 
-Normal use is intended to become installer-driven. Prototype 0.5 still uses an unpacked browser extension.
+Prototype 0.6 separates the application from your permanent AI workspace.
 
 ## Requirements
 
 - Windows, macOS, or Linux with Node.js 22.5 or newer
 - Chrome or Microsoft Edge
-- native ChatGPT, Gemini, and/or NotebookLM accounts as desired
+- Git if you want `git pull` updates
 
 No provider API key is required for the current browser-companion workflow.
 
-## Start the local harness
+## Recommended Windows locations
 
-From the repository folder:
+Application checkout:
+
+```text
+%LOCALAPPDATA%\AI-Harness\app
+```
+
+Persistent data, created automatically:
+
+```text
+%USERPROFILE%\Documents\AI Harness
+```
+
+The second location contains Projects, Archive, Backups, and `harness.db`. It is not part of the Git repository.
+
+## Start
+
+From the application checkout, double-click `start-harness.cmd`, or run:
 
 ```bash
 npm start
@@ -20,57 +36,38 @@ npm start
 
 Open `http://127.0.0.1:4317/`.
 
-## Install the browser companion
+## Browser companion
 
-### Chrome
+Chrome: `chrome://extensions`
 
-1. Open `chrome://extensions`.
-2. Enable **Developer mode**.
-3. Choose **Load unpacked**.
-4. Select the repository's `extension` folder.
+Edge: `edge://extensions`
 
-### Edge
+Enable Developer mode, choose **Load unpacked**, and select the application's `extension` folder. Refresh ChatGPT, Gemini, or NotebookLM.
 
-1. Open `edge://extensions`.
-2. Enable **Developer mode**.
-3. Choose **Load unpacked**.
-4. Select the repository's `extension` folder.
+A bright red **Harness ready** dot means the local service and browser companion can see one another. It does not mean every individual chat is safe to delete.
 
-Then open or refresh ChatGPT, Gemini, or NotebookLM.
+## Update the application
 
-## Ready indicator
+If this is a Git checkout, run `update-harness.cmd` or `update-harness.ps1`. It:
 
-The local app deliberately uses a **bright red dot** beside **Harness ready** once the local service is running and a browser companion has checked in.
+1. creates a clean SQLite backup under the persistent `Backups` folder;
+2. runs `git pull --ff-only` on application source;
+3. runs diagnostics.
 
-Before the companion is detected the same location says **Install/open companion** and the dot remains neutral.
-
-The provider page companion also uses the bright red dot when connected.
-
-## Extension upgrades
-
-During prototype development, after the `extension` folder changes:
-
-1. Open the browser extensions page.
-2. Press **Reload** on AI Harness Companion.
-3. Refresh the ChatGPT/Gemini/NotebookLM tab.
-
-A packaged installer/update path should replace these steps before a stable release.
-
-
-## Windows quick start
-
-After cloning or downloading the repository, double-click `start-harness.cmd`. It checks that Node.js is available, opens the local dashboard, and starts the Harness service. Keep the command window open while testing.
+Your project folders and archive are outside the Git checkout and are not replaced by the pull.
 
 ## Diagnostics
-
-Run:
 
 ```bash
 npm run doctor
 ```
 
-It checks the Node version, local data/vault write access, SQLite database, running service, and browser-companion heartbeat.
+## Manual backup
+
+```bash
+npm run backup
+```
 
 ## First test
 
-Follow `docs/TESTING.md`. The first milestone validates Project Space persistence, native ChatGPT capture, a ChatGPT-to-Gemini workspace handoff, and stable chat identity.
+Follow `docs/TESTING.md`.

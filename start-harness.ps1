@@ -5,6 +5,8 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
   Write-Host 'Install the current Node.js LTS release from https://nodejs.org/ and run this script again.'
   exit 1
 }
+$workspaceRoot = if ($env:HARNESS_WORKSPACE_ROOT) { $env:HARNESS_WORKSPACE_ROOT } else { Join-Path $HOME 'Documents\AI Harness' }
+Write-Host "Persistent workspace: $workspaceRoot"
 Start-Process 'http://127.0.0.1:4317/'
 Write-Host 'Starting AI Harness. Keep this window open while testing.'
 node .\src\server.mjs

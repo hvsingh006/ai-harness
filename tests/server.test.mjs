@@ -34,7 +34,9 @@ test('server supports first-run project and native continuity smoke flow', async
   const healthResponse = await waitFor(`${base}/health`);
   const health = await healthResponse.json();
   assert.equal(health.ok, true);
-  assert.equal(health.version, '0.5.0');
+  assert.equal(health.version, '0.6.0');
+  assert.equal(path.resolve(health.storage.workspace_root), path.resolve(dir));
+  assert.ok(health.storage.database_path.endsWith('test.db'));
 
   const createResponse = await fetch(`${base}/workspaces`, {
     method: 'POST',
@@ -45,11 +47,37 @@ test('server supports first-run project and native continuity smoke flow', async
   const workspace = await createResponse.json();
   assert.equal(workspace.name, 'Smoke project');
   assert.deepEqual(new Set(workspace.providers.map(item => item.provider)), new Set(['chatgpt', 'gemini', 'notebooklm']));
+  assert.ok(workspace.root_path);
+  assert.ok(path.resolve(workspace.root_path).startsWith(path.resolve(dir)));
+
+  const uploadResponse = await fetch(`${base}/workspaces/${encodeURIComponent(workspace.id)}/artifacts?name=notes.txt&relative_path=Notes%2Fnotes.txt&mime_type=text%2Fplain`, {
+    method: 'PUT',
+    body: Buffer.from('persistent project file')
+  });
+  assert.equal(uploadResponse.status, 201);
+  const uploaded = await uploadResponse.json();
+  assert.ok(fs.existsSync(uploaded.file.local_path));
+  assert.equal(fs.readFileSync(uploaded.file.local_path, 'utf8'), 'persistent project file');
+  assert.equal(uploaded.file.relative_path, 'Notes/notes.txt');
+
+  const attachedFolder = path.join(dir, 'existing-code-project');
+  fs.mkdirSync(attachedFolder, { recursive: true });
+  fs.writeFileSync(path.join(attachedFolder, 'README.md'), '# existing project');
+  const attachResponse = await fetch(`${base}/workspaces/${encodeURIComponent(workspace.id)}/attach-folder`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: attachedFolder })
+  });
+  assert.equal(attachResponse.status, 200);
+  const attached = await attachResponse.json();
+  assert.equal(path.resolve(attached.root_path), path.resolve(attachedFolder));
+  assert.equal(attached.path_mode, 'attached');
+  assert.ok(attached.files.some(file => file.relative_path === 'README.md'));
 
   const heartbeat = await fetch(`${base}/companion/heartbeat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ client_id: 'test-client', version: '0.5.0', provider: 'chatgpt' })
+    body: JSON.stringify({ client_id: 'test-client', version: '0.6.0', provider: 'chatgpt' })
   });
   assert.equal(heartbeat.status, 200);
   assert.equal((await heartbeat.json()).ready_for_native_workflow, true);

@@ -3,18 +3,21 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { openDatabase, rows, row, run, dataDir, upsertSessionExternalRef } from './db.mjs';
+import { spawn } from 'node:child_process';
+import { openDatabase, rows, row, run, storageForDatabase, ensureWorkspaceProjectRoot, attachWorkspaceFolder, upsertSessionExternalRef } from './db.mjs';
 import { sha256Text, archiveFile } from './archive.mjs';
 import { setCaptureStages, importChatGPTExport, importProviderArchive } from './importers.mjs';
 import { HARNESS_VERSION } from './version.mjs';
+import { indexWorkspaceFile, scanWorkspaceFiles, projectFileDestination, storageSummary } from './project-space.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
 const publicDir = path.join(rootDir, 'public');
 const port = Number(process.env.HARNESS_PORT || 4317);
 const db = process.env.HARNESS_DB ? openDatabase(path.resolve(process.env.HARNESS_DB)) : openDatabase();
+const storage = storageForDatabase(db);
 
-const stagingRoot = path.join(dataDir, 'imports', 'staging');
+const stagingRoot = path.join(storage.stagingDir, 'imports');
 fs.mkdirSync(stagingRoot, { recursive: true });
 
 function safeRelativePath(value) {
@@ -84,18 +87,22 @@ async function readJson(req, maxBytes = 25 * 1024 * 1024) {
 function getSettings() {
   const result = {};
   for (const item of rows(db, 'SELECT key, value FROM settings')) result[item.key] = item.value;
+  result.storage = storageSummary(db);
   return result;
 }
 
 function workspaceSummary(id) {
   const workspace = row(db, 'SELECT * FROM workspaces WHERE id = ?', id);
   if (!workspace) return null;
+  let projectFiles = [];
+  try { projectFiles = scanWorkspaceFiles(db, id, { maxFiles: 5000 }); }
+  catch { projectFiles = rows(db, 'SELECT * FROM workspace_files WHERE workspace_id = ? ORDER BY relative_path', id); }
   return {
     ...workspace,
     providers: rows(db, 'SELECT * FROM provider_links WHERE workspace_id = ? ORDER BY provider', id),
     sessions: rows(db, 'SELECT * FROM sessions WHERE workspace_id = ? ORDER BY started_at DESC LIMIT 100', id),
     memories: rows(db, `SELECT * FROM memories WHERE (workspace_id = ? OR scope = 'global') AND status = 'active' ORDER BY scope, updated_at DESC`, id),
-    files: rows(db, 'SELECT * FROM workspace_files WHERE workspace_id = ? ORDER BY created_at DESC', id),
+    files: projectFiles,
     artifacts: rows(db, 'SELECT id,name,mime_type,size_bytes,sha256,artifact_type,provider,source_url,created_at FROM artifacts WHERE workspace_id = ? ORDER BY created_at DESC LIMIT 300', id),
     learning: rows(db, 'SELECT * FROM learning_items WHERE workspace_id = ? ORDER BY updated_at DESC', id),
     development: rows(db, 'SELECT * FROM development_items WHERE workspace_id = ? ORDER BY updated_at DESC', id),
@@ -363,7 +370,7 @@ function captureBrowserSession(body) {
 async function handleApi(req, res, url) {
   if (req.method === 'OPTIONS') return sendJson(res, 204, {});
 
-  if (url.pathname === '/api/health') return sendJson(res, 200, { ok: true, version: HARNESS_VERSION, database: 'sqlite', archive: archiveStats() });
+  if (url.pathname === '/api/health') return sendJson(res, 200, { ok: true, version: HARNESS_VERSION, database: 'sqlite', storage: storageSummary(db), archive: archiveStats() });
   if (url.pathname === '/api/readiness' && req.method === 'GET') return sendJson(res, 200, readiness());
   if (url.pathname === '/api/companion/heartbeat' && req.method === 'POST') {
     const body = await readJson(req);
@@ -415,7 +422,7 @@ async function handleApi(req, res, url) {
   if (assetContentMatch && req.method === 'PUT') {
     const asset = row(db, `SELECT a.*, s.workspace_id, s.provider AS session_provider FROM session_assets a JOIN sessions s ON s.id=a.session_id WHERE a.id=?`, assetContentMatch[1]);
     if (!asset) return sendJson(res, 404, { error: 'asset reference not found' });
-    const tempDir = path.join(dataDir, 'imports', 'mirror');
+    const tempDir = path.join(storage.runtimeDir, 'mirror');
     fs.mkdirSync(tempDir, { recursive: true });
     const tempPath = path.join(tempDir, `${randomUUID()}.bin`);
     try {
@@ -481,33 +488,62 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, workspaces);
   }
 
+
   const workspaceArtifactUpload = url.pathname.match(/^\/api\/workspaces\/([^/]+)\/artifacts$/);
   if (workspaceArtifactUpload && req.method === 'PUT') {
     const workspaceId = workspaceArtifactUpload[1];
     if (!row(db, 'SELECT id FROM workspaces WHERE id=?', workspaceId)) return sendJson(res, 404, { error: 'workspace not found' });
-    const originalName = String(url.searchParams.get('name') || 'upload.bin').slice(0, 500);
+    const originalName = String(url.searchParams.get('name') || 'upload.bin').slice(0, 1000);
+    const relativePath = String(url.searchParams.get('relative_path') || originalName).slice(0, 2000);
     const declaredMime = String(url.searchParams.get('mime_type') || 'application/octet-stream').slice(0, 200);
-    const tempDir = path.join(dataDir, 'imports', 'project-space');
+    const tempDir = path.join(storage.runtimeDir, 'project-space');
     fs.mkdirSync(tempDir, { recursive: true });
     const tempPath = path.join(tempDir, `${randomUUID()}-${path.basename(originalName).replace(/[^a-zA-Z0-9._-]/g, '_') || 'upload.bin'}`);
     try {
       const size = await streamRequestToFile(req, tempPath, 2 * 1024 * 1024 * 1024);
+      const destination = projectFileDestination(db, workspaceId, relativePath);
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      if (fs.existsSync(destination) && fs.statSync(destination).isFile()) {
+        archiveFile(db, {
+          filePath: destination,
+          workspaceId,
+          provider: 'local',
+          artifactType: 'project_snapshot',
+          metadata: { original_name: path.basename(destination), version_reason: 'before_overwrite', added_via: 'project_space' }
+        });
+      }
+      fs.copyFileSync(tempPath, destination);
+      const projectFile = indexWorkspaceFile(db, workspaceId, destination);
       const artifact = archiveFile(db, {
-        filePath: tempPath,
+        filePath: destination,
         workspaceId,
         provider: 'local',
         artifactType: declaredMime === 'application/pdf' ? 'pdf' : declaredMime.startsWith('image/') ? 'image' : 'file',
-        sourcePathOverride: `project-space:${workspaceId}:${randomUUID()}`,
-        metadata: { original_name: originalName, declared_mime_type: declaredMime, added_via: 'project_space' }
+        metadata: { original_name: originalName, relative_path: projectFile.relative_path, declared_mime_type: declaredMime, added_via: 'project_space' }
       });
-      run(db, 'UPDATE artifacts SET name=?, mime_type=?, created_at=? WHERE id=?', originalName, declaredMime, new Date().toISOString(), artifact.id);
+      run(db, 'UPDATE artifacts SET name=?, mime_type=?, created_at=? WHERE id=?', path.basename(destination), declaredMime, new Date().toISOString(), artifact.id);
       run(db, 'UPDATE workspaces SET updated_at=? WHERE id=?', new Date().toISOString(), workspaceId);
-      return sendJson(res, 201, { ...row(db, 'SELECT * FROM artifacts WHERE id=?', artifact.id), uploaded_bytes: size });
+      return sendJson(res, 201, { file: projectFile, artifact: row(db, 'SELECT * FROM artifacts WHERE id=?', artifact.id), uploaded_bytes: size });
     } catch (error) {
       return sendJson(res, 400, { error: error.message });
     } finally {
       try { fs.unlinkSync(tempPath); } catch {}
     }
+  }
+
+  const workspaceFileContent = url.pathname.match(/^\/api\/workspace-files\/([^/]+)\/content$/);
+  if (workspaceFileContent && req.method === 'GET') {
+    const file = row(db, 'SELECT * FROM workspace_files WHERE id=?', workspaceFileContent[1]);
+    if (!file || !file.local_path || !fs.existsSync(file.local_path)) return sendJson(res, 404, { error: 'project file not found' });
+    const stat = fs.statSync(file.local_path);
+    const safeName = String(file.name || 'file').replace(/[\r\n"]/g, '_');
+    res.writeHead(200, {
+      'Content-Type': file.mime_type || 'application/octet-stream',
+      'Content-Length': stat.size,
+      'Content-Disposition': `inline; filename="${safeName}"`,
+      'Access-Control-Allow-Origin': '*'
+    });
+    return fs.createReadStream(file.local_path).pipe(res);
   }
 
   const artifactContent = url.pathname.match(/^\/api\/artifacts\/([^/]+)\/content$/);
@@ -537,11 +573,35 @@ async function handleApi(req, res, url) {
       ['gemini', 'Gemini', 'https://gemini.google.com/'],
       ['notebooklm', 'NotebookLM', 'https://notebooklm.google.com/']
     ];
+    ensureWorkspaceProjectRoot(db, id);
     for (const [provider, label, providerUrl] of defaultProviders) {
       run(db, `INSERT INTO provider_links (id,workspace_id,provider,label,url,status,metadata_json,created_at,updated_at) VALUES (?,?,?,?,?,'linked','{}',?,?)`,
         `provider-${randomUUID()}`, id, provider, label, providerUrl, ts, ts);
     }
     return sendJson(res, 201, workspaceSummary(id));
+  }
+
+  const attachWorkspaceMatch = url.pathname.match(/^\/api\/workspaces\/([^/]+)\/attach-folder$/);
+  if (attachWorkspaceMatch && req.method === 'POST') {
+    try {
+      const body = await readJson(req);
+      const workspace = attachWorkspaceFolder(db, attachWorkspaceMatch[1], body.path);
+      scanWorkspaceFiles(db, workspace.id);
+      return sendJson(res, 200, workspaceSummary(workspace.id));
+    } catch (error) { return sendJson(res, 400, { error: error.message }); }
+  }
+
+  const openWorkspaceFolderMatch = url.pathname.match(/^\/api\/workspaces\/([^/]+)\/open-folder$/);
+  if (openWorkspaceFolderMatch && req.method === 'POST') {
+    const workspace = row(db, 'SELECT * FROM workspaces WHERE id=?', openWorkspaceFolderMatch[1]);
+    if (!workspace) return sendJson(res, 404, { error: 'workspace not found' });
+    const folder = ensureWorkspaceProjectRoot(db, workspace.id);
+    try {
+      const command = process.platform === 'win32' ? 'explorer.exe' : process.platform === 'darwin' ? 'open' : 'xdg-open';
+      const child = spawn(command, [folder], { detached: true, stdio: 'ignore' });
+      child.unref();
+      return sendJson(res, 200, { opened: true, path: folder });
+    } catch (error) { return sendJson(res, 500, { error: error.message, path: folder }); }
   }
 
   if (url.pathname === '/api/active-workspace' && req.method === 'GET') {

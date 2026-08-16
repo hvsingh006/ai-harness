@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { randomUUID } from 'node:crypto';
-import { vaultDir, row, run } from './db.mjs';
+import { storageForDatabase, row, run } from './db.mjs';
 
 export function sha256File(filePath) {
   const hash = crypto.createHash('sha256');
@@ -34,6 +34,7 @@ export function mimeFromName(name) {
 }
 
 export function archiveFile(db, { filePath, workspaceId = null, sessionId = null, importId = null, provider = 'local', artifactType = 'file', sourceUrl = '', nativeId = '', metadata = {}, sourcePathOverride = '' }) {
+  const { vaultDir } = storageForDatabase(db);
   const stat = fs.statSync(filePath);
   if (!stat.isFile()) return null;
   const sha256 = sha256File(filePath);

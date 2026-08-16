@@ -95,14 +95,15 @@ function resourceIcon(item) {
 }
 
 function renderProjectResources() {
-  const items = (active.artifacts || []).slice(0, 18);
+  const items = (active.files || []).slice(0, 40);
   return `
     <div class="card project-resources-card">
-      <div class="section-title"><div><div class="eyebrow">PROJECT RESOURCES</div><h2>Files live with the workspace</h2></div><span class="badge">${esc((active.artifacts || []).length)} resources</span></div>
-      <p class="lede">Drop course documents, PDFs, images, screenshots, datasets, design files, notes, or other project material here once. They become canonical workspace resources that can be retrieved into future ChatGPT, Gemini, NotebookLM, and coding-tool sessions.</p>
+      <div class="section-title"><div><div class="eyebrow">PROJECT FILESYSTEM</div><h2>Your real project folder</h2></div><span class="badge">${esc((active.files || []).length)} files</span></div>
+      <p class="lede">These files live in a normal folder on your computer, outside the AI Harness application checkout. Updating the Harness cannot replace this project folder. The archive keeps immutable snapshots separately when files enter an AI workflow.</p>
+      <div class="project-path-row"><code>${esc(active.root_path || 'Project folder not initialized')}</code><button class="tiny-button" id="openProjectFolder">Open folder</button><button class="tiny-button" id="attachProjectFolder">Attach existing folder</button></div>
       <div id="projectDropZone" class="drop-zone" tabindex="0">
         <div class="drop-zone-title">Drop files here</div>
-        <div class="list-sub">or choose files / a folder. Originals are copied into the lossless vault.</div>
+        <div class="list-sub">or choose files / a folder. Files are written into the project folder and separately preserved in the archive.</div>
         <div class="drop-actions">
           <label class="file-picker">Add files<input id="projectFiles" type="file" multiple></label>
           <label class="file-picker secondary-picker">Add folder<input id="projectFolder" type="file" webkitdirectory directory multiple></label>
@@ -112,9 +113,9 @@ function renderProjectResources() {
       <div class="resource-grid">${items.map(item => `
         <article class="resource-card">
           <div class="resource-type">${esc(resourceIcon(item))}</div>
-          <div class="resource-body"><div class="resource-name" title="${esc(item.name)}">${esc(item.name)}</div><div class="list-sub">${esc(bytes(item.size_bytes))} · ${esc(item.provider || 'local')}</div></div>
-          <button class="tiny-button" data-artifact-open="${esc(item.id)}">Open</button>
-        </article>`).join('') || '<div class="empty">No project resources yet. Drag in the material you are actually working from.</div>'}</div>
+          <div class="resource-body"><div class="resource-name" title="${esc(item.relative_path || item.name)}">${esc(item.relative_path || item.name)}</div><div class="list-sub">${esc(bytes(item.size_bytes))} · project file</div></div>
+          <button class="tiny-button" data-project-file-open="${esc(item.id)}">Open</button>
+        </article>`).join('') || '<div class="empty">No project files yet. Drag in the material you are actually working from.</div>'}</div>
     </div>`;
 }
 
@@ -262,11 +263,13 @@ function renderIntegrations() {
 function renderSetup() {
   const companion = Boolean(readiness?.browser_companion_seen);
   const service = Boolean(health?.ok);
+  const storage = health?.storage || {};
   const checks = [
     ['Local Harness service', service, service ? `v${health.version}` : 'not responding'],
-    ['SQLite archive', service, service ? `${health.archive?.messages || 0} messages indexed` : 'waiting for service'],
+    ['Persistent workspace root', Boolean(storage.workspace_root), storage.workspace_root || 'waiting for service'],
+    ['SQLite archive', service, service ? `${health.archive?.messages || 0} messages indexed · ${storage.database_path || ''}` : 'waiting for service'],
     ['Browser companion', companion, companion ? `v${readiness.browser_companion_version || 'unknown'} connected` : 'load the unpacked extension and refresh an AI tab'],
-    ['Active project space', Boolean(active?.id), active?.name || 'create a project'],
+    ['Active project space', Boolean(active?.id && active?.root_path), active?.root_path || active?.name || 'create a project'],
   ];
   return `
     <div class="card" style="margin-bottom:18px">
@@ -295,7 +298,7 @@ function renderSetup() {
     <div class="card" style="margin-top:18px">
       <div class="section-title"><h3>Browser companion installation</h3><span class="badge">Chrome / Edge</span></div>
       <div class="callout">Open the browser extensions page, enable Developer mode, choose <strong>Load unpacked</strong>, and select this repository's <code>extension</code> folder. After any extension update, press Reload on the extension and refresh ChatGPT/Gemini/NotebookLM.</div>
-      <p class="lede">Windows shortcut: double-click <code>start-harness.cmd</code> to start the service and open this dashboard. Run <code>npm run doctor</code> if something is not connecting.</p>
+      <p class="lede">Windows shortcut: double-click <code>start-harness.cmd</code> to start the service and open this dashboard. Application code may be updated independently; persistent projects, archive, and the database live under <code>${esc(storage.workspace_root || 'Documents\\AI Harness')}</code>. Run <code>npm run doctor</code> if something is not connecting.</p>
     </div>`;
 }
 
@@ -339,7 +342,7 @@ async function uploadProjectFiles(files) {
   for (const file of list) {
     const displayName = file.webkitRelativePath || file.name;
     if (progress) progress.textContent = `Archiving ${uploaded + 1} of ${list.length}: ${displayName}`;
-    const response = await fetch(`${API}/workspaces/${encodeURIComponent(active.id)}/artifacts?name=${encodeURIComponent(displayName)}&mime_type=${encodeURIComponent(file.type || 'application/octet-stream')}`, { method: 'PUT', body: file });
+    const response = await fetch(`${API}/workspaces/${encodeURIComponent(active.id)}/artifacts?name=${encodeURIComponent(file.name || displayName)}&relative_path=${encodeURIComponent(displayName)}&mime_type=${encodeURIComponent(file.type || 'application/octet-stream')}`, { method: 'PUT', body: file });
     if (!response.ok) throw new Error(await response.text());
     uploaded += 1;
     uploadedBytes += Number(file.size || 0);
@@ -370,9 +373,34 @@ function wireDynamicButtons() {
     catch (error) { const p = qs('#projectUploadProgress'); if (p) p.textContent = `Upload failed: ${error.message}`; }
     finally { e.currentTarget.value = ''; }
   });
+  document.querySelectorAll('[data-project-file-open]').forEach(button => button.addEventListener('click', e => {
+    window.open(`${API}/workspace-files/${encodeURIComponent(e.currentTarget.dataset.projectFileOpen)}/content`, '_blank', 'noopener');
+  }));
   document.querySelectorAll('[data-artifact-open]').forEach(button => button.addEventListener('click', e => {
     window.open(`${API}/artifacts/${encodeURIComponent(e.currentTarget.dataset.artifactOpen)}/content`, '_blank', 'noopener');
   }));
+  qs('#openProjectFolder')?.addEventListener('click', async e => {
+    const original = e.currentTarget.textContent;
+    try {
+      await api(`/workspaces/${encodeURIComponent(active.id)}/open-folder`, { method: 'POST', body: '{}' });
+      e.currentTarget.textContent = 'Opened';
+    } catch { e.currentTarget.textContent = 'Open failed'; }
+    setTimeout(() => e.currentTarget.textContent = original, 1400);
+  });
+  qs('#attachProjectFolder')?.addEventListener('click', async e => {
+    const folderPath = prompt('Paste the full path of the existing project folder to attach. The Harness will not move or delete it.', active.root_path || '');
+    if (!folderPath?.trim()) return;
+    const original = e.currentTarget.textContent;
+    try {
+      active = await api(`/workspaces/${encodeURIComponent(active.id)}/attach-folder`, { method: 'POST', body: JSON.stringify({ path: folderPath.trim() }) });
+      e.currentTarget.textContent = 'Attached';
+      setTimeout(render, 450);
+    } catch (error) {
+      alert(`Could not attach folder: ${error.message}`);
+      e.currentTarget.textContent = 'Attach failed';
+    }
+    setTimeout(() => { if (document.body.contains(e.currentTarget)) e.currentTarget.textContent = original; }, 1400);
+  });
   document.querySelectorAll('[data-open]').forEach(button => button.addEventListener('click', () => window.open(button.dataset.open, '_blank', 'noopener')));
   qs('#openBoth')?.addEventListener('click', () => {
     const gpt = active.providers.find(p => p.provider === 'chatgpt')?.url || 'https://chatgpt.com/';

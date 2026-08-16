@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { openDatabase, row, rows, run } from '../src/db.mjs';
+import { openDatabase, row, rows, run, storageForDatabase, ensureWorkspaceProjectRoot } from '../src/db.mjs';
 import { archiveFile } from '../src/archive.mjs';
 
 test('database migrates and seeds core prototype data', () => {
@@ -105,4 +105,21 @@ test('project resources are vaulted and associated with the workspace independen
   assert.equal(fs.readFileSync(artifact.vault_path, 'utf8'), 'timing analysis notes');
   try { fs.unlinkSync(artifact.vault_path); } catch {}
   db.close();
+});
+
+
+test('persistent workspace storage stays outside application code and owns project folders', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aih-storage-'));
+  const dbPath = path.join(dir, 'harness.db');
+  const db = openDatabase(dbPath);
+  const storage = storageForDatabase(db);
+  assert.equal(path.resolve(storage.workspaceRoot), path.resolve(dir));
+  assert.equal(path.resolve(storage.dbPath), path.resolve(dbPath));
+  assert.ok(fs.existsSync(storage.projectsDir));
+  assert.ok(fs.existsSync(storage.archiveDir));
+  assert.ok(fs.existsSync(storage.backupsDir));
+  const projectRoot = ensureWorkspaceProjectRoot(db, 'ws-course');
+  assert.ok(path.resolve(projectRoot).startsWith(path.resolve(storage.projectsDir)));
+  db.close();
+  fs.rmSync(dir, { recursive: true, force: true });
 });

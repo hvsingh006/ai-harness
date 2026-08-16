@@ -12,6 +12,12 @@ if errorlevel 1 (
   exit /b 1
 )
 start "" http://127.0.0.1:4317/
+echo.
+if defined HARNESS_WORKSPACE_ROOT (
+  echo Persistent workspace: %HARNESS_WORKSPACE_ROOT%
+) else (
+  echo Persistent workspace: %USERPROFILE%\Documents\AI Harness
+)
 echo Starting AI Harness. Keep this window open while testing.
 echo Press Ctrl+C to stop it.
 echo.

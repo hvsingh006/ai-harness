@@ -1,142 +1,141 @@
 # AI Harness
 
-A local, provider-neutral continuity and archive layer for working in **native** ChatGPT, Gemini, NotebookLM, and future AI services.
+A local, provider-neutral continuity and project layer for working in **native** ChatGPT, Gemini, NotebookLM, and future AI/coding services.
 
 ## Product thesis
 
-**Chats are disposable. Workspaces are durable. Originals are never replaced by summaries.**
+**Chats are disposable. Project spaces are durable. Originals are never replaced by summaries.**
 
-The harness exists to make AI more useful for learning, development, research, and direction without turning the user into a passive consumer of answers.
+The Harness exists to improve productivity, learning, development, and continuity without replacing the user's critical thinking or forcing work into a custom chat UI.
 
-## What the harness owns
+## 0.6 storage model
+
+Application code and personal data are physically separate.
+
+Recommended Windows layout:
+
+```text
+%LOCALAPPDATA%\AI-Harness\app\        # Git checkout / application code
+
+%USERPROFILE%\Documents\AI Harness\  # permanent working space
+├── Projects\
+├── Library\
+├── Archive\
+│   ├── Vault\
+│   └── Imports\
+├── Backups\
+├── .harness\
+└── harness.db
+```
+
+You can update, delete, or reclone the application checkout without deleting your projects or archive. `HARNESS_WORKSPACE_ROOT` can override the default persistent location, but the Harness refuses to place persistent storage inside its own source checkout.
+
+See `docs/STORAGE.md`.
+
+## Project Spaces
+
+A Project Space is backed by a **real folder**, not just database records. Files dragged into the local app are written into that project folder while immutable archive snapshots are maintained separately when needed for provenance/recovery.
+
+You can also attach an existing project folder without moving it. This is the intended foundation for future repository/Codex/coding-tool integrations.
+
+## What the Harness owns
 
 - complete capturable conversation archive
 - exact imported provider exports
-- canonical copies of files, PDFs, images, and other assets
-- provider-neutral workspaces
+- provider chat IDs, routes, URLs, and native traceability
+- real project folders plus indexed resource manifests
+- immutable archived copies of provider/chat assets
 - current working state and next actions
 - source-linked memories and decisions
 - learning attempts, misconceptions, and mastery evidence
 - development state, architecture, experiments, bugs, and technical decisions
 - cross-provider search and handoff context
 
-## What the harness does not replace
+## What it does not replace
 
 - ChatGPT UI and native capabilities
 - Gemini UI and native capabilities
-- NotebookLM / Gemini notebook study and source features
-- future provider-specific features that are better used natively
+- NotebookLM / Gemini notebook study/source features
+- future provider-specific coding/research capabilities that are better used natively
 
 ## Archive model
 
-The data system deliberately separates two layers:
+Two layers are kept separately:
 
-1. **Lossless archive**: raw messages, raw provider records, exact files/assets, provider URLs, metadata, and hashes.
-2. **Derived working state**: summaries, memories, decisions, learning state, tasks, and context packets.
+1. **Lossless source archive**: raw messages, provider records, exact assets, IDs/URLs, metadata, hashes.
+2. **Derived working state**: summaries, memories, decisions, learning state, tasks, context packets.
 
-The derived layer can be regenerated. It is never allowed to be the only copy of important source information.
+Derived state can be regenerated. It never replaces the originals.
 
-A native chat is only `safe_to_delete` after the required capture stages are complete:
+A native chat is only `safe_to_delete` after raw transcript, attachments/assets, derived state, and search indexing are all verified complete.
 
-- full raw transcript
-- attachments/assets mirrored
-- derived state updated
-- search index updated
+## Start
 
-Live browser capture is currently best-effort and intentionally stays `captured_incomplete` until completeness can be verified.
+Requires Node.js 22.5+.
 
-## Run prototype
+Windows:
 
-Requires Node.js 22.5 or newer.
+```text
+start-harness.cmd
+```
+
+Or:
 
 ```bash
 npm start
 ```
 
-Open:
-
-```text
-http://127.0.0.1:4317
-```
+Then open `http://127.0.0.1:4317/`.
 
 ## Browser companion
 
-In Chrome or Edge:
+Load `extension/` as an unpacked Chrome/Edge extension. It currently supports ChatGPT, Gemini, and NotebookLM native pages for capture, chat labels, context handoff, and archived-session reuse.
 
-1. Open the browser extensions page.
-2. Enable Developer mode.
-3. Choose **Load unpacked**.
-4. Select `extension/`.
-5. Open ChatGPT, Gemini, or NotebookLM.
+The requested bright red **Harness ready** indicator appears after the local service and browser companion have connected.
 
-Current companion functions:
+## Updates and backups
 
-- automatically capture newly loaded native chat content every few seconds, with a manual Capture now fallback
-- best-effort mirror accessible conversation attachments/images into the local vault
-- display a stable AI Harness label directly on recognized native chats
-- retain provider chat IDs/routes/URLs for archive reconciliation
-- bring an archived chat back into the current prompt as source context
-- insert the active workspace context into a fresh native chat
-- copy the context packet
-- open the local harness
+If the application is a Git checkout:
+
+```text
+update-harness.cmd
+```
+
+The updater creates a database backup first, then performs `git pull --ff-only`, then runs diagnostics. Personal Projects and Archive data are outside Git.
+
+Manual commands:
+
+```bash
+npm run backup
+npm run doctor
+npm test
+```
 
 ## Historical imports
 
-The importer is intentionally lossless-first. Point it at an **extracted** provider export directory. Every file is hashed and copied into the immutable local vault before provider-specific parsing.
-
-ChatGPT export:
-
 ```bash
-npm run import -- chatgpt /path/to/extracted-export ws-harness
+npm run import -- chatgpt /path/to/extracted-export <workspace-id>
+npm run import -- gemini /path/to/extracted-export <workspace-id>
+npm run import -- notebooklm /path/to/extracted-export <workspace-id>
 ```
 
-Generic Gemini / NotebookLM / other provider archive:
-
-```bash
-npm run import -- gemini /path/to/extracted-export ws-harness
-npm run import -- notebooklm /path/to/extracted-export ws-harness
-```
-
-The ChatGPT importer currently parses `conversations.json` into sessions/messages and archives every other exported asset. Generic provider imports preserve all files first; provider-specific parsing is incremental work.
-
-## Data and privacy
-
-Runtime state is under `data/` and excluded from Git. The vault is content-addressed by SHA-256. Secrets belong in `.env`, also excluded.
-
-Git tracks source code, schema, documentation, and tests. Personal conversation history does **not** belong in Git.
+The importer preserves source files before parsing them.
 
 ## Repository
 
-This working tree is the `ai-harness` project. It preserves the original prototype Git history. The private GitHub repository is `hvsingh006/ai-harness`. Git stores source, tests, and documentation only; personal archive data remains local and ignored.
+Private remote: `hvsingh006/ai-harness`.
 
-See:
+Git stores application source, tests, migration logic, and documentation only. Personal project data, chats, files, PDFs, images, the archive vault, backups, and `harness.db` remain local.
 
+## Key documentation
+
+- `docs/STORAGE.md`
 - `docs/PRODUCT_SPEC.md`
 - `docs/ARCHITECTURE.md`
-- `docs/ROADMAP.md`
+- `docs/PROJECT_SPACE.md`
+- `docs/RESOURCE_POLICY.md`
+- `docs/CHAT_IDENTITY.md`
+- `docs/CODING_ADAPTERS.md`
 - `docs/IMPORTS.md`
 - `docs/TESTING.md`
-
-
-## Resource use
-
-Provider handoffs explicitly instruct the AI to use relevant prior prompts, prior model responses, raw archive history, files, PDFs, images, notebook sources, code, native tools, and current web information. If the corpus is too large, the harness preserves all of it and progressively retrieves smaller relevant subsets rather than discarding history. See `docs/RESOURCE_POLICY.md`.
-
-## Chat identity and labels
-
-Native chats receive a Harness overlay label when recognized. Provider chat identifiers are stored separately from titles and URLs so imported or archived chats can reconcile with later live sessions. See `docs/CHAT_IDENTITY.md`.
-
-## Prototype installation
-
-The current browser companion is an unpacked Chrome/Edge extension. See `docs/INSTALL.md`. The dashboard shows a bright red **Harness ready** dot after the companion checks in.
-
-## Project spaces
-
-A Harness workspace is also a durable project space. The local UI supports dragging or selecting documents, PDFs, images, datasets, folders, and other working material into the workspace. Originals are stored in the canonical content-addressed vault and remain available independently of any individual ChatGPT, Gemini, NotebookLM, or future coding-agent session.
-
-See `docs/PROJECT_SPACE.md` for the resource model and `docs/CODING_ADAPTERS.md` for the planned provider-neutral coding-tool boundary.
-
-
-## Prototype 0.5 quick test
-
-On Windows, double-click `start-harness.cmd`, load `extension/` as an unpacked Chrome/Edge extension, then open **Setup & Test** in the local dashboard. Follow `docs/TESTING.md` to validate Project Space persistence, native capture, and ChatGPT/Gemini continuity.
+- `docs/ROADMAP.md`

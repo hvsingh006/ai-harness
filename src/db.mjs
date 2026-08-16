@@ -1,22 +1,32 @@
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
+import { appRoot, legacyDataDir, buildStoragePaths, resolveWorkspaceRoot, ensureStorageLayout, migrateLegacyData, safeFolderName } from './storage.mjs';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-export const rootDir = path.resolve(__dirname, '..');
-export const dataDir = path.join(rootDir, 'data');
-export const vaultDir = path.join(dataDir, 'vault');
-fs.mkdirSync(dataDir, { recursive: true });
-fs.mkdirSync(vaultDir, { recursive: true });
+export const rootDir = appRoot;
+const databaseStorage = new WeakMap();
 
-export function openDatabase(dbPath = path.join(dataDir, 'harness.db')) {
-  const db = new DatabaseSync(dbPath);
+export function storageForDatabase(db) {
+  const storage = databaseStorage.get(db);
+  if (!storage) throw new Error('Database storage paths are unavailable for this database handle.');
+  return storage;
+}
+
+export function openDatabase(dbPath = null) {
+  const explicitDbPath = dbPath ? path.resolve(dbPath) : null;
+  const workspaceRoot = resolveWorkspaceRoot({ dbPath: explicitDbPath });
+  const storage = ensureStorageLayout(buildStoragePaths(workspaceRoot));
+  if (!explicitDbPath) migrateLegacyData(storage);
+  const actualDbPath = explicitDbPath || storage.dbPath;
+  const db = new DatabaseSync(actualDbPath);
+  databaseStorage.set(db, { ...storage, dbPath: actualDbPath });
   db.exec('PRAGMA foreign_keys = ON;');
   db.exec('PRAGMA journal_mode = WAL;');
   migrate(db);
+  migrateStorageReferences(db, storage);
   seed(db);
+  ensureWorkspaceProjectRoots(db);
   return db;
 }
 
@@ -265,8 +275,11 @@ function migrate(db) {
     CREATE INDEX IF NOT EXISTS idx_artifacts_sha ON artifacts(sha256);
     CREATE INDEX IF NOT EXISTS idx_session_assets_session ON session_assets(session_id, mirror_status);
     CREATE INDEX IF NOT EXISTS idx_tasks_workspace_status ON workspace_tasks(workspace_id, status, priority);
+    CREATE INDEX IF NOT EXISTS idx_workspace_files_workspace ON workspace_files(workspace_id, local_path);
   `);
 
+  addColumn(db, 'workspaces', "root_path TEXT NOT NULL DEFAULT ''");
+  addColumn(db, 'workspaces', "path_mode TEXT NOT NULL DEFAULT 'managed'");
   addColumn(db, 'sessions', "external_id TEXT NOT NULL DEFAULT ''");
   addColumn(db, 'sessions', "import_id TEXT REFERENCES imports(id) ON DELETE SET NULL");
   addColumn(db, 'sessions', "raw_complete INTEGER NOT NULL DEFAULT 0");
@@ -276,6 +289,9 @@ function migrate(db) {
   addColumn(db, 'sessions', "display_label TEXT NOT NULL DEFAULT ''");
   addColumn(db, 'workspace_files', "sha256 TEXT NOT NULL DEFAULT ''");
   addColumn(db, 'workspace_files', "size_bytes INTEGER NOT NULL DEFAULT 0");
+  addColumn(db, 'workspace_files', "relative_path TEXT NOT NULL DEFAULT ''");
+  addColumn(db, 'workspace_files', "modified_at TEXT");
+  addColumn(db, 'workspace_files', "updated_at TEXT");
   addColumn(db, 'learning_items', "last_practiced_at TEXT");
   addColumn(db, 'learning_items', "next_review_at TEXT");
   addColumn(db, 'learning_items', "attempt_count INTEGER NOT NULL DEFAULT 0");
@@ -285,6 +301,73 @@ function migrate(db) {
   } catch {
     // FTS5 is optional. Search falls back to LIKE when unavailable.
   }
+}
+
+
+function copyFileIfNeeded(source, destination) {
+  if (!source || !fs.existsSync(source)) return false;
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  if (!fs.existsSync(destination)) fs.copyFileSync(source, destination);
+  return fs.existsSync(destination);
+}
+
+function migrateStorageReferences(db, storage) {
+  const legacyVault = path.join(legacyDataDir, 'vault');
+  const artifacts = db.prepare('SELECT id,sha256,vault_path FROM artifacts').all();
+  for (const artifact of artifacts) {
+    if (!artifact.sha256) continue;
+    const canonical = path.join(storage.vaultDir, 'blobs', artifact.sha256.slice(0, 2), artifact.sha256);
+    const oldPath = artifact.vault_path || '';
+    if (!fs.existsSync(canonical)) {
+      const legacyCandidate = path.join(legacyVault, 'blobs', artifact.sha256.slice(0, 2), artifact.sha256);
+      copyFileIfNeeded(oldPath, canonical) || copyFileIfNeeded(legacyCandidate, canonical);
+    }
+    if (fs.existsSync(canonical) && path.resolve(oldPath || canonical) !== path.resolve(canonical)) {
+      db.prepare('UPDATE artifacts SET vault_path=? WHERE id=?').run(canonical, artifact.id);
+    }
+  }
+}
+
+function uniqueManagedProjectPath(db, storage, workspaceId, name) {
+  const base = safeFolderName(name, 'Project');
+  const existing = db.prepare(`SELECT root_path FROM workspaces WHERE id != ? AND root_path != ''`).all(workspaceId)
+    .map(item => path.resolve(item.root_path));
+  let candidate = path.join(storage.projectsDir, base);
+  let suffix = 2;
+  while (existing.includes(path.resolve(candidate)) || (fs.existsSync(candidate) && !fs.statSync(candidate).isDirectory())) {
+    candidate = path.join(storage.projectsDir, `${base} (${suffix++})`);
+  }
+  return candidate;
+}
+
+export function ensureWorkspaceProjectRoot(db, workspaceId) {
+  const workspace = db.prepare('SELECT * FROM workspaces WHERE id=?').get(workspaceId);
+  if (!workspace) return null;
+  const storage = storageForDatabase(db);
+  let rootPath = String(workspace.root_path || '').trim();
+  if (!rootPath) {
+    rootPath = uniqueManagedProjectPath(db, storage, workspaceId, workspace.name);
+    db.prepare(`UPDATE workspaces SET root_path=?,path_mode=COALESCE(NULLIF(path_mode,''),'managed') WHERE id=?`).run(rootPath, workspaceId);
+  }
+  fs.mkdirSync(rootPath, { recursive: true });
+  return rootPath;
+}
+
+export function ensureWorkspaceProjectRoots(db) {
+  for (const workspace of db.prepare('SELECT id FROM workspaces').all()) ensureWorkspaceProjectRoot(db, workspace.id);
+}
+
+export function attachWorkspaceFolder(db, workspaceId, folderPath) {
+  const target = path.resolve(String(folderPath || '').trim());
+  if (!target) throw new Error('folder path required');
+  if (!fs.existsSync(target) || !fs.statSync(target).isDirectory()) throw new Error(`folder not found: ${target}`);
+  const storage = storageForDatabase(db);
+  const appRel = path.relative(appRoot, target);
+  if (appRel === '' || (!appRel.startsWith('..') && !path.isAbsolute(appRel))) throw new Error('A project folder cannot be inside the AI Harness application checkout.');
+  const workspaceRootRel = path.relative(storage.workspaceRoot, target);
+  // Existing folders may live outside the managed workspace root. That is intentional.
+  db.prepare(`UPDATE workspaces SET root_path=?,path_mode='attached',updated_at=? WHERE id=?`).run(target, new Date().toISOString(), workspaceId);
+  return db.prepare('SELECT * FROM workspaces WHERE id=?').get(workspaceId);
 }
 
 function now() {
