@@ -61,7 +61,15 @@ function pumpQueue() {
         if (row(db, 'SELECT status FROM background_jobs WHERE id=?', jobId)?.status === 'cancel_requested') {
           throw Object.assign(new Error('background job was canceled'), { code: 'JOB_CANCELLED' });
         }
-        run(db, `UPDATE background_jobs SET status='completed',progress_current=CASE WHEN progress_total>0 THEN progress_total ELSE progress_current END,phase='complete',result_json=?,completed_at=? WHERE id=?`, JSON.stringify(result || {}), now(), jobId);
+        let finalStatus = 'completed';
+          let finalPhase = 'complete';
+          let finalError = '';
+          if (result && result.status === 'cancelled') {
+            finalStatus = 'cancelled';
+            finalPhase = 'cancelled';
+            finalError = result.code || result.reason || 'CANCELLED';
+          }
+          run(db, `UPDATE background_jobs SET status=?,progress_current=CASE WHEN progress_total>0 THEN progress_total ELSE progress_current END,phase=?,error_code=?,result_json=?,completed_at=? WHERE id=?`, finalStatus, finalPhase, finalError, JSON.stringify(result || {}), now(), jobId);
       } catch (error) {
         const cancelled = error.code === 'JOB_CANCELLED';
         run(db, `UPDATE background_jobs SET status=?,phase=?,error_code=?,error_message=?,completed_at=? WHERE id=?`, cancelled ? 'cancelled' : 'failed', cancelled ? 'cancelled' : 'failed', error.code || 'JOB_FAILED', String(error.message || error).slice(0, 2000), now(), jobId);

@@ -1,5 +1,7 @@
 const API = '/api';
 let workspaces = [];
+let currentResourcePage = 1;
+let paginatedResources = null;
 let active = null;
 let currentView = 'workspace';
 let readiness = null;
@@ -83,7 +85,10 @@ async function load() {
       if (active?.id && ['resources','security'].includes(currentView)) active = await api(`/workspaces/${encodeURIComponent(active.id)}`);
       renderReadiness();
       renderIntegrity();
-      if (currentView === 'resources' && (active?.jobs || []).some(job => ['queued','running'].includes(job.status))) render();
+      if (currentView === 'resources' && (active?.jobs || []).some(job => ['queued','running'].includes(job.status))) {
+        await fetchResources();
+        render();
+      }
     } catch {}
   }, 10000);
 }
@@ -267,8 +272,29 @@ function resourceOrigin(resource) {
   return 'Project folder';
 }
 
+async function fetchResources() {
+  if (!active) return;
+  try {
+    paginatedResources = await api(`/workspaces/${encodeURIComponent(active.id)}/resources?page=${currentResourcePage}&limit=100`);
+  } catch(e) {}
+}
+
+window.nextResourcePage = async () => {
+  currentResourcePage++;
+  await fetchResources();
+  render();
+};
+window.prevResourcePage = async () => {
+  currentResourcePage = Math.max(1, currentResourcePage - 1);
+  await fetchResources();
+  render();
+};
+
 function renderResources() {
-  const resources = active.resources || [];
+  const resourcesObj = paginatedResources || { items: active.resources || [], total: active.resource_count || 0, page: 1, limit: 100 };
+    const resources = resourcesObj.items || [];
+    const hasNext = resourcesObj.total > resourcesObj.page * resourcesObj.limit;
+    const hasPrev = resourcesObj.page > 1;
   const coverage = active.representation_coverage || {};
   const jobs = active.jobs || [];
   const running = jobs.filter(job => ['queued','running'].includes(job.status));
@@ -278,7 +304,12 @@ function renderResources() {
       <p class="lede">Original files remain authoritative. Digital text, page images, embedded images, and OCR are version-linked derived representations that can be rebuilt without deleting originals or history.</p>
       <div class="toolbar"><button class="tiny-button" data-job-type="verify_sources">Verify now</button> <button class="tiny-button" data-job-type="full_integrity_verify">Full integrity verification</button> <button class="tiny-button" data-job-type="rebuild_derived">Rebuild stale derived data</button> <button class="tiny-button" data-job-type="create_backup">Create backup</button> <button class="tiny-button" data-job-type="run_diagnostics">Run diagnostics</button></div>
       ${running.length ? `<div class="job-banner">${running.map(job => `${esc(job.job_type.replaceAll('_',' '))}: ${esc(job.phase || job.status)} ${job.progress_total ? `(${job.progress_current}/${job.progress_total})` : ''}`).join('<br>')}</div>` : ''}
-      <div class="list">${resources.map(resource => {
+      <div class="toolbar" style="margin-top: 10px; margin-bottom: 10px;">
+          <button class="tiny-button" onclick="prevResourcePage()" ${hasPrev ? '' : 'disabled'}>Previous Page</button>
+          <span style="font-size: 12px; margin: 0 10px;">Page ${resourcesObj.page} (${resourcesObj.total} total)</span>
+          <button class="tiny-button" onclick="nextResourcePage()" ${hasNext ? '' : 'disabled'}>Next Page</button>
+        </div>
+        <div class="list">${resources.map(resource => {
         const itemCoverage = coverageFor(resource);
         return `<div class="list-row resource-library-row"><div><div class="list-title">${esc(resource.relative_path)}</div><div class="list-sub">${esc(resource.resource_type)} · ${esc(bytes(resource.size_bytes))} · indexing ${esc(resource.indexing_status)} · representations ${esc(resource.representation_coverage || 'unknown')}${itemCoverage.page_count ? ` · ${esc(itemCoverage.page_count)} pages` : ''}<br>Origin: ${esc(resourceOrigin(resource))}<br>${resource.priority_status === 'priority' ? 'Priority Context · ' : ''}${resource.context_critical ? 'Context Critical · ' : ''}${resource.knowledge_status !== 'active' ? `${esc(resource.knowledge_status)} · ` : ''}Observed ${esc(resource.observed_at || '')}</div></div><div><button class="tiny-button" data-open-resource="${esc(resource.id)}">Open source</button> <button class="tiny-button" data-inspect-resource="${esc(resource.id)}">Versions &amp; provenance</button> <button class="tiny-button" data-reprocess-resource="${esc(resource.id)}">Retry processing</button> <button class="tiny-button" data-resource-policy="${esc(resource.id)}" data-policy-key="priority_status" data-policy-value="${resource.priority_status === 'priority' ? 'normal' : 'priority'}">${resource.priority_status === 'priority' ? 'Unpin' : 'Always consider'}</button> <button class="tiny-button" data-resource-policy="${esc(resource.id)}" data-policy-key="context_critical" data-policy-value="${resource.context_critical ? 'false' : 'true'}">${resource.context_critical ? 'Not critical' : 'Context Critical'}</button> <button class="tiny-button" data-resource-policy="${esc(resource.id)}" data-policy-key="knowledge_status" data-policy-value="${resource.knowledge_status === 'superseded' ? 'active' : 'superseded'}">${resource.knowledge_status === 'superseded' ? 'Mark active' : 'Mark superseded'}</button> <button class="tiny-button" data-resource-policy="${esc(resource.id)}" data-policy-key="provider_transmission_allowed" data-policy-value="${resource.provider_transmission_allowed ? 'false' : 'true'}">${resource.provider_transmission_allowed ? 'Exclude from AI' : 'Allow for AI'}</button>${resource.source_type !== 'filesystem' ? ` <button class="tiny-button" data-save-resource="${esc(resource.id)}" data-resource-name="${esc(resource.relative_path.split('/').pop())}">Save copy to project folder</button>` : ''}</div></div>`;
       }).join('') || '<div class="empty">No indexed resources yet. Add or link a source from Project Space.</div>'}</div>

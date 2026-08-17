@@ -138,7 +138,7 @@ function buildEnvelope({ workspace, freshness, retrieval, sanitizedEvidence, exc
   return { envelope, includedEvidence, budgetExclusions, deliveryMode: ledger ? 'existing_chat_delta' : 'fresh_chat_bootstrap', instructionHash: projectInstructionHash, personalizationHash };
 }
 
-export function prepareManagedSend(db, {
+export async function prepareManagedSend(db, {
   workspaceId,
   provider,
   userPrompt,
@@ -219,7 +219,7 @@ export function prepareManagedSend(db, {
   }
   const securityScanMs = Number((performance.now() - securityStart).toFixed(2));
   const attachmentStart = performance.now();
-  const deliveryPlan = planContextDelivery(db, { workspaceId, query: userPrompt, surfaceId: surface.id, retrieval });
+  const deliveryPlan = await planContextDelivery(db, { workspaceId, query: userPrompt, surfaceId: surface.id, retrieval });
   if (deliveryPlan.status === 'blocked') {
     const failureCode = deliveryPlan.reasons[0]?.code || 'DELIVERY_PLAN_BLOCKED';
     run(db, `UPDATE outgoing_context_runs SET status='blocked',delivery_state='ERROR',failure_code=?,delivery_plan_json=?,metadata_json=? WHERE id=?`, failureCode, JSON.stringify(deliveryPlan), JSON.stringify({ delivery_plan: deliveryPlan }), runId);

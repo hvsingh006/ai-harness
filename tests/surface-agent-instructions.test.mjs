@@ -57,14 +57,14 @@ test('a future provider text-and-image adapter uses the core planner and inherit
   const registry = new SurfaceRegistry([]);
   registry.register({ id: 'test-provider.web', provider_family: 'test-provider', display_name: 'Test provider', channel: 'browser_companion', adapter_version: '1.0.0', capabilities: { text_context: true, image_attachment: true, pdf_attachment: true, file_attachment: true, filesystem: false, shell: false, max_attachments: 4, max_attachment_bytes: 8 * 1024 * 1024 } });
 
-  const ready = planContextDelivery(db, { workspaceId: 'ws-harness', query: 'Inspect future-diagram.png visually', surfaceId: 'test-provider.web', retrieval: { selected: [] }, registry });
+  const ready = await planContextDelivery(db, { workspaceId: 'ws-harness', query: 'Inspect future-diagram.png visually', surfaceId: 'test-provider.web', retrieval: { selected: [] }, registry });
   assert.equal(ready.status, 'ready');
   assert.equal(ready.provider_family, 'test-provider');
   assert.equal(ready.visual_attachments[0].resource_id, resource.id);
 
   run(db, `UPDATE resource_versions SET security_status='local_only:content-secret' WHERE id=?`, resource.current_version_id);
   run(db, 'UPDATE workspace_resources SET provider_transmission_allowed=0 WHERE id=?', resource.id);
-  const blocked = planContextDelivery(db, { workspaceId: 'ws-harness', query: 'Inspect future-diagram.png visually', surfaceId: 'test-provider.web', retrieval: { selected: [] }, registry });
+  const blocked = await planContextDelivery(db, { workspaceId: 'ws-harness', query: 'Inspect future-diagram.png visually', surfaceId: 'test-provider.web', retrieval: { selected: [] }, registry });
   assert.equal(blocked.status, 'blocked');
   assert.equal(blocked.reasons.some(reason => reason.code === 'VISUAL_EVIDENCE_NOT_READY'), true);
 });
@@ -77,18 +77,18 @@ test('delivery capability matrix selects current visuals for browser surfaces an
   reconcileWorkspaceResources(db, 'ws-harness');
   run(db, `UPDATE resource_representations SET security_status='clear' WHERE resource_id=(SELECT id FROM workspace_resources WHERE relative_path='diagram.png') AND representation_kind='original_visual'`);
   run(db, `UPDATE resource_versions SET representation_coverage='complete' WHERE id=(SELECT current_version_id FROM workspace_resources WHERE relative_path='diagram.png')`);
-  const browser = planContextDelivery(db, { workspaceId: 'ws-harness', query: 'Inspect diagram.png visually', surfaceId: 'chatgpt.web', retrieval: { selected: [] } });
+  const browser = await planContextDelivery(db, { workspaceId: 'ws-harness', query: 'Inspect diagram.png visually', surfaceId: 'chatgpt.web', retrieval: { selected: [] } });
   assert.equal(browser.status, 'ready');
   assert.equal(browser.visual_attachments.length, 1);
   assert.equal(browser.visual_attachments[0].name.startsWith('diagram.png'), true);
   assert.equal(browser.visual_attachments[0].download_path.includes('resource-versions'), true);
   const diagram = row(db, `SELECT id,current_version_id FROM workspace_resources WHERE relative_path='diagram.png'`);
   const ocrRetrieval = { selected: [{ source_type: 'ocr_text', source_id: diagram.id, resource_version_id: diagram.current_version_id, content: 'FIFO DEPTH 32', provenance: { path: 'diagram.png', page_start: 1 } }] };
-  const ocrMatchedBrowser = planContextDelivery(db, { workspaceId: 'ws-harness', query: 'What is the FIFO depth?', surfaceId: 'gemini.web', retrieval: ocrRetrieval });
+  const ocrMatchedBrowser = await planContextDelivery(db, { workspaceId: 'ws-harness', query: 'What is the FIFO depth?', surfaceId: 'gemini.web', retrieval: ocrRetrieval });
   assert.equal(ocrMatchedBrowser.visual_attachments[0].resource_id, diagram.id, 'matching OCR should pull the current original visual into an image-capable plan');
-  const ocrMatchedLocal = planContextDelivery(db, { workspaceId: 'ws-harness', query: 'What is the FIFO depth?', surfaceId: 'codex.local', retrieval: ocrRetrieval });
+  const ocrMatchedLocal = await planContextDelivery(db, { workspaceId: 'ws-harness', query: 'What is the FIFO depth?', surfaceId: 'codex.local', retrieval: ocrRetrieval });
   assert.equal(ocrMatchedLocal.status, 'text_fallback');
-  const local = planContextDelivery(db, { workspaceId: 'ws-harness', query: 'Inspect diagram.png visually', surfaceId: 'codex.local', retrieval: { selected: [] } });
+  const local = await planContextDelivery(db, { workspaceId: 'ws-harness', query: 'Inspect diagram.png visually', surfaceId: 'codex.local', retrieval: { selected: [] } });
   assert.equal(local.status, 'blocked');
   assert.equal(local.reasons[0].code, 'SURFACE_VISUAL_UNSUPPORTED');
 });
@@ -104,7 +104,7 @@ test('an explicit unrendered PDF page delivers the verified current PDF or fails
   const handbook = row(db, `SELECT id,current_version_id FROM workspace_resources WHERE relative_path='handbook.pdf'`);
   run(db, `UPDATE resource_versions SET indexing_status='complete',extraction_status='complete',security_status='clear',representation_coverage='complete' WHERE id=?`, handbook.current_version_id);
 
-  const browser = planContextDelivery(db, { workspaceId: 'ws-harness', query: 'Inspect page 81 of handbook.pdf', surfaceId: 'chatgpt.web', retrieval: { selected: [] } });
+  const browser = await planContextDelivery(db, { workspaceId: 'ws-harness', query: 'Inspect page 81 of handbook.pdf', surfaceId: 'chatgpt.web', retrieval: { selected: [] } });
   assert.equal(browser.status, 'ready');
   assert.equal(browser.intents.requested_page, 81);
   assert.equal(browser.visual_attachments.length, 0, 'a different current image must never stand in for the requested PDF page');
@@ -112,7 +112,7 @@ test('an explicit unrendered PDF page delivers the verified current PDF or fails
   assert.equal(browser.file_attachments[0].resource_id, handbook.id);
   assert.equal(browser.file_attachments[0].sha256, row(db, 'SELECT sha256 FROM resource_versions WHERE id=?', handbook.current_version_id).sha256);
 
-  const local = planContextDelivery(db, { workspaceId: 'ws-harness', query: 'Inspect page 81 of handbook.pdf', surfaceId: 'codex.local', retrieval: { selected: [] } });
+  const local = await planContextDelivery(db, { workspaceId: 'ws-harness', query: 'Inspect page 81 of handbook.pdf', surfaceId: 'codex.local', retrieval: { selected: [] } });
   assert.equal(local.status, 'blocked');
   assert.equal(local.reasons.some(reason => reason.code === 'VISUAL_PAGE_NOT_READY'), true);
 });
@@ -134,7 +134,7 @@ test('project instructions and personalization are immutable, versioned, and inj
   assert.equal(context.workspace_personalization.profile.detail_level, 'concise for routine steps');
   assert.equal(instructionHistory(db, 'ws-harness').instructions.length, 2);
 
-  const prepared = prepareManagedSend(db, { workspaceId: 'ws-harness', provider: 'chatgpt', surfaceId: 'chatgpt.web', userPrompt: 'What should we do next?', capture: capture([]), attemptId: 'instructions-attempt', protocolVersion: 4 });
+  const prepared = await prepareManagedSend(db, { workspaceId: 'ws-harness', provider: 'chatgpt', surfaceId: 'chatgpt.web', userPrompt: 'What should we do next?', capture: capture([]), attemptId: 'instructions-attempt', protocolVersion: 4 });
   assert.equal(prepared.ok, true);
   const securityIndex = prepared.context_envelope.indexOf('Trust order: Harness security policy');
   const instructionsIndex = prepared.context_envelope.indexOf('Use option C');
@@ -157,7 +157,7 @@ test('speculative retrieval is generation-bound and the native-session ledger sw
   saveProjectInstructions(db, 'ws-harness', 'Use the current timing source and cite its provenance.');
   savePersonalization(db, { scope: 'global', profile: { response_style: 'direct' }, notes: 'Keep units explicit.' });
 
-  const first = prepareManagedSend(db, {
+  const first = await prepareManagedSend(db, {
     workspaceId: 'ws-harness', provider: 'chatgpt', surfaceId: 'chatgpt.web', userPrompt: 'What is the clock frequency?',
     capture: capture([]), attemptId: 'bootstrap-attempt', providerRoute: 'https://chatgpt.com/c/instructions', protocolVersion: 4
   });
@@ -172,7 +172,7 @@ test('speculative retrieval is generation-bound and the native-session ledger sw
 
   const draft = prepareSpeculativeDraft(db, { workspaceId: 'ws-harness', sessionId, surfaceId: 'chatgpt.web', provider: 'chatgpt', query: 'What is the clock frequency?' });
   assert.equal(draft.cached, true);
-  const second = prepareManagedSend(db, {
+  const second = await prepareManagedSend(db, {
     workspaceId: 'ws-harness', provider: 'chatgpt', surfaceId: 'chatgpt.web', userPrompt: 'What is the clock frequency?',
     capture: capture([]), attemptId: 'delta-attempt', providerRoute: 'https://chatgpt.com/c/instructions', protocolVersion: 4
   });
@@ -185,7 +185,7 @@ test('speculative retrieval is generation-bound and the native-session ledger sw
   assert.equal(JSON.parse(row(db, 'SELECT metadata_json FROM outgoing_context_runs WHERE id=?', second.run_id).metadata_json).context_delivery_mode, 'existing_chat_delta');
 
   run(db, 'UPDATE session_context_ledgers SET sends_since_bootstrap=8 WHERE session_id=?', sessionId);
-  const boundedRebootstrap = prepareManagedSend(db, {
+  const boundedRebootstrap = await prepareManagedSend(db, {
     workspaceId: 'ws-harness', provider: 'chatgpt', surfaceId: 'chatgpt.web', userPrompt: 'Confirm the clock source.',
     capture: capture([]), attemptId: 'bounded-rebootstrap', providerRoute: 'https://chatgpt.com/c/instructions', protocolVersion: 4
   });
@@ -194,7 +194,7 @@ test('speculative retrieval is generation-bound and the native-session ledger sw
 
   saveProjectInstructions(db, 'ws-harness', 'Use the revised timing rule and preserve MHz units.');
   assert.equal(reuseSpeculativeDraft(db, { workspaceId: 'ws-harness', sessionId, surfaceId: 'chatgpt.web', query: 'What is the clock frequency?' }), null);
-  const changedInstructions = prepareManagedSend(db, {
+  const changedInstructions = await prepareManagedSend(db, {
     workspaceId: 'ws-harness', provider: 'chatgpt', surfaceId: 'chatgpt.web', userPrompt: 'What is the clock frequency?',
     capture: capture([]), attemptId: 'instruction-change', providerRoute: 'https://chatgpt.com/c/instructions', protocolVersion: 4
   });
@@ -215,7 +215,7 @@ test('speculative retrieval is generation-bound and the native-session ledger sw
   assert.equal(reuseSpeculativeDraft(db, { workspaceId: 'ws-harness', sessionId, surfaceId: 'chatgpt.web', query: 'What is the clock frequency?' }), null);
   assert.equal(reuseSpeculativeDraft(db, { workspaceId: 'ws-harness', sessionId, surfaceId: 'gemini.web', query: 'What is the clock frequency?' }), null);
 
-  const freshChat = prepareManagedSend(db, {
+  const freshChat = await prepareManagedSend(db, {
     workspaceId: 'ws-harness', provider: 'chatgpt', surfaceId: 'chatgpt.web', userPrompt: 'What is the current clock?',
     capture: capture([], 'fresh-context'), attemptId: 'fresh-attempt', providerRoute: 'https://chatgpt.com/c/fresh-context', protocolVersion: 4
   });
@@ -263,7 +263,7 @@ test('retrieval exposes query-relevant current authority conflicts, class budget
   assert.equal(retrieval.diagnostics.semantic_retriever, 'test-local');
   assert.ok(Object.keys(retrieval.diagnostics.evidence_class_soft_limits).length >= 5);
 
-  const prepared = prepareManagedSend(db, { workspaceId: 'ws-harness', provider: 'chatgpt', surfaceId: 'chatgpt.web', userPrompt: 'What clock frequency should we target?', capture: capture([], 'conflict-chat'), attemptId: 'conflict-attempt', protocolVersion: 4 });
+  const prepared = await prepareManagedSend(db, { workspaceId: 'ws-harness', provider: 'chatgpt', surfaceId: 'chatgpt.web', userPrompt: 'What clock frequency should we target?', capture: capture([], 'conflict-chat'), attemptId: 'conflict-attempt', protocolVersion: 4 });
   assert.equal(prepared.ok, true);
   assert.match(prepared.context_envelope, /CONFLICT DETECTED/);
   assert.match(prepared.context_envelope, /CLOCK = 200 MHz/);

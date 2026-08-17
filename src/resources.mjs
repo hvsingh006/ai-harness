@@ -91,6 +91,7 @@ function retryFailedExtraction(db, { workspaceId, root, resource, version, metri
   run(db, 'UPDATE workspace_resources SET provider_transmission_allowed=?,updated_at=? WHERE id=?', root.provider_transmission_allowed && !sensitive.sensitive && !contentSecurity.blocked ? 1 : 0, now(), resource.id);
   if (indexingStatus === 'complete') run(db, 'UPDATE workspace_resources SET updated_at=? WHERE id=?', now(), resource.id);
   if (extraction.coverage?.pending_page_count > 0) createBackgroundJob(db, { workspaceId, jobType: 'complete_pdf', targetType: 'resource_version', targetId: version.id });
+    if (extraction.coverage?.pending_ocr) createBackgroundJob(db, { workspaceId, jobType: 'complete_image_ocr', targetType: 'resource_version', targetId: version.id });
   metrics.extraction_index_ms += performance.now() - extractionStart;
   return row(db, 'SELECT * FROM resource_versions WHERE id=?', version.id);
 }
@@ -187,6 +188,7 @@ function versionResource(db, { workspaceId, root, file, existingResource, metric
     extraction.status, extraction.coverage?.status || 'unknown', JSON.stringify(extraction.coverage || {}), versionId);
   if (extraction.status === 'complete') replaceVersionChunks(db, { workspaceId, resource, version, extraction });
   if (extraction.coverage?.pending_page_count > 0) createBackgroundJob(db, { workspaceId, jobType: 'complete_pdf', targetType: 'resource_version', targetId: versionId });
+    if (extraction.coverage?.pending_ocr) createBackgroundJob(db, { workspaceId, jobType: 'complete_image_ocr', targetType: 'resource_version', targetId: versionId });
   metrics.extraction_index_ms += performance.now() - extractionStart;
   run(db, `UPDATE workspace_resources SET current_version_id=?,status='active',resource_type=?,mime_type=?,provider_transmission_allowed=?,updated_at=? WHERE id=?`,
     versionId, classification.resourceType, classification.mimeType, transmissionAllowed ? 1 : 0, createdAt, resourceId);
@@ -515,11 +517,37 @@ export function ingestProviderArtifactResource(db, {
   run(db, `UPDATE resource_versions SET extraction_status=?,indexing_status=?,security_status=?,metadata_json=?,representation_status=?,representation_coverage=?,coverage_json=? WHERE id=?`,
     extraction.status, indexingStatus, securityStatus, JSON.stringify({ ...(extraction.metadata || {}), captured_provider: provider, source_id: sourceId, source_type: normalizedSourceType, provenance, security_findings: security.detections }), extraction.status, extraction.coverage?.status || 'unknown', JSON.stringify(extraction.coverage || {}), version.id);
   if (extraction.coverage?.pending_page_count > 0) createBackgroundJob(db, { workspaceId, jobType: 'complete_pdf', targetType: 'resource_version', targetId: version.id });
+    if (extraction.coverage?.pending_ocr) createBackgroundJob(db, { workspaceId, jobType: 'complete_image_ocr', targetType: 'resource_version', targetId: version.id });
   run(db, `UPDATE workspace_resources SET current_version_id=?,provider_transmission_allowed=?,updated_at=? WHERE id=?`, version.id, security.blocked ? 0 : 1, ts, resource.id);
   recordResourceRelationship(db, { workspaceId, sourceType: 'session_asset', sourceId, relationshipType: normalizedSourceType === 'provider_generated_asset' ? 'generated_resource' : 'introduced_resource', targetType: 'resource_version', targetId: version.id,
     provenance: { ...provenance, exact_sha256: artifact.sha256, source_type: normalizedSourceType } });
   run(db, `UPDATE workspaces SET corpus_generation=corpus_generation+1,index_generation=index_generation+1,freshness_status='stale',updated_at=? WHERE id=?`, ts, workspaceId);
   return { resource: row(db, 'SELECT * FROM workspace_resources WHERE id=?', resource.id), version: row(db, 'SELECT * FROM resource_versions WHERE id=?', version.id), reconciled: false };
+}
+
+
+export function getWorkspaceResourcesPage(db, workspaceId, { limit = 100, offset = 0, query = '', transmissionOnly = false } = {}) {
+  let qParams = [workspaceId];
+  let filter = "r.workspace_id=? AND r.status='active'";
+  if (transmissionOnly) filter += " AND r.provider_transmission_allowed=1 AND wr.provider_transmission_allowed=1 AND wr.status='current'";
+  if (query) {
+    filter += " AND (r.relative_path LIKE ? OR r.resource_type LIKE ?)";
+    qParams.push(`%${query}%`, `%${query}%`);
+  }
+  
+  const totalRow = row(db, `SELECT COUNT(*) AS total FROM workspace_resources r JOIN workspace_roots wr ON wr.id=r.root_id WHERE ${filter}`, ...qParams);
+  
+  const items = rows(db, `SELECT r.*,v.sha256,v.size_bytes,v.modified_at,v.observed_at,v.archive_artifact_id,v.extraction_status,v.indexing_status,v.security_status,
+    v.representation_status,v.representation_coverage,v.coverage_json,
+    wr.label AS root_label,wr.root_kind,wr.provider_transmission_allowed AS root_transmission_allowed
+    FROM workspace_resources r
+    JOIN workspace_roots wr ON wr.id=r.root_id
+    LEFT JOIN resource_versions v ON v.id=r.current_version_id
+    WHERE ${filter}
+    ORDER BY r.relative_path ASC, r.id ASC
+    LIMIT ? OFFSET ?`, ...qParams, limit, offset);
+    
+  return { items, total: totalRow.total, limit, offset };
 }
 
 export function currentWorkspaceResources(db, workspaceId, { transmissionOnly = false } = {}) {
@@ -552,6 +580,7 @@ export function reprocessResourceVersion(db, resourceId) {
     extraction.status, indexingStatus, securityStatus, extraction.status, extraction.coverage?.status || 'unknown', JSON.stringify(extraction.coverage || {}),
     JSON.stringify({ ...(JSON.parse(version.metadata_json || '{}')), ...(extraction.metadata || {}), security_findings: scan.detections, reprocessed_at: now() }), version.id);
   if (extraction.coverage?.pending_page_count > 0) createBackgroundJob(db, { workspaceId: resource.workspace_id, jobType: 'complete_pdf', targetType: 'resource_version', targetId: version.id });
+    if (extraction.coverage?.pending_ocr) createBackgroundJob(db, { workspaceId: resource.workspace_id, jobType: 'complete_image_ocr', targetType: 'resource_version', targetId: version.id });
   run(db, 'UPDATE workspace_resources SET provider_transmission_allowed=?,updated_at=? WHERE id=?',
     resource.root_transmission_allowed && !securityStatus.startsWith('local_only:') ? 1 : 0, now(), resource.id);
   const remainingBlockers = Number(row(db, `SELECT COUNT(*) AS n FROM workspace_resources r

@@ -435,6 +435,27 @@ export function ensurePdfPageRepresentation(db, { workspaceId, resourceId, page 
   }
 }
 
+
+export function representationCoverageSummary(db, workspaceId) {
+  const statsRow = row(db, `
+    SELECT 
+      COUNT(*) AS total,
+      SUM(CASE WHEN v.representation_coverage = 'complete' THEN 1 ELSE 0 END) AS complete,
+      SUM(CASE WHEN v.representation_coverage = 'partial' THEN 1 ELSE 0 END) AS partial,
+      SUM(CASE WHEN v.representation_coverage = 'blocked' THEN 1 ELSE 0 END) AS blocked
+    FROM workspace_resources r
+    JOIN resource_versions v ON v.id = r.current_version_id
+    WHERE r.workspace_id = ? AND r.status = 'active'`, workspaceId) || { total: 0, complete: 0, partial: 0, blocked: 0 };
+    
+  return {
+    status: statsRow.blocked > 0 ? 'blocked' : (statsRow.total > (statsRow.complete + (statsRow.total - statsRow.complete - statsRow.partial - statsRow.blocked))) ? 'partial' : 'complete',
+    total: Number(statsRow.total),
+    complete: Number(statsRow.complete || 0),
+    partial: Number(statsRow.partial || 0),
+    blocked: Number(statsRow.blocked || 0)
+  };
+}
+
 export function representationCoverage(db, workspaceId) {
   const items = rows(db, `SELECT r.id,r.relative_path,r.resource_type,r.current_version_id,v.representation_status,v.representation_coverage,v.coverage_json
     FROM workspace_resources r JOIN resource_versions v ON v.id=r.current_version_id WHERE r.workspace_id=? AND r.status='active' ORDER BY r.relative_path`, workspaceId)
@@ -462,6 +483,57 @@ export function currentVisualRepresentations(db, workspaceId, { kinds = ['page_i
       AND r.knowledge_status='active' AND r.provider_transmission_allowed=1 AND wr.provider_transmission_allowed=1
     ORDER BY rr.created_at DESC,rr.page_start LIMIT 500`, workspaceId, ...kinds);
 }
+export async function completeImageOcrBackground(db, versionId, progress) {
+  const current = row(db, `SELECT r.id AS resource_id, r.workspace_id, v.id AS version_id, v.sha256, v.security_status, v.coverage_json, v.metadata_json, v.archive_artifact_id, a.vault_path
+    FROM workspace_resources r JOIN resource_versions v ON v.id=r.current_version_id LEFT JOIN artifacts a ON a.id=v.archive_artifact_id
+    WHERE v.id=? AND r.status='active' AND r.resource_type='image'`, versionId);
+  if (!current?.vault_path || !fs.existsSync(current.vault_path)) throw Object.assign(new Error('immutable current image original is unavailable'), { code: 'IMAGE_ORIGINAL_UNAVAILABLE' });
+  
+  let coverage = {};
+  try { coverage = JSON.parse(current.coverage_json || '{}'); } catch {}
+  if (coverage.ocr) return { status: 'complete' };
+
+  if (progress) progress(0, 1, 'ocr');
+
+  const ocr = await runToolAsync('ocrImage', [current.vault_path]);
+  
+  let failures = [];
+  if (!ocr.ok) failures.push({ code: ocr.status?.code || 'OCR_FAILED', message: ocr.message });
+  else {
+    const storage = storageForDatabase(db);
+    const tempDir = path.join(storage.derivedDir, `process-${versionId}-${randomUUID()}`);
+    fs.mkdirSync(tempDir, { recursive: true });
+    try {
+      const visualSecurity = scanOutgoingText(ocr.text, { source: `${current.resource_id}:page:1` });
+      
+      const originalRepresentationId = row(db, `SELECT id FROM resource_representations WHERE resource_version_id=? AND representation_kind='original_visual'`, versionId)?.id;
+      if (originalRepresentationId) {
+        run(db, 'UPDATE resource_representations SET security_status=? WHERE id=?', visualSecurity.blocked ? 'blocked' : visualSecurity.redacted ? 'redact_required' : 'clear', originalRepresentationId);
+      }
+
+      const textArtifact = archiveDerivedText(db, { workspaceId: current.workspace_id, versionId, kind: 'ocr_text', page: 1, text: ocr.text, tempDir });
+      const repId = addRepresentation(db, { workspaceId: current.workspace_id, resourceId: current.resource_id, versionId, kind: 'ocr_text', page: 1, artifactId: textArtifact?.id, extractor: 'tesseract', extractorVersion: ocr.status?.version, contentSha256: sha256(ocr.text), confidence: ocr.confidence, metadata: { regions: ocr.regions, untrusted_evidence: true }, securityStatus: visualSecurity.blocked ? 'blocked' : visualSecurity.redacted ? 'redact_required' : 'clear' });
+      
+      const chunks = chunkText(ocr.text, { page: 1, sourceKind: 'ocr_text', confidence: ocr.confidence, authority: 'untrusted_derived', region: { regions: ocr.regions } }).map(chunk => ({ ...chunk, representationId: repId }));
+      appendVersionChunks(db, { workspaceId: current.workspace_id, resource: { id: current.resource_id, relative_path: '' }, version: { id: versionId }, chunks });
+    } finally {
+      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    }
+  }
+
+  const latestCoverageJson = row(db, 'SELECT coverage_json FROM resource_versions WHERE id=?', versionId)?.coverage_json || '{}';
+  let mergedCoverage = {};
+  try { mergedCoverage = JSON.parse(latestCoverageJson); } catch {}
+  mergedCoverage.status = failures.length ? 'partial' : 'complete';
+  mergedCoverage.ocr = !failures.length;
+  mergedCoverage.pending_ocr = false;
+  if (failures.length) mergedCoverage.failures = [...(mergedCoverage.failures || []), ...failures];
+  if (!failures.length && !mergedCoverage.availability_states?.includes('SEARCHABLE')) mergedCoverage.availability_states = [...(mergedCoverage.availability_states || []), 'SEARCHABLE'];
+  
+  run(db, `UPDATE resource_versions SET representation_coverage=?, coverage_json=? WHERE id=?`, mergedCoverage.status, JSON.stringify(mergedCoverage), versionId);
+  return { status: 'complete' };
+}
+
 export async function completePdfBackground(db, versionId, progress) {
   const current = row(db, `SELECT r.id AS resource_id, r.workspace_id, v.id AS version_id, v.sha256, v.security_status, v.coverage_json, v.metadata_json, v.archive_artifact_id, a.vault_path
     FROM workspace_resources r JOIN resource_versions v ON v.id=r.current_version_id LEFT JOIN artifacts a ON a.id=v.archive_artifact_id

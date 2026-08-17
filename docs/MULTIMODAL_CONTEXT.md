@@ -20,14 +20,16 @@ Kinds implemented in 0.8.0 are `original_source`, `original_visual`, `pdf_metada
 The bounded local pipeline uses Poppler and Tesseract with argument arrays and `shell: false`:
 
 1. enforce the immutable input-byte limit;
-2. inspect metadata/page count/encryption with `pdfinfo`;
-3. extract digital text one page at a time with `pdftotext`;
-4. render bounded page images at 144 DPI with `pdftoppm`;
-5. OCR each rendered page to TSV with Tesseract;
-6. extract embedded raster images with `pdfimages` where practical;
-7. archive derived artifacts content-addressed under private state;
-8. index digital/OCR chunks with version/page/region provenance;
-9. remove the processing scratch directory in a `finally` path.
+2. detect format and extract fast metadata (e.g., `pdfinfo`);
+3. enqueue a high-priority background job for heavy extraction;
+4. immediately return control to the UI/service;
+5. the background job extracts digital text one page at a time with `pdftotext`;
+6. renders bounded page images at 144 DPI with `pdftoppm`;
+7. OCRs each rendered page to TSV with Tesseract;
+8. extracts embedded raster images with `pdfimages` where practical;
+9. archives derived artifacts content-addressed under private state;
+10. indexes digital/OCR chunks with version/page/region provenance;
+11. removes the processing scratch directory in a `finally` path.
 
 Encrypted PDFs, page/input/pixel/output/time limits, missing tools, tool failures, and partial pages are explicit coverage failures. No cached older representation is substituted. PDF digital/OCR overlap is compared per page; highly overlapping OCR is retained as an auditable representation but excluded from duplicate retrieval chunks.
 

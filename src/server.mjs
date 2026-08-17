@@ -12,7 +12,7 @@ import { indexWorkspaceFile, scanWorkspaceFiles, projectFileDestination, storage
 import { captureBrowserSession as captureVerifiedBrowserSession, resolveSessionByRefs as resolveCapturedSession, validateProviderAssetUrl, workspaceHistoryCoverage } from './chat-capture.mjs';
 import { prepareManagedSend, markContextRunSent, markContextRunFailed } from './outgoing-context.mjs';
 import { workspaceIntegrity, markWorkspaceStale } from './freshness.mjs';
-import { currentWorkspaceResources, reconcileWorkspaceResources, reprocessResourceVersion, ingestProviderArtifactResource, saveResourceCopyToProjectFolder, updateResourceContextPolicy } from './resources.mjs';
+import { currentWorkspaceResources, getWorkspaceResourcesPage, reconcileWorkspaceResources, reprocessResourceVersion, ingestProviderArtifactResource, saveResourceCopyToProjectFolder, updateResourceContextPolicy } from './resources.mjs';
 import { createPairingChallenge, completePairing, authenticateCompanionRequest, ensureInstallCredential, isSameOriginDashboardRequest, pairedCompanionStatus } from './security/companion-auth.mjs';
 import { pendingManagedWorkspaceMigrations, migrateManagedWorkspaceProject } from './workspace-migration.mjs';
 import { isPathWithin, resolveApprovedTarget } from './security/paths.mjs';
@@ -313,18 +313,21 @@ function getSettings() {
 function workspaceSummary(id) {
   const workspace = row(db, `SELECT * FROM workspaces WHERE id=? AND lifecycle_status='active'`, id);
   if (!workspace) return null;
-  const projectFiles = rows(db, 'SELECT * FROM workspace_files WHERE workspace_id = ? ORDER BY relative_path', id);
+  const fileCount = Number(row(db, 'SELECT COUNT(*) AS total FROM workspace_files WHERE workspace_id = ?', id)?.total || 0);
+    const projectFilesPreview = rows(db, 'SELECT * FROM workspace_files WHERE workspace_id = ? ORDER BY relative_path LIMIT 50', id);
   return {
     ...workspace,
     roots: workspaceRoots(db, id),
     integrity: workspaceIntegrity(db, id),
-    representation_coverage: representationCoverage(db, id),
+    representation_coverage: representationCoverageSummary(db, id),
     instruction_context: instructionContext(db, id),
-    resources: currentWorkspaceResources(db, id).slice(0, 100),
+    resources: getWorkspaceResourcesPage(db, id, { limit: 100 }).items,
+      resource_count: getWorkspaceResourcesPage(db, id, { limit: 1 }).total,
     providers: rows(db, 'SELECT * FROM provider_links WHERE workspace_id = ? ORDER BY provider', id),
     sessions: rows(db, 'SELECT * FROM sessions WHERE workspace_id = ? ORDER BY started_at DESC LIMIT 100', id),
     memories: rows(db, `SELECT * FROM memories WHERE (workspace_id = ? OR scope = 'global') AND status = 'active' ORDER BY scope, updated_at DESC`, id),
-    files: projectFiles,
+    files: projectFilesPreview,
+      file_count: fileCount,
     artifacts: rows(db, 'SELECT id,name,mime_type,size_bytes,sha256,artifact_type,provider,source_url,created_at FROM artifacts WHERE workspace_id = ? ORDER BY created_at DESC LIMIT 300', id),
     learning: rows(db, 'SELECT * FROM learning_items WHERE workspace_id = ? ORDER BY updated_at DESC', id),
     development: rows(db, 'SELECT * FROM development_items WHERE workspace_id = ? ORDER BY updated_at DESC', id),
@@ -739,7 +742,7 @@ async function handleApi(req, res, url) {
         return sendJson(res, 412, { ok: false, freshness: 'blocked', reasons: (capabilities.failures || []).map(item => ({ code: item.code || 'PROVIDER_CAPABILITY_FAILED', message: `required provider capability failed: ${item.capability || 'unknown'}` })) });
       }
       if (capabilities.surface_id !== body.surface_id) return sendJson(res, 409, { ok: false, freshness: 'blocked', reasons: [{ code: 'SURFACE_CAPABILITY_MISMATCH', message: 'surface identity and capability evidence do not match' }] });
-      const result = prepareManagedSend(db, {
+      const result = await prepareManagedSend(db, {
         workspaceId: prepareSendMatch[1],
         provider: body.provider,
         userPrompt: body.user_prompt,

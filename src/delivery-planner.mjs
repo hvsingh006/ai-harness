@@ -1,5 +1,5 @@
 import { rows } from './db.mjs';
-import { currentVisualRepresentations, ensurePdfPageRepresentation } from './multimodal.mjs';
+import { currentVisualRepresentations, ensurePdfPageRepresentationAsync } from './multimodal.mjs';
 import { surfaceRegistry } from './surface-registry.mjs';
 
 function queryTerms(query) {
@@ -38,7 +38,7 @@ function pathScore(relativePath, terms) {
   return terms.reduce((score, term) => score + (lower.includes(term) ? 15 : 0), 0);
 }
 
-export function planContextDelivery(db, { workspaceId, query, surfaceId, retrieval, registry = surfaceRegistry }) {
+export async function planContextDelivery(db, { workspaceId, query, surfaceId, retrieval, registry = surfaceRegistry }) {
   const surface = registry.resolve(surfaceId);
   const terms = queryTerms(query);
   const requestedPage = requestedPageNumber(query);
@@ -55,7 +55,7 @@ export function planContextDelivery(db, { workspaceId, query, surfaceId, retriev
       .filter(item => item.relevance > 0)
       .sort((a, b) => b.relevance - a.relevance || String(b.last_captured_at || b.observed_at || '').localeCompare(String(a.last_captured_at || a.observed_at || '')));
     if (pdfCandidates[0]) {
-      const materialized = ensurePdfPageRepresentation(db, { workspaceId, resourceId: pdfCandidates[0].id, page: requestedPage });
+      const materialized = await ensurePdfPageRepresentationAsync(db, { workspaceId, resourceId: pdfCandidates[0].id, page: requestedPage });
       if (!materialized.ok) pageMaterializationFailure = { code: materialized.code || 'VISUAL_PAGE_NOT_READY', page: requestedPage, resource_id: pdfCandidates[0].id, message: materialized.message || `page ${requestedPage} could not be prepared safely` };
     }
   }

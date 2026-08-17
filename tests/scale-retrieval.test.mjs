@@ -65,7 +65,7 @@ test('large cold corpus retrieval and warm prompt kickoff stay bounded and avoid
   assert.ok(retrieval.candidate_count < 400, `candidate generation should remain bounded, got ${retrieval.candidate_count}`);
   assert.ok(retrieval.used_characters <= 18000);
 
-  const prepared = prepareManagedSend(db, {
+  const prepared = await prepareManagedSend(db, {
     workspaceId: 'ws-harness', provider: 'chatgpt', surfaceId: 'chatgpt.web', userPrompt: 'What should I work on next? Include NEEDLE_SCALE_2377.',
     capture: completeCapture('scale-live'), attemptId: 'scale-kickoff', providerRoute: 'https://chatgpt.com/c/scale-live', protocolVersion: 4
   });

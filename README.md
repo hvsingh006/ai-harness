@@ -93,3 +93,8 @@ npm run dev:status
 Use `update-and-launch-harness.cmd` for the fail-closed update flow: inspect the worktree, back up private metadata, fetch/fast-forward only, validate, roll source back on failure, and restart the same canonical checkout. It never creates a duplicate installed source tree.
 
 See `docs/ARCHITECTURE.md`, `docs/MULTIMODAL_CONTEXT.md`, `docs/ADAPTER_ARCHITECTURE.md`, `docs/INSTRUCTIONS_AND_PERSONALIZATION.md`, `docs/STORAGE.md`, `docs/PROJECT_SPACE.md`, `docs/TESTING.md`, and `docs/ROADMAP.md`.
+ 
+ # #   0 . 8 . 0   R e l e a s e   N o t e s  
+ -   H e a v y   m u l t i m o d a l   e x t r a c t i o n   ( P D F   r e n d e r i n g ,   i m a g e   O C R )   i s   f u l l y   a s y n c h r o n o u s ,   p r e v e n t i n g   e v e n t - l o o p   f r e e z e s .  
+ -   T r u e   S Q L   p a g i n a t i o n   e n s u r e s   r e s p o n s i v e   U I   e v e n   w i t h   l a r g e   ( e . g .   1 0 0 , 0 0 0 +   f i l e s )   w o r k s p a c e s .  
+ 
