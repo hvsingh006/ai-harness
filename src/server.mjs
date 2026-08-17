@@ -18,7 +18,7 @@ import { pendingManagedWorkspaceMigrations, migrateManagedWorkspaceProject } fro
 import { isPathWithin, resolveApprovedTarget } from './security/paths.mjs';
 import { inspectSafeUpdate } from './update-safety.mjs';
 import { agentCapabilities, launchRegisteredAgent } from './agent-launcher.mjs';
-import { representationCoverage, completePdfBackground } from './multimodal.mjs';
+import { representationCoverage, representationCoverageSummary, completePdfBackground } from './multimodal.mjs';
 import { multimodalToolStatus } from './tooling.mjs';
 import { surfaceRegistry, browserSurfaceForProvider, publicSurfaceStatus } from './surface-registry.mjs';
 import { activeProjectInstructions, activePersonalization, saveProjectInstructions, savePersonalization, instructionContext, instructionHistory } from './instructions.mjs';

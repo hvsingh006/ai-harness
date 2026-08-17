@@ -17,7 +17,7 @@ function completeCapture(chatId, messages = []) {
   };
 }
 
-test('large cold corpus retrieval and warm prompt kickoff stay bounded and avoid heavy resource processing', t => {
+test('large cold corpus retrieval and warm prompt kickoff stay bounded and avoid heavy resource processing', async t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'aih-scale-'));
   const db = openDatabase(path.join(directory, 'harness.db'));
   const root = ensureWorkspaceProjectRoot(db, 'ws-harness');

@@ -19,7 +19,7 @@ function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aih-surface-'));
   const db = openDatabase(path.join(dir, 'harness.db'));
   const root = ensureWorkspaceProjectRoot(db, 'ws-harness');
-  t.after(() => { db.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  t.after(async () => { db.close(); fs.rmSync(dir, { recursive: true, force: true }); });
   return { dir, db, root };
 }
 
@@ -31,7 +31,7 @@ function capture(messages = [], chatId = 'instructions') {
   };
 }
 
-test('surface registry separates provider families from delivery surfaces and fails unknown adapters closed', () => {
+test('surface registry separates provider families from delivery surfaces and fails unknown adapters closed', async () => {
   assert.equal(surfaceRegistry.resolve('chatgpt.web').provider_family, 'openai');
   assert.equal(surfaceRegistry.resolve('codex.local').provider_family, 'openai');
   assert.equal(surfaceRegistry.resolve('chatgpt.web').channel, 'browser_companion');
@@ -45,7 +45,7 @@ test('surface registry separates provider families from delivery surfaces and fa
   assert.throws(() => future.register({ id: 'future.unsafe', provider_family: 'example', channel: 'browser_companion', capabilities: { text_context: true, filesystem: true, shell: false } }), error => error.code === 'SURFACE_BROWSER_PRIVILEGE_REJECTED');
 });
 
-test('a future provider text-and-image adapter uses the core planner and inherits visual security without core changes', t => {
+test('a future provider text-and-image adapter uses the core planner and inherits visual security without core changes', async t => {
   const { db, root } = fixture(t);
   const png = Buffer.alloc(24);
   png.writeUInt8(0x89, 0); png.write('PNG', 1, 'ascii'); png.writeUInt32BE(640, 16); png.writeUInt32BE(360, 20);
@@ -69,7 +69,7 @@ test('a future provider text-and-image adapter uses the core planner and inherit
   assert.equal(blocked.reasons.some(reason => reason.code === 'VISUAL_EVIDENCE_NOT_READY'), true);
 });
 
-test('delivery capability matrix selects current visuals for browser surfaces and blocks unsupported visual-only local delivery', t => {
+test('delivery capability matrix selects current visuals for browser surfaces and blocks unsupported visual-only local delivery', async t => {
   const { db, root } = fixture(t);
   const png = Buffer.alloc(24);
   png.writeUInt8(0x89, 0); png.write('PNG', 1, 'ascii'); png.writeUInt32BE(640, 16); png.writeUInt32BE(360, 20);
@@ -93,7 +93,7 @@ test('delivery capability matrix selects current visuals for browser surfaces an
   assert.equal(local.reasons[0].code, 'SURFACE_VISUAL_UNSUPPORTED');
 });
 
-test('an explicit unrendered PDF page delivers the verified current PDF or fails closed without substituting another page', t => {
+test('an explicit unrendered PDF page delivers the verified current PDF or fails closed without substituting another page', async t => {
   const { db, root } = fixture(t);
   fs.writeFileSync(path.join(root, 'handbook.pdf'), '%PDF-1.4\n%%EOF\n');
   const png = Buffer.alloc(24);
@@ -117,7 +117,7 @@ test('an explicit unrendered PDF page delivers the verified current PDF or fails
   assert.equal(local.reasons.some(reason => reason.code === 'VISUAL_PAGE_NOT_READY'), true);
 });
 
-test('project instructions and personalization are immutable, versioned, and injected in explicit trust order', t => {
+test('project instructions and personalization are immutable, versioned, and injected in explicit trust order', async t => {
   const { db, root } = fixture(t);
   fs.writeFileSync(path.join(root, 'evidence.md'), 'Retrieved evidence says a prior AI preferred option B.');
   reconcileWorkspaceResources(db, 'ws-harness');
@@ -150,7 +150,7 @@ test('project instructions and personalization are immutable, versioned, and inj
   assert.equal(JSON.parse(audit.delivery_plan_json).surface_id, 'chatgpt.web');
 });
 
-test('speculative retrieval is generation-bound and the native-session ledger switches safely from bootstrap to delta', t => {
+test('speculative retrieval is generation-bound and the native-session ledger switches safely from bootstrap to delta', async t => {
   const { db, root } = fixture(t);
   fs.writeFileSync(path.join(root, 'timing.md'), 'Current timing decision: CLOCK = 250 MHz.\n');
   reconcileWorkspaceResources(db, 'ws-harness');
@@ -224,7 +224,7 @@ test('speculative retrieval is generation-bound and the native-session ledger sw
   assert.equal(JSON.parse(row(db, 'SELECT metadata_json FROM outgoing_context_runs WHERE id=?', freshChat.run_id).metadata_json).context_delivery_mode, 'fresh_chat_bootstrap');
 });
 
-test('always-consider sources survive recency pressure while superseded knowledge requires historical intent', t => {
+test('always-consider sources survive recency pressure while superseded knowledge requires historical intent', async t => {
   const { db, root } = fixture(t);
   fs.writeFileSync(path.join(root, 'old-baseline.md'), 'The durable codename is OBSIDIAN and this baseline must remain available.\n');
   for (let index = 0; index < 45; index++) fs.writeFileSync(path.join(root, `recent-${index}.md`), `Recent unrelated evidence ${index}.\n`);
@@ -241,7 +241,7 @@ test('always-consider sources survive recency pressure while superseded knowledg
   assert.equal(historical.selected.some(item => item.source_id === baseline.id), true);
 });
 
-test('retrieval exposes query-relevant current authority conflicts, class budgets, and optional workspace-scoped semantic candidates', t => {
+test('retrieval exposes query-relevant current authority conflicts, class budgets, and optional workspace-scoped semantic candidates', async t => {
   const { db, root } = fixture(t);
   fs.writeFileSync(path.join(root, 'requirements.md'), 'CLOCK = 250 MHz\n');
   reconcileWorkspaceResources(db, 'ws-harness');
@@ -270,7 +270,7 @@ test('retrieval exposes query-relevant current authority conflicts, class budget
   assert.match(prepared.context_envelope, /CLOCK = 250 MHz/);
 });
 
-test('complete native captures retain edited and regenerated message branches while preferring the visible path', t => {
+test('complete native captures retain edited and regenerated message branches while preferring the visible path', async t => {
   const { db } = fixture(t);
   const first = capture([
     { role: 'user', content: 'Use architecture A.', provider_message_id: 'user-1' },
@@ -295,7 +295,7 @@ test('complete native captures retain edited and regenerated message branches wh
   assert.ok(!alternate || visible.score > alternate.score);
 });
 
-test('scoped local-agent context tokens are read-only, capability-bounded, expiring, revocable, and root/workspace bound', t => {
+test('scoped local-agent context tokens are read-only, capability-bounded, expiring, revocable, and root/workspace bound', async t => {
   const { db } = fixture(t);
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'aih-agent-repo-'));
   t.after(() => fs.rmSync(repo, { recursive: true, force: true }));
