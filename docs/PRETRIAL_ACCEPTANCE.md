@@ -9,6 +9,8 @@ This document is the acceptance gate for the local pre-trial hardening pass. It 
 - The companion does not record `sent` after clicking a native control. It waits for strong or corroborated provider-acceptance evidence and the service re-verifies disk and repository state before acknowledging delivery.
 - A service restart converts abandoned prepared transactions to an auditable error. It never promotes them to sent.
 - Original messages, resource versions, and captured provider assets are retained. Indexes, working state, and outgoing context are derived and rebuildable.
+- User-selected native attachments and clipboard images must be durably archived before managed replay. Observed references without bytes keep preservation/history partial and are never described as preserved.
+- Guaranteed sends use a double-inventory persisted-manifest barrier and hash every candidate delta; explicit full-integrity verification rehashes the whole corpus. Speculative retrieval never replaces that barrier.
 - Browser integration can call only an explicit companion API allowlist. It has no filesystem path API, shell API, Git API, credential API, generic URL proxy, or local-agent launcher.
 - Local coding-agent launch is dashboard-only and accepts only a Project Space workspace ID, a registered repository-root ID, and the fixed `codex` or `antigravity` identifier.
 
@@ -34,15 +36,30 @@ The automated suite covers:
 8. Every managed-send transaction state: `IDLE`, `PREPARING`, `PREPARED`, `ATTACHING`, `REPLAYING`, `WAITING_FOR_PROVIDER_ACCEPT`, `DONE`, and `ERROR`.
 9. Exact attempt/prompt/route/protocol binding, uncertain acceptance rejection, successful strong acceptance, crash recovery, and outgoing provenance audit.
 10. Provider asset URL scheme/origin restrictions and explicit lifecycle states: `DISCOVERED`, `FETCHING`, `CAPTURED`, `UNAVAILABLE`, `AUTH_REQUIRED`, `CORS_BLOCKED`, `EXPIRED`, and `FAILED`.
-11. PDF fail-closed behavior, retry of an unchanged failed version when `pdftotext` becomes available, input/output bounds, and extractor diagnostics. The retry test skips when the test process genuinely cannot execute `pdftotext`.
+11. PDF fail-closed behavior, retry/rebuild, input/page/pixel/output/time bounds, and per-tool diagnostics.
 12. Office formats as explicit immutable attachment-only resources. AI Harness does not pretend that OOXML text extraction succeeded.
-13. Safe update classification using temporary Git repositories for equal, behind, dirty, feature branch, ahead, diverged, and missing-remote states; the updater also has static assertions for backup, tests, doctor, development status, fast-forward-only behavior, and absence of hard-reset rollback.
-14. Registered-repository-only Codex/Antigravity resolution and fixed tool capability reporting.
-15. Real local HTTP integration for pairing, capture, cross-provider retrieval, prepare-send, provider-acceptance acknowledgement, current attachment release, unauthenticated rejection, and required-root failure.
+13. Real hybrid/scanned PDF metadata, digital text, page images, embedded images, OCR, deduplication, version/page/region provenance, and scratch cleanup.
+14. OCR prompt-injection evidence and OCR secret scanning/local-only enforcement.
+15. Protocol-4 provider-neutral surface registry, capability matrix, unknown/future adapter contracts, and query-specific visual/file planning.
+16. Versioned instructions/personalization trust order and outgoing audit binding.
+17. Scoped local-agent status/query/sources/resource/visual capabilities, hashed token, expiry/revocation, and no database import.
+18. UI APIs for resources, jobs, coverage, instructions, personalization, security, backup, and diagnostics; no generic command/path API.
+19. Safe update classification using temporary Git repositories for equal, behind, dirty, feature branch, ahead, diverged, and missing-remote states; the updater also has static assertions for backup, tests, doctor, development status, fast-forward-only behavior, and absence of hard-reset rollback.
+20. Registered-repository-only Codex/Antigravity resolution and fixed tool capability reporting.
+21. Real local HTTP integration for pairing, capture, cross-provider retrieval, prepare-send, provider-acceptance acknowledgement, current attachment release, unauthenticated rejection, and required-root failure.
+22. Direct native-input descriptor/byte capture, clipboard OCR cross-provider continuity, late provider-message provenance backfill, exact approved-root reconciliation, ambiguous non-merge, and exact save-copy export.
+23. Warm manifest verification with zero unchanged hashes/processes, one-edit/one-hash delta, generation-bound speculative retrieval, bounded session deltas/rebootstrap, and cache invalidation for file/chat/instruction/policy/surface changes.
+24. Always-consider retrieval under recency pressure, superseded knowledge exclusion/historical recovery, context-critical fail-closed readiness, high-confidence rename continuity, and bounded/recoverable/cancellable job queues.
+25. Edited/regenerated provider message revisions with visible/alternate path provenance, current repository branch/HEAD/dirty working-set evidence, deterministic high-authority conflict notices, class-balanced retrieval budgets, and optional semantic candidates that reject cross-workspace results.
+26. Same-origin protection for the shutdown lifecycle, UI-safe Project Space tracking removal that preserves live files/archive, instruction/personalization history inspection, retained-storage breakdown, and job cancellation controls.
+
+## UI-only normal-use acceptance scenario
+
+After installation, a normal user can perform the following without a terminal: launch Harness; create/select or safely remove tracking for a Project Space without deleting its files/archive; choose and review a detected repository through the native folder picker; add PDF/image/files through Project Space; configure Project Instructions and global/project personalization and inspect their prior versions; verify current sources; pair/revoke the browser companion; open ChatGPT, Gemini, Codex, or installed Antigravity; inspect exact outgoing context/provenance; review resource versions/representation coverage and retained-storage classes; retry/cancel failed or running processing, or rebuild stale derived data; run diagnostics; create a backup; inspect/update root policy; inspect update eligibility; run safe Update & Restart when eligible; and recover a blocked source with the displayed retry/policy actions. The dashboard exposes fixed actions and typed identifiers—never a generic command runner or browser-companion path capability.
 
 ## Provider capability contract
 
-The service and extension use companion protocol version 3. Readiness is false when the versions differ or the provider adapter reports an unhealthy capability.
+The service and extension use companion protocol version 4. Readiness is false when the versions differ or the provider adapter reports an unhealthy capability.
 
 Each provider adapter reports:
 
@@ -69,13 +86,16 @@ Prepared native attachments are selected by current resource/version ID. Before 
 
 If automatic attachment fails, the companion exposes a one-click fallback. That fallback performs a new prepare and retrieves the current approved version; it does not ask the user to browse for a file. Its outgoing audit records `attachment_mode=fallback`, the failed source run, the previously requested version IDs, and the newly verified current versions, so a stale version cannot be silently reused.
 
+User-selected file input, drag/drop, and clipboard bytes are captured in the page while they are available, registered as `direct_input`, and uploaded only against an authenticated server-issued asset descriptor with an empty source URL and a 25 MiB bound. The managed send fails before preparation if any required user input remains unpreserved. After provider acceptance assigns a message ID, the association is backfilled into the resource and relationship audit.
+
 Provider-generated assets are discovered in the conversation DOM and assigned local asset IDs. Before any provider request, the background obtains an authenticated server-issued descriptor for that exact discovered asset and fetches the stored URL rather than a message-supplied URL. HTTPS assets use the signed-in provider session and a 100 MiB bound. Provider-origin `blob:` assets use a separate page-byte path capped at 25 MiB. The service checks provider origin, capture strategy, exact source equality, authentication, expected MIME, byte limits, and immutable archival. It is not a general URL fetch service.
 
 ## Resource capabilities and bounds
 
 - Text/code: UTF-8 validation, 8 MiB extraction limit, bounded chunks.
-- PDF: 100 MiB input limit, 32 MiB extracted-output buffer, 30-second extractor timeout, fail closed when extraction is required.
-- Images: immutable bytes plus safe PNG/GIF/JPEG dimensions where available; no OCR claim.
+- PDF: 200 MiB immutable-input limit, 5,000-page metadata/admission limit, 144-DPI rendering, 45-million-pixel per-page/600-million-pixel aggregate limits, 64 MiB tool-output bounds, 60-second per-tool baseline timeout, and explicit blocked/partial coverage. PDFs over 80 pages receive an initial bounded 24-page representation pass. An explicit later page request materializes that exact current page on demand from the immutable original, performs OCR-based secret analysis, and either delivers the verified page or fails closed. An unrelated partial/failed heavy document does not block an ordinary verified text turn; marking it Context Critical restores whole-resource fail-closed behavior.
+- PNG/JPEG/WebP: 200 MiB immutable-input limit plus original visual and bounded Tesseract OCR/region/confidence where supported by the installed Leptonica build; coverage is explicit and OCR is untrusted evidence.
+- PDFs: immutable original, metadata, per-page digital text, rendered pages, embedded images where practical, OCR, and page/region provenance.
 - DOCX/PPTX/XLSX and legacy Office: immutable, current, provider-native attachment-only. No extraction claim.
 - Prepared browser attachment transfer: 25 MiB companion transfer limit.
 - Provider asset capture: 100 MiB limit and constrained MIME families.
@@ -89,7 +109,7 @@ The dashboard displays running source, application/protocol version, branch, HEA
 
 ## Service and recovery behavior
 
-The launcher starts the localhost service hidden and stores logs under the private Runtime directory; the dashboard may be closed after launch. It refuses to silently coexist with a different source tree on port 4317. Watchers debounce changes, mark Project state stale immediately, recover missing watchers periodically, and are closed during shutdown. Shutdown checkpoints SQLite. Content-addressed vault writes use temporary files and atomic rename. SQLite backup uses checkpoint, `VACUUM INTO`, an integrity check, and a SHA-256 manifest.
+The launcher starts the localhost service hidden and stores logs under the private Runtime directory; the dashboard may be closed after launch. It refuses to silently coexist with a different source tree on port 4317. Watchers debounce changes, mark Project state stale immediately, queue priority-bounded verification, recover missing watchers periodically, and are closed during shutdown. Queued/running fixed jobs recover safely after a service restart; queued jobs can be cancelled and admission fails closed under backpressure. Shutdown checkpoints SQLite. Content-addressed vault writes use temporary files and atomic rename. SQLite backup uses checkpoint, `VACUUM INTO`, an integrity check, and a SHA-256 manifest.
 
 ## External compatibility validation still required
 

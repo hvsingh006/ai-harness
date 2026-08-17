@@ -1,7 +1,7 @@
 (() => {
   const AUTO_CAPTURE_INTERVAL_MS = 15000;
   const COMPANION_VERSION = chrome.runtime.getManifest().version;
-  const PROTOCOL_VERSION = 3;
+  const PROTOCOL_VERSION = 4;
   const transactionModel = globalThis.AIH_SEND_TRANSACTION;
   const SEND_STATES = transactionModel?.STATES;
   const provider = location.hostname === 'chatgpt.com' ? 'chatgpt' : location.hostname === 'gemini.google.com' ? 'gemini' : '';
@@ -22,6 +22,12 @@
   let pendingAttachmentFallback = null;
   let pendingIdentityUsed = false;
   let associationConfirmed = false;
+  let harnessAttachmentInjection = false;
+  const nativeInputAssets = new Map();
+  const nativeInputReadTasks = new Set();
+  const recentNativeFileEvents = new Map();
+  let draftTimer = null;
+  let lastDraftHash = '';
 
   function moveSendState(next) {
     if (sendAttempt?.transaction && sendAttempt.transaction.state !== next) sendAttempt.transaction.transition(next);
@@ -82,23 +88,65 @@
   }
 
   function captureAssets() {
-    const assets = [];
+    const assets = [...nativeInputAssets.values()].map(item => ({ ...item.descriptor }));
     const seen = new Set();
     const filePattern = /\.(pdf|docx?|xlsx?|pptx?|csv|txt|md|zip|png|jpe?g|webp|gif)(?:[?#]|$)/i;
     for (const anchor of document.querySelectorAll('a[href]')) {
       const url = anchor.href;
+      const context = adapter.messageContext(anchor);
       const providerFileEvidence = anchor.hasAttribute('download') || /file|download|attachment/i.test(anchor.getAttribute('aria-label') || '') || Boolean(anchor.closest?.('[data-testid*="file"], [data-testid*="attachment"], [class*="attachment"]'));
-      if (!url || seen.has(url) || !providerFileEvidence || (!filePattern.test(url) && !anchor.hasAttribute('download'))) continue;
+      if (!context || !url || seen.has(url) || !providerFileEvidence || (!filePattern.test(url) && !anchor.hasAttribute('download'))) continue;
       seen.add(url);
-      assets.push({ asset_type: 'file', name: (anchor.getAttribute('download') || anchor.textContent?.trim() || 'linked asset').slice(0, 240), url, native_id: anchor.dataset?.id || '' });
+      assets.push({ asset_type: 'file', name: (anchor.getAttribute('download') || anchor.textContent?.trim() || 'linked asset').slice(0, 240), url,
+        native_id: anchor.dataset?.id || `${context.provider_message_id}:${url}`, origin_kind: context.role === 'user' ? 'user_input' : 'provider_output',
+        originating_provider_message_id: context.provider_message_id, capture_method: String(url).startsWith('blob:') ? 'page_blob' : 'history_dom' });
     }
     for (const image of document.querySelectorAll('main img[src], [role="main"] img[src]')) {
       const url = image.currentSrc || image.src;
-      if (!url || url.startsWith('data:') || seen.has(url) || (image.naturalWidth && image.naturalWidth < 120 && image.naturalHeight < 120)) continue;
+      const context = adapter.messageContext(image);
+      if (!context || !url || url.startsWith('data:') || seen.has(url) || (image.naturalWidth && image.naturalWidth < 120 && image.naturalHeight < 120)) continue;
       seen.add(url);
-      assets.push({ asset_type: 'image', name: image.alt || 'conversation image', url, mime_type: 'image/*' });
+      assets.push({ asset_type: 'image', name: image.alt || 'conversation image', url, mime_type: 'image/*',
+        native_id: `${context.provider_message_id}:${url}`, origin_kind: context.role === 'user' ? 'user_input' : 'provider_output',
+        originating_provider_message_id: context.provider_message_id, capture_method: String(url).startsWith('blob:') ? 'page_blob' : 'history_dom' });
     }
     return assets;
+  }
+
+  async function stageNativeInputFile(file, captureMethod) {
+    if (!file || harnessAttachmentInjection) return;
+    const eventKey = `${file.name || ''}\0${file.type || ''}\0${Number(file.size || 0)}\0${Number(file.lastModified || 0)}`;
+    const previousEvent = recentNativeFileEvents.get(eventKey) || 0;
+    if (Date.now() - previousEvent < 2000) return;
+    recentNativeFileEvents.set(eventKey, Date.now());
+    const nativeId = `native-input-${crypto.randomUUID()}`;
+    const item = {
+      descriptor: {
+        asset_type: String(file.type || '').startsWith('image/') ? 'image' : 'file',
+        name: String(file.name || (captureMethod === 'clipboard_image' ? 'clipboard-image.png' : 'native-input')).slice(0, 240),
+        url: '',
+        native_id: nativeId,
+        mime_type: String(file.type || 'application/octet-stream').slice(0, 200),
+        origin_kind: 'user_input',
+        capture_method: captureMethod,
+        metadata: { size_bytes: Number(file.size || 0), last_modified: Number(file.lastModified || 0), captured_from_composer: true }
+      },
+      data_base64: '',
+      state: 'reading',
+      error: ''
+    };
+    nativeInputAssets.set(nativeId, item);
+    const task = (async () => {
+      if (Number(file.size || 0) > 25 * 1024 * 1024) throw new Error('native input asset exceeds the 25 MiB durable capture limit');
+      item.data_base64 = encodeAssetBytes(await file.arrayBuffer());
+      item.state = 'pending';
+    })().catch(error => {
+      item.state = 'failed';
+      item.error = error.message;
+      item.descriptor.metadata.capture_error = error.message;
+    }).finally(() => nativeInputReadTasks.delete(task));
+    nativeInputReadTasks.add(task);
+    return task;
   }
 
   async function visibleEvidence({ complete = false } = {}) {
@@ -174,11 +222,29 @@
     catch { return null; }
   }
 
+  function prewarmProject() {
+    if (!workspace?.id || !associationConfirmed) return Promise.resolve(null);
+    return request(`/companion/workspaces/${encodeURIComponent(workspace.id)}/prewarm`, { method: 'POST', body: { provider, surface_id: adapter.surfaceId, session_id: boundSession?.id || '' } }).catch(() => null);
+  }
+
+  function scheduleDraftRetrieval() {
+    clearTimeout(draftTimer);
+    if (!workspace?.id || !associationConfirmed || sendState !== SEND_STATES.IDLE) return;
+    draftTimer = setTimeout(async () => {
+      const draft = adapter.composerText(adapter.findComposer()).trim();
+      if (draft.length < 3) return;
+      const draftHash = await sha256(draft);
+      if (draftHash === lastDraftHash) return;
+      lastDraftHash = draftHash;
+      await request(`/companion/workspaces/${encodeURIComponent(workspace.id)}/draft-context`, { method: 'POST', body: { provider, surface_id: adapter.surfaceId, session_id: boundSession?.id || '', query: draft, query_hash: draftHash } }).catch(() => {});
+    }, 800);
+  }
+
   async function captureCurrent({ force = false, complete = false } = {}) {
     if (captureInFlight || !workspace || !associationConfirmed) return null;
     const messages = captureMessages();
     const assets = captureAssets();
-    const fingerprint = `${location.href}|${messages.length}|${assets.length}|${messages.slice(-3).map(item => item.content).join('|')}`;
+    const fingerprint = `${location.href}|${messages.length}|${assets.length}|${[...nativeInputAssets.values()].map(item => item.state).join(',')}|${messages.slice(-3).map(item => item.content).join('|')}`;
     if (!force && (!messages.length || fingerprint === lastFingerprint)) return null;
     captureInFlight = true;
     try {
@@ -186,6 +252,12 @@
       for (const asset of result.asset_refs || []) {
         if (String(asset.mirror_status).toUpperCase() !== 'DISCOVERED' || !asset.source_url) continue;
         mirrorDiscoveredAsset(asset).catch(() => {});
+      }
+      for (const asset of result.asset_refs || []) {
+        let metadata = {};
+        try { metadata = JSON.parse(asset.metadata_json || '{}'); } catch {}
+        if (String(asset.mirror_status).toUpperCase() !== 'DISCOVERED' || metadata.capture_strategy !== 'direct_input') continue;
+        await mirrorDiscoveredAsset(asset);
       }
       lastFingerprint = fingerprint;
       boundSession = result.session;
@@ -234,6 +306,21 @@
   }
 
   async function mirrorDiscoveredAsset(asset) {
+    let metadata = {};
+    try { metadata = JSON.parse(asset.metadata_json || '{}'); } catch {}
+    if (metadata.capture_strategy === 'direct_input') {
+      const input = nativeInputAssets.get(asset.native_id);
+      if (!input) throw new Error('native input bytes are no longer available in the composer capture buffer');
+      if (input.state === 'failed' || !input.data_base64) {
+        await request(`/companion/session-assets/${encodeURIComponent(asset.id)}/status`, { method: 'POST', body: { status: 'FAILED', message: input.error || 'native input bytes unavailable' } }).catch(() => {});
+        throw new Error(input.error || 'native input bytes unavailable');
+      }
+      const result = await chrome.runtime.sendMessage({ type: 'aih-mirror-input-bytes', asset_id: asset.id, provider, mime_type: input.descriptor.mime_type, data_base64: input.data_base64 });
+      if (result?.error) throw new Error(result.error);
+      input.state = 'captured';
+      input.data_base64 = '';
+      return result;
+    }
     if (!String(asset.source_url).startsWith('blob:')) {
       return chrome.runtime.sendMessage({ type: 'aih-mirror-asset', asset_id: asset.id, provider });
     }
@@ -252,14 +339,25 @@
   }
 
   async function attachPreparedFiles(attachments, attempt) {
-    for (const attachment of attachments || []) {
-      if (attempt.invalidated) throw Object.assign(new Error('prompt or provider route changed during attachment preparation'), { code: 'PREPARED_CONTEXT_INVALIDATED' });
-      const result = await chrome.runtime.sendMessage({ type: 'aih-resource-request', path: attachment.download_path });
-      if (!result?.ok) throw new Error(result?.error || `Could not load current attachment ${attachment.name}`);
-      const file = new File([decodeAttachment(result.data_base64, attachment.mime_type)], attachment.name, { type: attachment.mime_type, lastModified: Date.now() });
-      const attached = await adapter.attachFile(file);
-      if (!attached.ok) throw Object.assign(new Error(`${attachment.name}: ${attached.reason}`), { code: attached.code || 'ATTACHMENT_PREP_FAILED' });
-    }
+    harnessAttachmentInjection = true;
+    try {
+      for (const attachment of attachments || []) {
+        if (attempt.invalidated) throw Object.assign(new Error('prompt or provider route changed during attachment preparation'), { code: 'PREPARED_CONTEXT_INVALIDATED' });
+        const result = await chrome.runtime.sendMessage({ type: 'aih-resource-request', path: attachment.download_path });
+        if (!result?.ok) throw new Error(result?.error || `Could not load current attachment ${attachment.name}`);
+        const file = new File([decodeAttachment(result.data_base64, attachment.mime_type)], attachment.name, { type: attachment.mime_type, lastModified: Date.now() });
+        const attached = await adapter.attachFile(file);
+        if (!attached.ok) throw Object.assign(new Error(`${attachment.name}: ${attached.reason}`), { code: attached.code || 'ATTACHMENT_PREP_FAILED' });
+      }
+    } finally { harnessAttachmentInjection = false; }
+  }
+
+  async function preservePendingNativeInputs() {
+    if (nativeInputReadTasks.size) await Promise.allSettled([...nativeInputReadTasks]);
+    if (![...nativeInputAssets.values()].some(item => item.state !== 'captured')) return;
+    await captureCurrent({ force: true });
+    const incomplete = [...nativeInputAssets.values()].filter(item => item.state !== 'captured');
+    if (incomplete.length) throw Object.assign(new Error(`durable capture failed for ${incomplete.map(item => item.descriptor.name).join(', ')}`), { code: 'USER_INPUT_ASSET_CAPTURE_INCOMPLETE' });
   }
 
   async function prepareAndReplay({ attachmentMode = 'automatic', fallbackFrom = null } = {}) {
@@ -287,9 +385,10 @@
     setStatus('Verifying Project Space before send…', 'verifying');
     let prepared = null;
     try {
+      await preservePendingNativeInputs();
       prepared = await request(`/companion/workspaces/${encodeURIComponent(workspace.id)}/prepare-send`, {
         method: 'POST',
-        body: { provider, user_prompt: originalText, capture: await capturePayload({ complete: true }), attempt_id: attempt.id, prompt_hash: attempt.originalHash, route: attempt.route, protocol_version: PROTOCOL_VERSION, attachment_mode: attachmentMode, fallback_from_run_id: fallbackFrom?.run_id || '', fallback_version_ids: fallbackFrom?.version_ids || [] }
+        body: { provider, surface_id: adapter.surfaceId, user_prompt: originalText, capture: await capturePayload({ complete: true }), attempt_id: attempt.id, prompt_hash: attempt.originalHash, route: attempt.route, protocol_version: PROTOCOL_VERSION, attachment_mode: attachmentMode, fallback_from_run_id: fallbackFrom?.run_id || '', fallback_version_ids: fallbackFrom?.version_ids || [] }
       });
       attempt.prepared = prepared;
       moveSendState(SEND_STATES.PREPARED);
@@ -320,6 +419,14 @@
       acceptance.attachment_mode = prepared.attachments?.length ? attachmentMode : 'none';
       acceptance.fallback_from_run_id = fallbackFrom?.run_id || '';
       if (!acceptance.accepted) throw Object.assign(new Error('provider acceptance could not be proven; Harness will not record this attempt as sent'), { code: acceptance.code });
+      const latestUser = adapter.captureMessages().filter(item => item.role === 'user').at(-1);
+      if (latestUser?.provider_message_id) {
+        for (const input of nativeInputAssets.values()) input.descriptor.originating_provider_message_id ||= latestUser.provider_message_id;
+        const associatedCapture = await captureCurrent({ force: true }).catch(() => null);
+        if (associatedCapture) for (const [nativeId, input] of nativeInputAssets) {
+          if (input.state === 'captured' && input.descriptor.originating_provider_message_id) nativeInputAssets.delete(nativeId);
+        }
+      }
       await request(`/companion/outgoing-context/${encodeURIComponent(prepared.run_id)}/sent`, { method: 'POST', body: { attempt_id: attempt.id, prompt_hash: attempt.originalHash, route: attempt.route, protocol_version: PROTOCOL_VERSION, acceptance } });
       moveSendState(SEND_STATES.DONE);
       pendingAttachmentFallback = null;
@@ -366,8 +473,13 @@
 
   async function refreshRouteBinding() {
     if (location.href === lastLocationHref) return;
+    const providerAcceptanceTransition = sendAttempt && [SEND_STATES.REPLAYING, SEND_STATES.WAITING_FOR_PROVIDER_ACCEPT].includes(sendState);
+    if (!providerAcceptanceTransition) {
+      nativeInputAssets.clear();
+      recentNativeFileEvents.clear();
+    }
     lastLocationHref = location.href;
-    if (sendAttempt && sendState !== SEND_STATES.IDLE) { sendAttempt.invalidated = true; sendAttempt.transaction?.invalidate(); }
+    if (sendAttempt && sendState !== SEND_STATES.IDLE && !providerAcceptanceTransition) { sendAttempt.invalidated = true; sendAttempt.transaction?.invalidate(); }
     lastFingerprint = '';
     boundSession = null;
     const resolved = await resolveCurrentSession();
@@ -377,12 +489,13 @@
       associationConfirmed = true;
     }
     updateNativeLabel();
+    prewarmProject();
   }
 
   async function mount() {
     try {
       workspace = await request('/companion/active-workspace');
-      await request('/companion/heartbeat', { method: 'POST', body: { version: COMPANION_VERSION, protocol_version: PROTOCOL_VERSION, provider, metadata: { hostname: location.hostname, adapter_version: adapter.version, capabilities: adapter.capabilities() } } });
+      await request('/companion/heartbeat', { method: 'POST', body: { version: COMPANION_VERSION, protocol_version: PROTOCOL_VERSION, provider, surface_id: adapter.surfaceId, metadata: { hostname: location.hostname, surface_id: adapter.surfaceId, adapter_version: adapter.version, capabilities: adapter.capabilities() } } });
     } catch {
       return;
     }
@@ -415,6 +528,7 @@
     attachmentFallbackButton = root.querySelector('.aih-attach');
     document.body.appendChild(root);
     updateNativeLabel();
+    prewarmProject();
 
     const autoButton = root.querySelector('.aih-auto');
     const updateAuto = () => { autoButton.textContent = `Auto capture: ${autoCaptureEnabled ? 'on' : 'off'}`; };
@@ -449,6 +563,7 @@
       try {
         await captureCurrent({ force: true, complete: true });
         updateAssociation();
+        prewarmProject();
         setStatus(`Associated with ${workspace.name}.`, 'current');
       } catch (error) {
         associationConfirmed = false;
@@ -466,25 +581,53 @@
 
     document.addEventListener('click', interceptClick, true);
     document.addEventListener('keydown', interceptKeydown, true);
+    const captureFileInput = event => {
+      if (harnessAttachmentInjection) return;
+      const input = event.target;
+      if (!input?.matches?.('input[type="file"]') || !input.files?.length) return;
+      for (const file of input.files) stageNativeInputFile(file, 'direct_file_input').catch(() => {});
+    };
+    const captureClipboard = event => {
+      const composer = adapter.findComposer();
+      if (!composer || !(event.target === composer || composer.contains?.(event.target))) return;
+      const directFiles = [...(event.clipboardData?.files || [])];
+      const itemFiles = directFiles.length ? [] : [...(event.clipboardData?.items || [])].filter(item => item.kind === 'file').map(item => item.getAsFile()).filter(Boolean);
+      for (const file of [...directFiles, ...itemFiles]) stageNativeInputFile(file, String(file.type || '').startsWith('image/') ? 'clipboard_image' : 'direct_file_input').catch(() => {});
+    };
+    const captureDrop = event => {
+      const composer = adapter.findComposer();
+      if (!composer || !(event.target === composer || composer.contains?.(event.target))) return;
+      for (const file of event.dataTransfer?.files || []) stageNativeInputFile(file, 'drag_drop').catch(() => {});
+    };
+    document.addEventListener('change', captureFileInput, true);
+    document.addEventListener('paste', captureClipboard, true);
+    document.addEventListener('drop', captureDrop, true);
     const captureTimer = setInterval(() => {
       if (autoCaptureEnabled && document.visibilityState === 'visible' && sendState === SEND_STATES.IDLE) captureCurrent().catch(() => {});
     }, AUTO_CAPTURE_INTERVAL_MS);
-    const heartbeatTimer = setInterval(() => request('/companion/heartbeat', { method: 'POST', body: { version: COMPANION_VERSION, protocol_version: PROTOCOL_VERSION, provider, metadata: { adapter_version: adapter.version, capabilities: adapter.capabilities() } } }).catch(() => {}), 60000);
+    const heartbeatTimer = setInterval(() => request('/companion/heartbeat', { method: 'POST', body: { version: COMPANION_VERSION, protocol_version: PROTOCOL_VERSION, provider, surface_id: adapter.surfaceId, metadata: { surface_id: adapter.surfaceId, adapter_version: adapter.version, capabilities: adapter.capabilities() } } }).catch(() => {}), 60000);
     const routeTimer = setInterval(() => refreshRouteBinding().catch(() => {}), 1500);
     document.addEventListener('visibilitychange', () => {
       if (autoCaptureEnabled && document.visibilityState === 'hidden') captureCurrent({ force: true }).catch(() => {});
     });
     document.addEventListener('input', event => {
-      if (!sendAttempt || sendAttempt.internalComposerWrite || sendState === SEND_STATES.IDLE || sendState === SEND_STATES.REPLAYING) return;
       const composer = adapter.findComposer();
-      if (composer && (event.target === composer || composer.contains?.(event.target))) { sendAttempt.invalidated = true; sendAttempt.transaction?.invalidate(); }
+      if (!composer || !(event.target === composer || composer.contains?.(event.target))) return;
+      if (sendState === SEND_STATES.IDLE) return scheduleDraftRetrieval();
+      if (!sendAttempt || sendAttempt.internalComposerWrite || sendState === SEND_STATES.REPLAYING) return;
+      sendAttempt.invalidated = true;
+      sendAttempt.transaction?.invalidate();
     }, true);
     window.addEventListener('pagehide', () => {
       clearInterval(captureTimer);
       clearInterval(heartbeatTimer);
       clearInterval(routeTimer);
+      clearTimeout(draftTimer);
       document.removeEventListener('click', interceptClick, true);
       document.removeEventListener('keydown', interceptKeydown, true);
+      document.removeEventListener('change', captureFileInput, true);
+      document.removeEventListener('paste', captureClipboard, true);
+      document.removeEventListener('drop', captureDrop, true);
     }, { once: true });
     if (autoCaptureEnabled) setTimeout(() => captureCurrent({ force: true }).catch(() => {}), 2000);
   }

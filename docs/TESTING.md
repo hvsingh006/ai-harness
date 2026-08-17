@@ -1,6 +1,6 @@
 # AI Harness 0.8 testing
 
-The pre-trial acceptance matrix is maintained in `docs/PRETRIAL_ACCEPTANCE.md`. The suite includes synthetic provider DOM fixtures, exact native-send delivery binding, crash recovery, asset origin rules, updater temp repositories, local-agent root scoping, advanced path/secret attacks, PDF recovery, Office attachment-only behavior, and real localhost HTTP integration. A skipped PDF retry case means the test process could not execute `pdftotext`; `npm run doctor` reports that condition separately and the installer remediates it.
+The pre-trial acceptance matrix is maintained in `docs/PRETRIAL_ACCEPTANCE.md`. The suite includes synthetic provider DOM fixtures, exact native-send delivery binding, crash recovery, asset origin rules, updater/temp repositories, scoped local-agent context, advanced path/secret attacks, real Poppler/Tesseract hybrid/scanned PDF processing, OCR security, Office attachment-only behavior, provider-neutral surface planning, UI APIs, and real localhost HTTP integration. Multimodal tests skip only when the host genuinely lacks a required executable; `npm run doctor` reports each tool separately and the Windows installer remediates it.
 
 Passing local tests is not evidence that live ChatGPT/Gemini DOM integration works. Live provider compatibility is a separate external gate.
 
@@ -12,9 +12,10 @@ Run from the canonical repository:
 npm test
 npm run doctor
 npm run dev:status
+npm run test:clean   # after committing: clone HEAD and prove representative workflows leave it clean
 ```
 
-The automated suite covers additive 0.7 database migration, storage isolation, safe legacy-project migration/conflicts, approved-root traversal/symlink security, immutable versions, deletion/new-file discovery, current-version-only retrieval, ChatGPT/Gemini/user weighting, repository state, chat reconciliation/coverage, secret blocking/redaction, companion pairing/auth/origin rules, outgoing audit/envelope cleanup, opaque current attachments, immediate pre-send disk changes, and unavailable-root HTTP 412 failure.
+The automated suite covers additive 0.7 migration, storage isolation, migration conflicts, path/symlink security, immutable source/representation versions, manifest fast paths and single-file deltas, rename continuity, current-only unified retrieval, real digital/OCR/page/embedded-image processing, on-demand exact-page materialization, OCR injection/secret filtering, binary/visual delivery security state, native user-input/provider-output ingestion, late message-provenance association, cross-provider clipboard OCR continuity, exact-hash reconciliation/ambiguous non-merge, safe project-folder export, surface capability/unknown-adapter failure, explicit page non-substitution, unrelated-heavy-document isolation, instructions/personalization trust order, speculative-cache invalidation, bounded session bootstrap/delta, always-consider/critical/superseded policy, scoped local context, bounded/recoverable jobs, UI APIs, chat preservation coverage, pairing/auth/origins, same-origin shutdown, outgoing audits, attachments, immediate disk changes, and unavailable-root HTTP 412 failure. Retrieval-quality tests also cover visible/alternate edited chat paths, current branch/worktree provenance, deterministic instruction/source conflicts, evidence-class budgets, and cross-workspace rejection by the optional semantic interface.
 
 ## Required live smoke setup
 
@@ -75,6 +76,19 @@ Add an image once, then replace it on disk. Ask about its visual layout by name.
 
 Pass: the current version is prepared by opaque ID, the provider UI visibly confirms the filename before Send replay, and audit provenance identifies the current hash/version. If the provider control cannot confirm attachment, the send remains paused and the run is audited as failed.
 
+## Live test G: native input durability and cross-provider use
+
+1. In an associated ChatGPT chat, paste a Snipping Tool image containing `CLOCK = 250 MHz` and send normally.
+2. Confirm Resources shows **Pasted into ChatGPT**, the immutable current version, OCR coverage, and originating message provenance.
+3. Close that conversation, open a new associated Gemini conversation, and ask what frequency appeared in the earlier screenshot.
+4. Repeat with a PDF attached from Downloads, then ask about it from a new ChatGPT conversation.
+
+Pass: no re-upload is needed; current OCR/PDF evidence and original bytes are available according to surface capability; history is not safe to delete before byte/derived/index stages complete; Downloads was not granted as a root; the Git worktree was not dirtied.
+
+## Live test H: warm and changed latency
+
+Inspect outgoing diagnostics after association prewarm, an unchanged send, a one-file edit, instruction-only change, and surface switch. Pass locally means unchanged sends hash/process zero files, one-file edits hash/process only that candidate, cache hits occur only under exact identity, instruction changes do not rerun source extraction, and any generation/policy/chat change invalidates the draft. Collect real P50/P95 numbers; do not claim the 500 ms/1.5 s target until measured on the user corpus and live provider surface.
+
 ## Known environment limitation
 
-PDF text extraction uses local `pdftotext`. A missing executable or failed required-PDF extraction must produce `RESOURCE_INDEX_FAILED`; it is not an acceptable reason to claim Current from a cached/empty index. Provider DOM and attachment behavior require the live smoke tests above after browser/provider changes.
+PDF processing uses locally installed Poppler (`pdfinfo`, `pdftotext`, `pdftoppm`, `pdfimages`) and Tesseract. Missing minimum PDF processing or a failed required representation is never replaced with cached older data; coverage/freshness/delivery status stays explicit and visual-dependent delivery fails closed when no supported current fallback exists. Provider DOM and attachment behavior still require the live smoke tests above after browser/provider changes.

@@ -117,6 +117,26 @@ function migrate(db) {
       UNIQUE(resource_id, sha256)
     );
 
+    CREATE TABLE IF NOT EXISTS resource_representations (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      resource_id TEXT NOT NULL REFERENCES workspace_resources(id) ON DELETE CASCADE,
+      resource_version_id TEXT NOT NULL REFERENCES resource_versions(id) ON DELETE CASCADE,
+      representation_kind TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      artifact_id TEXT REFERENCES artifacts(id) ON DELETE SET NULL,
+      page_start INTEGER,
+      page_end INTEGER,
+      region_json TEXT NOT NULL DEFAULT '{}',
+      extractor TEXT NOT NULL DEFAULT '',
+      extractor_version TEXT NOT NULL DEFAULT '',
+      content_sha256 TEXT NOT NULL DEFAULT '',
+      confidence REAL,
+      trust_class TEXT NOT NULL DEFAULT 'untrusted_derived',
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS resource_chunks (
       id TEXT PRIMARY KEY,
       workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -410,11 +430,135 @@ function migrate(db) {
       source_id TEXT NOT NULL DEFAULT '',
       resource_version_id TEXT REFERENCES resource_versions(id) ON DELETE SET NULL,
       chunk_id TEXT REFERENCES resource_chunks(id) ON DELETE SET NULL,
+      representation_id TEXT REFERENCES resource_representations(id) ON DELETE SET NULL,
       provenance_json TEXT NOT NULL DEFAULT '{}',
       retrieval_score REAL NOT NULL DEFAULT 0,
       selection_reason TEXT NOT NULL DEFAULT '',
       transmitted_character_count INTEGER NOT NULL DEFAULT 0,
       excluded_reason TEXT NOT NULL DEFAULT ''
+    );
+
+    CREATE TABLE IF NOT EXISTS instruction_versions (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      version_number INTEGER NOT NULL,
+      content TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL,
+      UNIQUE(workspace_id, version_number)
+    );
+
+    CREATE TABLE IF NOT EXISTS personalization_versions (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
+      scope TEXT NOT NULL CHECK(scope IN ('global','workspace')),
+      version_number INTEGER NOT NULL,
+      profile_json TEXT NOT NULL DEFAULT '{}',
+      notes TEXT NOT NULL DEFAULT '',
+      content_hash TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS agent_context_sessions (
+      id TEXT PRIMARY KEY,
+      token_hash TEXT NOT NULL UNIQUE,
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      root_id TEXT NOT NULL REFERENCES workspace_roots(id) ON DELETE CASCADE,
+      agent TEXT NOT NULL,
+      capabilities_json TEXT NOT NULL DEFAULT '[]',
+      expires_at TEXT NOT NULL,
+      last_used_at TEXT,
+      revoked_at TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS background_jobs (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
+      job_type TEXT NOT NULL,
+      target_type TEXT NOT NULL DEFAULT 'workspace',
+      target_id TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'queued',
+      progress_current INTEGER NOT NULL DEFAULT 0,
+      progress_total INTEGER NOT NULL DEFAULT 0,
+      phase TEXT NOT NULL DEFAULT '',
+      result_json TEXT NOT NULL DEFAULT '{}',
+      error_code TEXT NOT NULL DEFAULT '',
+      error_message TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS resource_relationships (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      source_type TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      relationship_type TEXT NOT NULL,
+      target_type TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      provenance_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      UNIQUE(workspace_id,source_type,source_id,relationship_type,target_type,target_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS root_manifest_entries (
+      root_id TEXT NOT NULL REFERENCES workspace_roots(id) ON DELETE CASCADE,
+      relative_path TEXT NOT NULL,
+      resource_id TEXT REFERENCES workspace_resources(id) ON DELETE SET NULL,
+      resource_version_id TEXT REFERENCES resource_versions(id) ON DELETE SET NULL,
+      size_bytes INTEGER NOT NULL,
+      modified_ns TEXT NOT NULL,
+      changed_ns TEXT NOT NULL DEFAULT '',
+      file_identity TEXT NOT NULL DEFAULT '',
+      sha256 TEXT NOT NULL,
+      verified_generation INTEGER NOT NULL DEFAULT 0,
+      verified_at TEXT NOT NULL,
+      PRIMARY KEY(root_id,relative_path)
+    );
+
+    CREATE TABLE IF NOT EXISTS context_draft_cache (
+      cache_key TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+      surface_id TEXT NOT NULL,
+      query_hash TEXT NOT NULL,
+      corpus_generation INTEGER NOT NULL,
+      index_generation INTEGER NOT NULL,
+      chat_generation INTEGER NOT NULL DEFAULT 0,
+      instruction_hash TEXT NOT NULL DEFAULT '',
+      personalization_hash TEXT NOT NULL DEFAULT '',
+      result_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS session_context_ledgers (
+      session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      surface_id TEXT NOT NULL,
+      instruction_hash TEXT NOT NULL DEFAULT '',
+      personalization_hash TEXT NOT NULL DEFAULT '',
+      corpus_generation INTEGER NOT NULL DEFAULT 0,
+      index_generation INTEGER NOT NULL DEFAULT 0,
+      evidence_json TEXT NOT NULL DEFAULT '[]',
+      visual_versions_json TEXT NOT NULL DEFAULT '[]',
+      last_run_id TEXT NOT NULL DEFAULT '',
+      bootstrap_at TEXT,
+      sends_since_bootstrap INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS context_prepare_metrics (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES outgoing_context_runs(id) ON DELETE CASCADE,
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      fast_path INTEGER NOT NULL DEFAULT 0,
+      metrics_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS migration_records (
@@ -444,9 +588,19 @@ function migrate(db) {
     CREATE INDEX IF NOT EXISTS idx_resource_versions_resource ON resource_versions(resource_id, observed_at DESC);
     CREATE INDEX IF NOT EXISTS idx_resource_versions_sha ON resource_versions(sha256);
     CREATE INDEX IF NOT EXISTS idx_resource_chunks_current ON resource_chunks(workspace_id, resource_version_id);
+    CREATE INDEX IF NOT EXISTS idx_representations_version ON resource_representations(resource_version_id, representation_kind, page_start);
     CREATE INDEX IF NOT EXISTS idx_snapshots_workspace_time ON project_snapshots(workspace_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_outgoing_workspace_time ON outgoing_context_runs(workspace_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_outgoing_sources_run ON outgoing_context_sources(run_id);
+    CREATE INDEX IF NOT EXISTS idx_instruction_versions_workspace ON instruction_versions(workspace_id, version_number DESC);
+    CREATE INDEX IF NOT EXISTS idx_personalization_scope ON personalization_versions(scope, workspace_id, version_number DESC);
+    CREATE INDEX IF NOT EXISTS idx_agent_context_expiry ON agent_context_sessions(expires_at, revoked_at);
+    CREATE INDEX IF NOT EXISTS idx_jobs_workspace_time ON background_jobs(workspace_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_relationships_source ON resource_relationships(workspace_id,source_type,source_id);
+    CREATE INDEX IF NOT EXISTS idx_relationships_target ON resource_relationships(workspace_id,target_type,target_id);
+    CREATE INDEX IF NOT EXISTS idx_manifest_resource ON root_manifest_entries(resource_id,resource_version_id);
+    CREATE INDEX IF NOT EXISTS idx_draft_cache_lookup ON context_draft_cache(workspace_id,session_id,surface_id,query_hash,expires_at);
+    CREATE INDEX IF NOT EXISTS idx_prepare_metrics_workspace ON context_prepare_metrics(workspace_id,created_at DESC);
   `);
 
   addColumn(db, 'workspaces', "root_path TEXT NOT NULL DEFAULT ''");
@@ -466,6 +620,8 @@ function migrate(db) {
   addColumn(db, 'sessions', "display_label TEXT NOT NULL DEFAULT ''");
   addColumn(db, 'sessions', "history_coverage TEXT NOT NULL DEFAULT 'unknown'");
   addColumn(db, 'sessions', "capture_evidence_json TEXT NOT NULL DEFAULT '{}'");
+  addColumn(db, 'sessions', "user_input_assets_complete INTEGER NOT NULL DEFAULT 0");
+  addColumn(db, 'sessions', "provider_output_assets_complete INTEGER NOT NULL DEFAULT 0");
   addColumn(db, 'workspace_files', "sha256 TEXT NOT NULL DEFAULT ''");
   addColumn(db, 'workspace_files', "size_bytes INTEGER NOT NULL DEFAULT 0");
   addColumn(db, 'workspace_files', "relative_path TEXT NOT NULL DEFAULT ''");
@@ -475,6 +631,8 @@ function migrate(db) {
   addColumn(db, 'learning_items', "next_review_at TEXT");
   addColumn(db, 'learning_items', "attempt_count INTEGER NOT NULL DEFAULT 0");
   addColumn(db, 'messages', "clean_content_text TEXT NOT NULL DEFAULT ''");
+  addColumn(db, 'messages', "path_status TEXT NOT NULL DEFAULT 'unknown'");
+  addColumn(db, 'messages', "last_seen_in_capture_at TEXT");
   addColumn(db, 'messages', "outgoing_context_run_id TEXT REFERENCES outgoing_context_runs(id) ON DELETE SET NULL");
   addColumn(db, 'messages', "harness_managed INTEGER NOT NULL DEFAULT 0");
   addColumn(db, 'outgoing_context_runs', "attempt_id TEXT NOT NULL DEFAULT ''");
@@ -483,6 +641,31 @@ function migrate(db) {
   addColumn(db, 'outgoing_context_runs', "protocol_version INTEGER NOT NULL DEFAULT 0");
   addColumn(db, 'outgoing_context_runs', "delivery_state TEXT NOT NULL DEFAULT 'PREPARING'");
   addColumn(db, 'outgoing_context_runs', "acceptance_json TEXT NOT NULL DEFAULT '{}'");
+  addColumn(db, 'outgoing_context_runs', "surface_id TEXT NOT NULL DEFAULT ''");
+  addColumn(db, 'outgoing_context_runs', "delivery_plan_json TEXT NOT NULL DEFAULT '{}'");
+  addColumn(db, 'resource_versions', "representation_status TEXT NOT NULL DEFAULT 'pending'");
+  addColumn(db, 'resource_versions', "representation_coverage TEXT NOT NULL DEFAULT 'unknown'");
+  addColumn(db, 'resource_versions', "coverage_json TEXT NOT NULL DEFAULT '{}'");
+  addColumn(db, 'workspace_resources', "source_type TEXT NOT NULL DEFAULT 'filesystem'");
+  addColumn(db, 'workspace_resources', "origin_json TEXT NOT NULL DEFAULT '{}'");
+  addColumn(db, 'workspace_resources', "priority_status TEXT NOT NULL DEFAULT 'normal'");
+  addColumn(db, 'workspace_resources', "knowledge_status TEXT NOT NULL DEFAULT 'active'");
+  addColumn(db, 'workspace_resources', "context_critical INTEGER NOT NULL DEFAULT 0");
+  addColumn(db, 'session_assets', "origin_kind TEXT NOT NULL DEFAULT 'provider_output'");
+  addColumn(db, 'session_assets', "capture_method TEXT NOT NULL DEFAULT 'provider_url'");
+  addColumn(db, 'session_assets', "originating_provider_message_id TEXT NOT NULL DEFAULT ''");
+  addColumn(db, 'session_assets', "resource_id TEXT REFERENCES workspace_resources(id) ON DELETE SET NULL");
+  addColumn(db, 'session_assets', "resource_version_id TEXT REFERENCES resource_versions(id) ON DELETE SET NULL");
+  addColumn(db, 'resource_chunks', "representation_id TEXT REFERENCES resource_representations(id) ON DELETE SET NULL");
+  addColumn(db, 'resource_chunks', "source_kind TEXT NOT NULL DEFAULT 'digital_text'");
+  addColumn(db, 'resource_chunks', "authority TEXT NOT NULL DEFAULT 'source_derived'");
+  addColumn(db, 'resource_chunks', "confidence REAL");
+  addColumn(db, 'resource_chunks', "region_json TEXT NOT NULL DEFAULT '{}'");
+  addColumn(db, 'resource_representations', "security_status TEXT NOT NULL DEFAULT 'unchecked'");
+  addColumn(db, 'session_context_ledgers', "bootstrap_at TEXT");
+  addColumn(db, 'session_context_ledgers', "sends_since_bootstrap INTEGER NOT NULL DEFAULT 0");
+  addColumn(db, 'context_draft_cache', "chat_generation INTEGER NOT NULL DEFAULT 0");
+  addColumn(db, 'workspaces', "lifecycle_status TEXT NOT NULL DEFAULT 'active'");
 
   // A process crash must never promote an unacknowledged prepared send. Keep it
   // inspectable and require a fresh prepare/reconciliation on the next attempt.

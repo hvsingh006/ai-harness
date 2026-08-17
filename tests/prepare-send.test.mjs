@@ -254,6 +254,18 @@ test('a required text resource that cannot be extracted blocks guaranteed curren
   assert.equal(row(db, `SELECT indexing_status FROM resource_versions v JOIN workspace_resources r ON r.current_version_id=v.id WHERE r.relative_path='broken.txt'`).indexing_status, 'failed');
 });
 
+test('an unrelated failed heavy-document representation does not block a verified current text turn', t => {
+  const { db, root } = fixture(t);
+  fs.writeFileSync(path.join(root, 'current.txt'), 'The current decision is deterministic.');
+  fs.writeFileSync(path.join(root, 'optional-reference.pdf'), '%PDF-1.4\n%%EOF\n');
+  const result = prepareManagedSend(db, { workspaceId: 'ws-harness', provider: 'chatgpt', userPrompt: 'What does current.txt say?', capture: capture('chatgpt', 'optional-heavy-document', []) });
+  assert.equal(result.ok, true);
+  assert.match(result.context_envelope, /current decision is deterministic/i);
+  const optional = row(db, `SELECT v.indexing_status,v.representation_coverage FROM resource_versions v JOIN workspace_resources r ON r.current_version_id=v.id WHERE r.relative_path='optional-reference.pdf'`);
+  assert.equal(optional.indexing_status, 'failed');
+  assert.equal(optional.representation_coverage, 'blocked');
+});
+
 test('reopening the same provider conversation reuses one immutable Harness session', t => {
   const { db } = fixture(t);
   const first = captureBrowserSession(db, capture('gemini', 'same-chat', [{ role: 'user', content: 'first' }]));
@@ -332,6 +344,10 @@ test('visual queries select only the current image version by opaque resource/ve
   png.writeUInt8(0x89, 0); png.write('PNG', 1, 'ascii'); png.writeUInt32BE(320, 16); png.writeUInt32BE(200, 20);
   const imagePath = path.join(root, 'diagram.png');
   fs.writeFileSync(imagePath, png);
+  reconcileWorkspaceResources(db, 'ws-harness');
+  const preclearedDiagram = row(db, `SELECT id,current_version_id FROM workspace_resources WHERE relative_path='diagram.png'`);
+  run(db, `UPDATE resource_representations SET security_status='clear' WHERE resource_id=? AND representation_kind='original_visual'`, preclearedDiagram.id);
+  run(db, `UPDATE resource_versions SET representation_coverage='complete' WHERE id=?`, preclearedDiagram.current_version_id);
   const result = prepareManagedSend(db, { workspaceId: 'ws-harness', provider: 'chatgpt', userPrompt: 'Inspect the visual layout in diagram.png', capture: capture('chatgpt', 'image-query', []) });
   assert.equal(result.ok, true);
   assert.equal(result.attachments.length, 1);

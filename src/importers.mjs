@@ -138,22 +138,36 @@ export function setCaptureStages(db, sessionId, stages) {
   const now = new Date().toISOString();
   const labels = {
     raw: 'raw_transcript',
-    attachments: 'attachments',
+    userInputs: 'user_input_attachments',
+    providerOutputs: 'provider_generated_assets',
     derived: 'derived_state',
     search: 'search_index'
   };
-  for (const [key, complete] of Object.entries(stages)) {
+  const normalized = { ...stages };
+  // Compatibility for lossless archive importers that already proved all asset
+  // classes complete. Live browser capture uses the two explicit stages.
+  if (Object.hasOwn(normalized, 'attachments')) {
+    normalized.userInputs ??= normalized.attachments;
+    normalized.providerOutputs ??= normalized.attachments;
+    delete normalized.attachments;
+  }
+  for (const [key, value] of Object.entries(normalized)) {
     if (!(key in labels)) continue;
+    const complete = typeof value === 'object' ? Boolean(value.complete) : Boolean(value);
+    const details = typeof value === 'object' ? String(value.details || '').slice(0, 1000) : '';
     const id = `stage-${sessionId}-${labels[key]}`;
     run(db, `INSERT INTO capture_stages (id,session_id,stage,status,details,updated_at) VALUES (?,?,?,?,?,?)
              ON CONFLICT(session_id,stage) DO UPDATE SET status=excluded.status,details=excluded.details,updated_at=excluded.updated_at`,
-      id, sessionId, labels[key], complete ? 'complete' : 'pending', '', now);
+      id, sessionId, labels[key], complete ? 'complete' : 'pending', details, now);
   }
-  const required = ['raw_transcript','attachments','derived_state','search_index'];
+  const required = ['raw_transcript','user_input_attachments','provider_generated_assets','derived_state','search_index'];
   const stageRows = db.prepare(`SELECT stage,status FROM capture_stages WHERE session_id=?`).all(sessionId);
   const state = Object.fromEntries(stageRows.map(r => [r.stage, r.status]));
   const completed = required.filter(stage => state[stage] === 'complete').length;
   const status = completed === required.length ? 'safe_to_delete' : 'captured_incomplete';
-  run(db, `UPDATE sessions SET capture_status=?, raw_complete=?, attachments_complete=?, derived_complete=? WHERE id=?`,
-    status, state.raw_transcript === 'complete' ? 1 : 0, state.attachments === 'complete' ? 1 : 0, state.derived_state === 'complete' ? 1 : 0, sessionId);
+  const userInputsComplete = state.user_input_attachments === 'complete';
+  const providerOutputsComplete = state.provider_generated_assets === 'complete';
+  run(db, `UPDATE sessions SET capture_status=?,raw_complete=?,attachments_complete=?,user_input_assets_complete=?,provider_output_assets_complete=?,derived_complete=? WHERE id=?`,
+    status, state.raw_transcript === 'complete' ? 1 : 0, userInputsComplete && providerOutputsComplete ? 1 : 0,
+    userInputsComplete ? 1 : 0, providerOutputsComplete ? 1 : 0, state.derived_state === 'complete' ? 1 : 0, sessionId);
 }

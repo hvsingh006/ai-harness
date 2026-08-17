@@ -2,7 +2,7 @@
 
 ## 0.8.0 pre-trial hardening
 
-Implemented locally: fail-closed provider capability detection, protocol negotiation, acceptance-based native-send transactions, prepared-context invalidation, constrained provider asset capture, current-version native attachments with one-click retry, background service launcher/reconnect, safe update classification/backup/rollback/restart, Git/runtime diagnostics, registered-root Codex/Antigravity handoff, root lifecycle actions, extraction retry, capability/size reporting, crash recovery, expanded adversarial tests, and the acceptance matrix.
+Implemented locally: fail-closed protocol-4 surface capability detection, acceptance-based native-send transactions, prepared-context invalidation, constrained provider asset capture into the unified resource model, current-version native attachments, Poppler/Tesseract multimodal representations, representation coverage, provider-neutral delivery plans, UI-only daily administration, versioned instructions/personalization, scoped read-only Codex/Antigravity context, background jobs, safe update/backup/rollback/restart, Git/runtime diagnostics, crash recovery, and expanded adversarial/end-to-end tests.
 
 Remaining gate: live signed-in ChatGPT/Gemini compatibility validation only. See `docs/PRETRIAL_ACCEPTANCE.md`; do not convert external unknowns into success claims.
 
@@ -25,6 +25,12 @@ Remaining gate: live signed-in ChatGPT/Gemini compatibility validation only. See
 - [x] Project Current/Blocked/source-policy inspection UI
 - [x] safe copy-and-verify legacy managed-project migration
 - [x] integration coverage for immediate disk change and unavailable required root
+- [x] immutable version-linked multimodal representations and unified digital/OCR retrieval
+- [x] scanned/hybrid PDF, embedded-image, OCR injection/secret, and cleanup acceptance tests
+- [x] provider-neutral surface registry and query-specific delivery capability matrix
+- [x] scoped local-agent context helper with token hashing, expiry, revocation, and no database access
+- [x] versioned project instructions and restrained personalization with explicit trust order
+- [x] Resource/Instructions/Security control-plane UI and fixed processing/backup/diagnostic jobs
 
 ## Reliability validation still required on live providers
 
@@ -33,7 +39,7 @@ Remaining gate: live signed-in ChatGPT/Gemini compatibility validation only. See
 - [ ] maintain provider selector fixtures as their DOMs change
 - [ ] validate native attachment confirmation across provider UI variants and account states
 - [ ] improve reconciliation/import coverage for activity created while Harness was not running
-- [ ] add a bundled cross-platform PDF extractor if depending on local `pdftotext` proves too fragile
+- [ ] consider bundled/cross-platform Poppler/Tesseract distribution if clean-machine Windows provisioning proves fragile
 
 These limitations remain explicit and fail closed where they affect freshness or native-send correctness. They do not justify a replacement chat UI, another provider, a permanent provider conversation, or weakened security.
 
@@ -42,6 +48,6 @@ These limitations remain explicit and fail closed where they affect freshness or
 - background indexing queue observability and performance tuning for very large repositories
 - richer current-result/image associations and previews
 - optional embeddings only if they improve retrieval without replacing FTS/source provenance
-- scoped native coding-agent handoff, separately permissioned from cloud chat providers
+- performance tuning and richer read-only local-agent visual consumption after daily-use evidence
 
 Learning and development remain use cases, not top-level product modes.

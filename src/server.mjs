@@ -9,15 +9,24 @@ import { archiveFile, sha256File } from './archive.mjs';
 import { setCaptureStages, importChatGPTExport, importProviderArchive } from './importers.mjs';
 import { HARNESS_VERSION, COMPANION_PROTOCOL_VERSION, COMPANION_PROTOCOL_MIN_VERSION } from './version.mjs';
 import { indexWorkspaceFile, scanWorkspaceFiles, projectFileDestination, storageSummary } from './project-space.mjs';
-import { captureBrowserSession as captureVerifiedBrowserSession, resolveSessionByRefs as resolveCapturedSession, validateProviderAssetUrl } from './chat-capture.mjs';
+import { captureBrowserSession as captureVerifiedBrowserSession, resolveSessionByRefs as resolveCapturedSession, validateProviderAssetUrl, workspaceHistoryCoverage } from './chat-capture.mjs';
 import { prepareManagedSend, markContextRunSent, markContextRunFailed } from './outgoing-context.mjs';
 import { workspaceIntegrity, markWorkspaceStale } from './freshness.mjs';
-import { currentWorkspaceResources, reconcileWorkspaceResources } from './resources.mjs';
+import { currentWorkspaceResources, reconcileWorkspaceResources, reprocessResourceVersion, ingestProviderArtifactResource, saveResourceCopyToProjectFolder, updateResourceContextPolicy } from './resources.mjs';
 import { createPairingChallenge, completePairing, authenticateCompanionRequest, ensureInstallCredential, isSameOriginDashboardRequest, pairedCompanionStatus } from './security/companion-auth.mjs';
 import { pendingManagedWorkspaceMigrations, migrateManagedWorkspaceProject } from './workspace-migration.mjs';
 import { isPathWithin, resolveApprovedTarget } from './security/paths.mjs';
 import { inspectSafeUpdate } from './update-safety.mjs';
 import { agentCapabilities, launchRegisteredAgent } from './agent-launcher.mjs';
+import { representationCoverage } from './multimodal.mjs';
+import { multimodalToolStatus } from './tooling.mjs';
+import { surfaceRegistry, browserSurfaceForProvider, publicSurfaceStatus } from './surface-registry.mjs';
+import { activeProjectInstructions, activePersonalization, saveProjectInstructions, savePersonalization, instructionContext, instructionHistory } from './instructions.mjs';
+import { authenticateAgentContext, agentContextStatus, agentContextQuery, agentContextSources, agentContextResource, agentContextVisual, revokeAgentContextSession } from './agent-context.mjs';
+import { backgroundQueueStatus, cancelBackgroundJob, createBackgroundJob, recoverBackgroundJobs, startBackgroundJob } from './jobs.mjs';
+import { createDatabaseBackup } from './backup.mjs';
+import { prepareSpeculativeDraft } from './context-cache.mjs';
+import { refreshWorkspaceRepositories } from './repository.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
@@ -33,16 +42,59 @@ fs.mkdirSync(stagingRoot, { recursive: true });
 const rootWatchers = new Map();
 const indexingTimers = new Map();
 
+function backgroundJobHandler(job) {
+  return async progress => {
+    const workspaceId = job.workspace_id;
+    const targetId = String(job.target_id || '');
+    if (job.job_type === 'verify_sources') {
+      progress({ phase: 'verifying changed source candidates' });
+      const resources = reconcileWorkspaceResources(db, workspaceId);
+      progress({ phase: 'refreshing repository state' });
+      const repository = refreshWorkspaceRepositories(db, workspaceId);
+      return { resources, repository };
+    }
+    if (job.job_type === 'full_integrity_verify') {
+      progress({ phase: 'hashing all approved source bytes' });
+      const resources = reconcileWorkspaceResources(db, workspaceId, { fullIntegrity: true });
+      progress({ phase: 'refreshing repository state' });
+      return { resources, repository: refreshWorkspaceRepositories(db, workspaceId) };
+    }
+    if (job.job_type === 'reprocess_resource') {
+      if (!targetId) throw Object.assign(new Error('resource target required'), { code: 'JOB_TARGET_REQUIRED' });
+      progress({ current: 0, total: 1, phase: 'reprocessing current version' });
+      const result = reprocessResourceVersion(db, targetId);
+      progress({ current: 1, total: 1, phase: 'reprocessed' });
+      return { resource_id: result.resource.id, version_id: result.version.id, representation_coverage: result.version.representation_coverage };
+    }
+    if (job.job_type === 'rebuild_derived') {
+      const resources = rows(db, `SELECT r.id FROM workspace_resources r JOIN resource_versions v ON v.id=r.current_version_id
+        WHERE r.workspace_id=? AND r.status='active' AND (v.indexing_status='failed' OR v.representation_coverage NOT IN ('complete','not_applicable')) ORDER BY r.relative_path`, workspaceId);
+      const results = [];
+      for (let index = 0; index < resources.length; index++) {
+        progress({ current: index, total: resources.length, phase: `reprocessing ${index + 1} of ${resources.length}` });
+        results.push(reprocessResourceVersion(db, resources[index].id));
+      }
+      progress({ current: resources.length, total: resources.length, phase: 'rebuild complete' });
+      return { resource_count: results.length, coverage: representationCoverage(db, workspaceId) };
+    }
+    if (job.job_type === 'create_backup') return createDatabaseBackup(db);
+    if (job.job_type === 'run_diagnostics') return { tools: multimodalToolStatus(), integrity: workspaceIntegrity(db, workspaceId), surfaces: surfaceRegistry.list().map(item => ({ id: item.id, capabilities: item.capabilities })) };
+    throw Object.assign(new Error('unsupported job type'), { code: 'JOB_TYPE_UNSUPPORTED' });
+  };
+}
+
 function scheduleBackgroundIndex(workspaceId) {
   markWorkspaceStale(db, workspaceId, 'filesystem_change_observed');
   clearTimeout(indexingTimers.get(workspaceId));
   indexingTimers.set(workspaceId, setTimeout(() => {
-    try { reconcileWorkspaceResources(db, workspaceId); }
-    catch {}
-    finally {
-      markWorkspaceStale(db, workspaceId, 'background_index_updated_pending_send_verification');
-      indexingTimers.delete(workspaceId);
-    }
+    try {
+      const existing = row(db, `SELECT id FROM background_jobs WHERE workspace_id=? AND job_type='verify_sources' AND status IN ('queued','running') LIMIT 1`, workspaceId);
+      if (!existing) {
+        const job = createBackgroundJob(db, { workspaceId, jobType: 'verify_sources', targetType: 'workspace', targetId: workspaceId });
+        startBackgroundJob(db, job.id, backgroundJobHandler(job));
+      }
+    } catch {}
+    finally { indexingTimers.delete(workspaceId); }
   }, 700));
 }
 
@@ -71,6 +123,7 @@ function refreshRootWatchers() {
 }
 
 refreshRootWatchers();
+recoverBackgroundJobs(db, backgroundJobHandler);
 const watcherRecoveryTimer = setInterval(() => {
   refreshRootWatchers();
   const affected = new Set(rows(db, `SELECT workspace_id,id FROM workspace_roots WHERE indexing_enabled=1`).filter(root => !rootWatchers.has(root.id)).map(root => root.workspace_id));
@@ -118,6 +171,25 @@ async function applicationUpdateStatus({ fetch = false } = {}) {
   }
 }
 
+function selectSourceFolder() {
+  return new Promise((resolve, reject) => {
+    if (process.platform !== 'win32') return reject(Object.assign(new Error('native folder selection is currently available on Windows'), { code: 'SOURCE_PICKER_UNAVAILABLE' }));
+    const script = path.join(rootDir, 'scripts', 'select-source.ps1');
+    const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script], { cwd: rootDir, windowsHide: false, stdio: ['ignore', 'pipe', 'pipe'], shell: false });
+    let stdout = ''; let stderr = '';
+    const timer = setTimeout(() => { child.kill(); reject(Object.assign(new Error('folder selection timed out'), { code: 'SOURCE_PICKER_TIMEOUT' })); }, 5 * 60 * 1000);
+    child.stdout.on('data', chunk => { stdout += chunk; }); child.stderr.on('data', chunk => { stderr += chunk; });
+    child.on('error', error => { clearTimeout(timer); reject(error); });
+    child.on('close', code => {
+      clearTimeout(timer);
+      if (code === 3) return resolve(null);
+      if (code !== 0) return reject(Object.assign(new Error(stderr.trim() || 'folder selection failed'), { code: 'SOURCE_PICKER_FAILED' }));
+      try { resolve(JSON.parse(stdout.trim())); }
+      catch { reject(Object.assign(new Error('folder selection returned invalid data'), { code: 'SOURCE_PICKER_INVALID' })); }
+    });
+  });
+}
+
 function safeRelativePath(value) {
   const normalized = String(value || '').replaceAll('\\', '/').replace(/^\/+/, '');
   const parts = normalized.split('/').filter(Boolean);
@@ -132,6 +204,40 @@ function providerAssetMimeCompatible(expected, received) {
   if (!expectedType || expectedType === 'application/octet-stream') return true;
   if (expectedType.endsWith('/*')) return receivedType.startsWith(expectedType.slice(0, -1));
   return expectedType === receivedType;
+}
+
+function recomputeSessionAssetStages(sessionId) {
+  const incompleteInputs = Number(row(db, `SELECT COUNT(*) AS n FROM session_assets WHERE session_id=? AND origin_kind='user_input' AND UPPER(mirror_status)!='CAPTURED'`, sessionId)?.n || 0);
+  const incompleteOutputs = Number(row(db, `SELECT COUNT(*) AS n FROM session_assets WHERE session_id=? AND origin_kind!='user_input' AND UPPER(mirror_status)!='CAPTURED'`, sessionId)?.n || 0);
+  const incompleteDerived = Number(row(db, `SELECT COUNT(*) AS n FROM session_assets sa LEFT JOIN resource_versions v ON v.id=sa.resource_version_id
+    WHERE sa.session_id=? AND (UPPER(sa.mirror_status)!='CAPTURED' OR v.id IS NULL OR v.indexing_status IN ('pending','processing','failed') OR v.representation_coverage IN ('blocked','partial','unknown'))`, sessionId)?.n || 0);
+  setCaptureStages(db, sessionId, {
+    userInputs: { complete: incompleteInputs === 0, details: incompleteInputs ? `${incompleteInputs} observed user input asset(s) still require durable bytes` : '' },
+    providerOutputs: { complete: incompleteOutputs === 0, details: incompleteOutputs ? `${incompleteOutputs} observed provider-generated asset(s) still require durable bytes` : '' },
+    derived: { complete: incompleteDerived === 0, details: incompleteDerived ? `${incompleteDerived} captured asset representation(s) remain incomplete` : '' },
+    search: { complete: incompleteDerived === 0, details: incompleteDerived ? 'captured asset search representation is incomplete' : '' }
+  });
+  const session = row(db, 'SELECT workspace_id FROM sessions WHERE id=?', sessionId);
+  if (session) run(db, 'UPDATE workspaces SET history_coverage=?,updated_at=? WHERE id=?', workspaceHistoryCoverage(db, session.workspace_id), new Date().toISOString(), session.workspace_id);
+  return { user_inputs_complete: incompleteInputs === 0, provider_outputs_complete: incompleteOutputs === 0, derived_complete: incompleteDerived === 0, search_complete: incompleteDerived === 0, attachments_complete: incompleteInputs === 0 && incompleteOutputs === 0 };
+}
+
+function sniffAssetMime(filePath, declaredType, name = '') {
+  const fd = fs.openSync(filePath, 'r');
+  const head = Buffer.alloc(16);
+  const length = fs.readSync(fd, head, 0, head.length, 0);
+  fs.closeSync(fd);
+  const bytes = head.subarray(0, length);
+  if (bytes.subarray(0, 8).equals(Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]))) return 'image/png';
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+  if (bytes.subarray(0, 4).toString('ascii') === '%PDF') return 'application/pdf';
+  if (bytes.subarray(0, 4).toString('ascii') === 'RIFF' && bytes.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+  if (bytes.subarray(0, 4).equals(Buffer.from([0x50,0x4b,0x03,0x04]))) return String(declaredType || '').includes('vnd.') ? String(declaredType).split(';')[0].trim().toLowerCase() : 'application/zip';
+  const extension = path.extname(String(name || '')).toLowerCase();
+  if (['.txt','.md','.csv','.json','.js','.mjs','.ts','.tsx','.py','.c','.h','.sv','.v'].includes(extension)) return String(declaredType || 'text/plain').split(';')[0].trim().toLowerCase() || 'text/plain';
+  const normalizedDeclared = String(declaredType || '').split(';')[0].trim().toLowerCase();
+  if (['application/pdf','image/png','image/jpeg','image/webp'].includes(normalizedDeclared)) return 'application/octet-stream';
+  return normalizedDeclared || 'application/octet-stream';
 }
 
 async function streamRequestToFile(req, filePath, maxBytes = 1024 * 1024 * 1024) {
@@ -198,13 +304,15 @@ function getSettings() {
 }
 
 function workspaceSummary(id) {
-  const workspace = row(db, 'SELECT * FROM workspaces WHERE id = ?', id);
+  const workspace = row(db, `SELECT * FROM workspaces WHERE id=? AND lifecycle_status='active'`, id);
   if (!workspace) return null;
   const projectFiles = rows(db, 'SELECT * FROM workspace_files WHERE workspace_id = ? ORDER BY relative_path', id);
   return {
     ...workspace,
     roots: workspaceRoots(db, id),
     integrity: workspaceIntegrity(db, id),
+    representation_coverage: representationCoverage(db, id),
+    instruction_context: instructionContext(db, id),
     resources: currentWorkspaceResources(db, id),
     providers: rows(db, 'SELECT * FROM provider_links WHERE workspace_id = ? ORDER BY provider', id),
     sessions: rows(db, 'SELECT * FROM sessions WHERE workspace_id = ? ORDER BY started_at DESC LIMIT 100', id),
@@ -216,7 +324,9 @@ function workspaceSummary(id) {
     decisions: rows(db, 'SELECT * FROM decisions WHERE workspace_id = ? ORDER BY created_at DESC', id),
     tasks: rows(db, `SELECT * FROM workspace_tasks WHERE workspace_id = ? ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, priority, updated_at DESC`, id),
     imports: rows(db, 'SELECT * FROM imports WHERE workspace_id = ? ORDER BY created_at DESC LIMIT 50', id),
-    archive: archiveStats(id)
+    archive: archiveStats(id),
+    jobs: rows(db, 'SELECT * FROM background_jobs WHERE workspace_id=? ORDER BY created_at DESC LIMIT 50', id),
+    processing_queue: backgroundQueueStatus()
   };
 }
 
@@ -224,6 +334,18 @@ function archiveStats(workspaceId = null) {
   const whereSession = workspaceId ? 'WHERE workspace_id = ?' : '';
   const whereArtifact = workspaceId ? 'WHERE workspace_id = ?' : '';
   const params = workspaceId ? [workspaceId] : [];
+  const derivedTypes = "'derived_representation','pdf_page_image','pdf_embedded_image'";
+  let backupBytes = 0;
+  try {
+    for (const entry of fs.readdirSync(storage.backupsDir, { withFileTypes: true })) {
+      if (entry.isFile()) backupBytes += fs.statSync(path.join(storage.backupsDir, entry.name)).size;
+    }
+  } catch {}
+  const projectResourceBytes = workspaceId
+    ? Number(row(db, `SELECT COALESCE(SUM(v.size_bytes),0) AS n FROM workspace_resources r JOIN resource_versions v ON v.id=r.current_version_id WHERE r.workspace_id=? AND r.status='active'`, workspaceId)?.n || 0)
+    : 0;
+  const derivedBytes = Number(row(db, `SELECT COALESCE(SUM(size_bytes),0) AS n FROM artifacts ${workspaceId ? `WHERE workspace_id=? AND artifact_type IN (${derivedTypes})` : `WHERE artifact_type IN (${derivedTypes})`}`, ...params)?.n || 0);
+  const originalArchiveBytes = Number(row(db, `SELECT COALESCE(SUM(size_bytes),0) AS n FROM artifacts ${workspaceId ? `WHERE workspace_id=? AND artifact_type NOT IN (${derivedTypes})` : `WHERE artifact_type NOT IN (${derivedTypes})`}`, ...params)?.n || 0);
   return {
     sessions: Number(row(db, `SELECT COUNT(*) AS n FROM sessions ${whereSession}`, ...params)?.n || 0),
     messages: Number(row(db, workspaceId
@@ -231,6 +353,11 @@ function archiveStats(workspaceId = null) {
       : `SELECT COUNT(*) AS n FROM messages`, ...params)?.n || 0),
     artifacts: Number(row(db, `SELECT COUNT(*) AS n FROM artifacts ${whereArtifact}`, ...params)?.n || 0),
     artifact_bytes: Number(row(db, `SELECT COALESCE(SUM(size_bytes),0) AS n FROM artifacts ${whereArtifact}`, ...params)?.n || 0),
+    project_resource_bytes: projectResourceBytes,
+    original_archive_bytes: originalArchiveBytes,
+    derived_bytes: derivedBytes,
+    backup_bytes: backupBytes,
+    total_known_bytes: projectResourceBytes + originalArchiveBytes + derivedBytes + backupBytes,
     imports: Number(row(db, workspaceId ? `SELECT COUNT(*) AS n FROM imports WHERE workspace_id=?` : `SELECT COUNT(*) AS n FROM imports`, ...params)?.n || 0),
     safe_sessions: Number(row(db, workspaceId
       ? `SELECT COUNT(*) AS n FROM sessions WHERE workspace_id=? AND capture_status='safe_to_delete'`
@@ -386,11 +513,32 @@ function readiness() {
   };
 }
 
+function bearerToken(req) {
+  const match = String(req.headers.authorization || '').match(/^Bearer\s+([^\s]+)$/i);
+  return match?.[1] || '';
+}
+
+function streamVaultFile(res, artifact, { disposition = 'inline', name = 'artifact' } = {}) {
+  if (!artifact?.vault_path || !isPathWithin(artifact.vault_path, storage.vaultDir) || !fs.existsSync(artifact.vault_path)) return sendJson(res, 404, { ok: false, code: 'ARTIFACT_NOT_AVAILABLE' });
+  const stat = fs.statSync(artifact.vault_path);
+  if (!stat.isFile() || stat.size > 100 * 1024 * 1024 || (artifact.sha256 && sha256File(artifact.vault_path) !== artifact.sha256)) return sendJson(res, 409, { ok: false, code: 'ARTIFACT_INTEGRITY_FAILURE' });
+  const safeName = path.basename(name).replace(/[\r\n"]/g, '_');
+  res.writeHead(200, {
+    'Content-Type': artifact.mime_type || 'application/octet-stream',
+    'Content-Length': stat.size,
+    'Content-Disposition': `${disposition}; filename="${safeName}"`,
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff'
+  });
+  return fs.createReadStream(artifact.vault_path).pipe(res);
+}
+
 async function handleApi(req, res, url) {
   if (req.method === 'OPTIONS') return sendJson(res, 204, {});
 
   const pairingChallengePath = url.pathname === '/api/companion/pairing-challenge';
   const pairingPath = url.pathname === '/api/companion/pair';
+  const agentContextProtected = url.pathname.startsWith('/api/agent-context/');
   const companionProtected = url.pathname.startsWith('/api/companion/') && !pairingChallengePath && !pairingPath;
   if (companionProtected) {
     const authenticated = authenticateCompanionRequest(db, req, { installSecret: companionCredential.secret });
@@ -401,11 +549,78 @@ async function handleApi(req, res, url) {
   } else if (pairingPath) {
     const extensionId = String(req.headers['x-aih-extension-id'] || '');
     if (req.headers.origin !== `chrome-extension://${extensionId}`) return sendJson(res, 403, { ok: false, code: 'ORIGIN_REJECTED', error: 'pairing origin rejected' });
-  } else if (!['GET', 'HEAD'].includes(req.method) && !isSameOriginDashboardRequest(req, port)) {
+  } else if (!agentContextProtected && !['GET', 'HEAD'].includes(req.method) && !isSameOriginDashboardRequest(req, port)) {
     return sendJson(res, 403, { ok: false, code: 'ORIGIN_REJECTED', error: 'request origin rejected' });
   }
 
   if (url.pathname === '/api/health') return sendJson(res, 200, { ok: true, version: HARNESS_VERSION, protocol_version: COMPANION_PROTOCOL_VERSION, source_root: rootDir, pid: process.pid, database: 'sqlite', storage: storageSummary(db), archive: archiveStats(), pending_managed_project_migrations: pendingManagedWorkspaceMigrations(db).length });
+  if (url.pathname === '/api/tools' && req.method === 'GET') return sendJson(res, 200, multimodalToolStatus());
+  if (url.pathname === '/api/dialogs/select-source' && req.method === 'POST') {
+    try {
+      const body = await readJson(req, 16 * 1024);
+      const selected = await selectSourceFolder();
+      if (!selected) return sendJson(res, 200, { selected: false });
+      const canonical = fs.realpathSync.native(selected);
+      const gitRepository = fs.existsSync(path.join(canonical, '.git'));
+      const duplicate = body.workspace_id ? row(db, 'SELECT id,label FROM workspace_roots WHERE workspace_id=? AND canonical_path=?', String(body.workspace_id), canonical) : null;
+      return sendJson(res, 200, {
+        selected: true,
+        path: canonical,
+        detected: { kind: gitRepository ? 'Git repository' : 'Folder', git_repository: gitRepository },
+        duplicate: duplicate ? { root_id: duplicate.id, label: duplicate.label } : null
+      });
+    } catch (error) { return sendJson(res, 503, { ok: false, code: error.code || 'SOURCE_PICKER_FAILED', error: error.message }); }
+  }
+  if (url.pathname === '/api/surfaces' && req.method === 'GET') {
+    const clients = rows(db, 'SELECT provider,last_seen_at,metadata_json FROM companion_clients ORDER BY last_seen_at DESC');
+    const agents = agentCapabilities();
+    const surfaces = surfaceRegistry.list().map(surface => {
+      if (surface.channel === 'browser_companion') {
+        const provider = surface.id.startsWith('chatgpt') ? 'chatgpt' : 'gemini';
+        const live = clients.find(item => item.provider === provider && JSON.parse(item.metadata_json || '{}').surface_id === surface.id);
+        return publicSurfaceStatus(surface, live ? { status: 'connected', last_seen_at: live.last_seen_at } : { status: 'not_detected', limitation: 'Open or refresh the native provider page after pairing the companion.' });
+      }
+      const agent = surface.id.split('.')[0];
+      return publicSurfaceStatus(surface, agents[agent]?.available ? { status: 'available' } : { status: 'not_installed', limitation: agents[agent]?.code || 'TOOL_NOT_INSTALLED' });
+    });
+    return sendJson(res, 200, surfaces);
+  }
+  if (url.pathname === '/api/security' && req.method === 'GET') return sendJson(res, 200, {
+    companion: pairedCompanionStatus(db),
+    active_agent_context_sessions: rows(db, `SELECT id,workspace_id,root_id,agent,capabilities_json,expires_at,last_used_at,created_at FROM agent_context_sessions WHERE revoked_at IS NULL AND expires_at>? ORDER BY created_at DESC`, new Date().toISOString()),
+    boundaries: { dashboard: 'same-origin localhost mutations only', browser_companion: 'paired allowlisted continuity operations only; no filesystem or shell', local_agents: 'registered repository plus expiring read-only context session' }
+  });
+  if (url.pathname === '/api/security/companion/revoke' && req.method === 'POST') {
+    const body = await readJson(req, 16 * 1024);
+    const extensionId = String(body.extension_id || pairedCompanionStatus(db)?.extension_id || '');
+    if (!extensionId) return sendJson(res, 404, { ok: false, code: 'COMPANION_NOT_PAIRED' });
+    run(db, 'UPDATE companion_pairings SET revoked_at=? WHERE extension_id=? AND revoked_at IS NULL', new Date().toISOString(), extensionId);
+    return sendJson(res, 200, { ok: true, extension_id: extensionId });
+  }
+  const revokeAgentSessionMatch = url.pathname.match(/^\/api\/security\/agent-context\/([^/]+)\/revoke$/);
+  if (revokeAgentSessionMatch && req.method === 'POST') return revokeAgentContextSession(db, revokeAgentSessionMatch[1])
+    ? sendJson(res, 200, { ok: true }) : sendJson(res, 404, { ok: false, code: 'AGENT_CONTEXT_NOT_ACTIVE' });
+
+  const agentContextPath = url.pathname.match(/^\/api\/agent-context\/(status|query|sources|resource|visual)(?:\/([^/]+))?$/);
+  if (agentContextPath) {
+    const capability = agentContextPath[1];
+    const authenticated = authenticateAgentContext(db, bearerToken(req), capability);
+    if (!authenticated.ok) return sendJson(res, authenticated.code === 'AGENT_CONTEXT_EXPIRED' ? 410 : 401, authenticated);
+    try {
+      if (capability === 'status' && req.method === 'GET') return sendJson(res, 200, agentContextStatus(db, authenticated.session));
+      if (capability === 'query' && req.method === 'POST') {
+        const body = await readJson(req, 128 * 1024);
+        return sendJson(res, 200, agentContextQuery(db, authenticated.session, String(body.query || ''), body.character_budget));
+      }
+      if (capability === 'sources' && req.method === 'GET') return sendJson(res, 200, agentContextSources(db, authenticated.session));
+      if (capability === 'resource' && req.method === 'GET' && agentContextPath[2]) return sendJson(res, 200, agentContextResource(db, authenticated.session, decodeURIComponent(agentContextPath[2])));
+      if (capability === 'visual' && req.method === 'GET' && agentContextPath[2]) {
+        const visual = agentContextVisual(db, authenticated.session, decodeURIComponent(agentContextPath[2]));
+        return streamVaultFile(res, visual, { disposition: 'inline', name: `${path.basename(visual.relative_path)}-${visual.page_start || 'visual'}` });
+      }
+      return sendJson(res, 405, { ok: false, code: 'METHOD_NOT_ALLOWED' });
+    } catch (error) { return sendJson(res, error.code?.endsWith('_NOT_FOUND') ? 404 : 400, { ok: false, code: error.code || 'AGENT_CONTEXT_FAILED', error: error.message }); }
+  }
   if (url.pathname === '/api/update-status' && req.method === 'GET') return sendJson(res, 200, await applicationUpdateStatus({ fetch: url.searchParams.get('refresh') === '1' }));
   if (url.pathname === '/api/update-and-restart' && req.method === 'POST') {
     const status = await applicationUpdateStatus({ fetch: true });
@@ -439,9 +654,14 @@ async function handleApi(req, res, url) {
   }
   if (url.pathname === '/api/companion/heartbeat' && req.method === 'POST') {
     const body = await readJson(req);
+    let surface;
+    try { surface = surfaceRegistry.resolve(body.surface_id || body.metadata?.surface_id); }
+    catch (error) { return sendJson(res, 409, { ok: false, code: error.code || 'SURFACE_UNSUPPORTED', error: error.message }); }
+    const expected = browserSurfaceForProvider(body.provider);
+    if (surface.id !== expected.id || surface.channel !== 'browser_companion') return sendJson(res, 409, { ok: false, code: 'SURFACE_PROVIDER_MISMATCH' });
     const clientId = req.aihCompanion.extensionId;
     const ts = new Date().toISOString();
-    const metadata = { ...(body.metadata || {}), protocol_version: Number(body.protocol_version || 0) };
+    const metadata = { ...(body.metadata || {}), surface_id: surface.id, protocol_version: Number(body.protocol_version || 0) };
     run(db, `INSERT INTO companion_clients (client_id,version,provider,last_seen_at,metadata_json) VALUES (?,?,?,?,?) ON CONFLICT(client_id) DO UPDATE SET version=excluded.version,provider=excluded.provider,last_seen_at=excluded.last_seen_at,metadata_json=excluded.metadata_json`, clientId, body.version || '', body.provider || '', ts, JSON.stringify(metadata));
     return sendJson(res, 200, readiness());
   }
@@ -469,6 +689,33 @@ async function handleApi(req, res, url) {
     catch (error) { return sendJson(res, error.code === 'SESSION_WORKSPACE_MISMATCH' ? 409 : 400, { ok: false, code: error.code || 'CAPTURE_FAILED', error: error.message }); }
   }
 
+  const prewarmMatch = url.pathname.match(/^\/api\/companion\/workspaces\/([^/]+)\/prewarm$/);
+  if (prewarmMatch && req.method === 'POST') {
+    const workspaceId = prewarmMatch[1];
+    if (!row(db, 'SELECT id FROM workspaces WHERE id=?', workspaceId)) return sendJson(res, 404, { ok: false, code: 'WORKSPACE_NOT_FOUND' });
+    const existing = row(db, `SELECT * FROM background_jobs WHERE workspace_id=? AND job_type='verify_sources' AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1`, workspaceId);
+    if (existing) return sendJson(res, 202, { ok: true, reused: true, job: existing });
+    const job = createBackgroundJob(db, { workspaceId, jobType: 'verify_sources', targetType: 'workspace', targetId: workspaceId });
+    startBackgroundJob(db, job.id, async progress => {
+      progress({ phase: 'warming source manifest and current representations' });
+      const resources = reconcileWorkspaceResources(db, workspaceId);
+      progress({ phase: 'refreshing repository state' });
+      const repository = refreshWorkspaceRepositories(db, workspaceId);
+      return { resources, repository };
+    });
+    return sendJson(res, 202, { ok: true, reused: false, job });
+  }
+
+  const draftContextMatch = url.pathname.match(/^\/api\/companion\/workspaces\/([^/]+)\/draft-context$/);
+  if (draftContextMatch && req.method === 'POST') {
+    try {
+      const body = await readJson(req, 64 * 1024);
+      const expected = browserSurfaceForProvider(body.provider);
+      if (expected.id !== body.surface_id) return sendJson(res, 409, { ok: false, code: 'SURFACE_PROVIDER_MISMATCH' });
+      return sendJson(res, 200, { ok: true, ...prepareSpeculativeDraft(db, { workspaceId: draftContextMatch[1], sessionId: String(body.session_id || ''), surfaceId: body.surface_id, provider: body.provider, query: body.query }) });
+    } catch (error) { return sendJson(res, 400, { ok: false, code: error.code || 'DRAFT_CONTEXT_FAILED', error: error.message }); }
+  }
+
   const prepareSendMatch = url.pathname.match(/^\/api\/companion\/workspaces\/([^/]+)\/prepare-send$/);
   if (prepareSendMatch && req.method === 'POST') {
     try {
@@ -484,6 +731,7 @@ async function handleApi(req, res, url) {
       if (capabilities.ok !== true) {
         return sendJson(res, 412, { ok: false, freshness: 'blocked', reasons: (capabilities.failures || []).map(item => ({ code: item.code || 'PROVIDER_CAPABILITY_FAILED', message: `required provider capability failed: ${item.capability || 'unknown'}` })) });
       }
+      if (capabilities.surface_id !== body.surface_id) return sendJson(res, 409, { ok: false, freshness: 'blocked', reasons: [{ code: 'SURFACE_CAPABILITY_MISMATCH', message: 'surface identity and capability evidence do not match' }] });
       const result = prepareManagedSend(db, {
         workspaceId: prepareSendMatch[1],
         provider: body.provider,
@@ -492,6 +740,7 @@ async function handleApi(req, res, url) {
         attemptId: body.attempt_id,
         promptHash: body.prompt_hash,
         providerRoute: body.route,
+        surfaceId: body.surface_id,
         protocolVersion: body.protocol_version,
         attachmentMode: body.attachment_mode,
         fallbackFromRunId: body.fallback_from_run_id,
@@ -524,8 +773,8 @@ async function handleApi(req, res, url) {
 
   const resourceVersionContent = url.pathname.match(/^\/api\/companion\/resource-versions\/([^/]+)\/content$/);
   if (resourceVersionContent && req.method === 'GET') {
-    const version = row(db, `SELECT v.*,r.relative_path,r.mime_type,r.current_version_id,r.provider_transmission_allowed,
-      wr.provider_transmission_allowed AS root_transmission_allowed,wr.status AS root_status,wr.root_path,wr.canonical_path,a.vault_path
+    const version = row(db, `SELECT v.*,r.relative_path,r.resource_type,r.mime_type,r.current_version_id,r.provider_transmission_allowed,
+      wr.provider_transmission_allowed AS root_transmission_allowed,wr.status AS root_status,wr.root_path,wr.canonical_path,wr.root_kind,a.vault_path
       FROM resource_versions v
       JOIN workspace_resources r ON r.id=v.resource_id
       JOIN workspace_roots wr ON wr.id=r.root_id
@@ -534,10 +783,10 @@ async function handleApi(req, res, url) {
     if (!version || version.current_version_id !== version.id || !version.provider_transmission_allowed || !version.root_transmission_allowed || version.root_status !== 'current' || !version.vault_path) {
       return sendJson(res, 404, { ok: false, code: 'RESOURCE_NOT_AVAILABLE' });
     }
-    if (String(version.security_status).startsWith('local_only') || !isPathWithin(version.vault_path, storage.vaultDir) || !fs.existsSync(version.vault_path)) {
+    if (version.security_status !== 'clear' || (['pdf','image'].includes(version.resource_type) && version.representation_coverage !== 'complete') || !isPathWithin(version.vault_path, storage.vaultDir) || !fs.existsSync(version.vault_path)) {
       return sendJson(res, 403, { ok: false, code: 'RESOURCE_TRANSMISSION_BLOCKED' });
     }
-    try {
+    if (version.root_kind !== 'provider_archive') try {
       const live = resolveApprovedTarget(version, version.relative_path, { expectedType: 'file' });
       if (sha256File(live.absolutePath) !== version.sha256) return sendJson(res, 409, { ok: false, code: 'PREPARED_ATTACHMENT_INVALIDATED' });
     } catch (error) {
@@ -555,6 +804,23 @@ async function handleApi(req, res, url) {
       'X-Content-Type-Options': 'nosniff'
     });
     return fs.createReadStream(version.vault_path).pipe(res);
+  }
+
+  const representationContent = url.pathname.match(/^\/api\/companion\/representations\/([^/]+)\/content$/);
+  if (representationContent && req.method === 'GET') {
+    const representation = row(db, `SELECT rr.*,r.relative_path,r.current_version_id,r.provider_transmission_allowed,v.sha256 AS version_sha256,v.security_status AS version_security_status,
+      wr.provider_transmission_allowed AS root_transmission_allowed,wr.status AS root_status,wr.root_path,wr.canonical_path,wr.root_kind,
+      a.vault_path,a.mime_type,a.size_bytes,a.sha256,a.name
+      FROM resource_representations rr JOIN workspace_resources r ON r.id=rr.resource_id
+      JOIN resource_versions v ON v.id=rr.resource_version_id JOIN workspace_roots wr ON wr.id=r.root_id
+      JOIN artifacts a ON a.id=rr.artifact_id WHERE rr.id=?`, representationContent[1]);
+    if (!representation || representation.current_version_id !== representation.resource_version_id || !representation.provider_transmission_allowed || !representation.root_transmission_allowed || representation.root_status !== 'current') return sendJson(res, 404, { ok: false, code: 'REPRESENTATION_NOT_AVAILABLE' });
+    if (representation.security_status !== 'clear' || representation.version_security_status !== 'clear') return sendJson(res, 403, { ok: false, code: 'REPRESENTATION_TRANSMISSION_BLOCKED' });
+    if (representation.root_kind !== 'provider_archive') try {
+      const live = resolveApprovedTarget(representation, representation.relative_path, { expectedType: 'file' });
+      if (sha256File(live.absolutePath) !== representation.version_sha256) return sendJson(res, 409, { ok: false, code: 'PREPARED_REPRESENTATION_INVALIDATED' });
+    } catch (error) { return sendJson(res, 409, { ok: false, code: 'PREPARED_REPRESENTATION_INVALIDATED', error: error.message }); }
+    return streamVaultFile(res, representation, { disposition: 'attachment', name: `${path.parse(representation.relative_path).name}-page-${representation.page_start || 'visual'}${path.extname(representation.name || '') || '.png'}` });
   }
 
   if (url.pathname === '/api/imports/start' && req.method === 'POST') {
@@ -589,7 +855,12 @@ async function handleApi(req, res, url) {
   if (assetSourceMatch && req.method === 'GET') {
     const asset = row(db, `SELECT a.*,s.provider AS session_provider,s.workspace_id FROM session_assets a JOIN sessions s ON s.id=a.session_id WHERE a.id=?`, assetSourceMatch[1]);
     if (!asset) return sendJson(res, 404, { ok: false, code: 'ASSET_NOT_DISCOVERED' });
-    const validated = validateProviderAssetUrl(asset.session_provider, asset.source_url);
+    let metadata = {};
+    try { metadata = JSON.parse(asset.metadata_json || '{}'); } catch {}
+    const directInput = asset.origin_kind === 'user_input' && metadata.capture_strategy === 'direct_input' && !asset.source_url;
+    const validated = directInput
+      ? { ok: true, url: '', capture_strategy: 'direct_input' }
+      : validateProviderAssetUrl(asset.session_provider, asset.source_url);
     if (!validated.ok) return sendJson(res, 403, { ok: false, code: validated.code, status: validated.status });
     if (String(asset.mirror_status).toUpperCase() === 'CAPTURED') return sendJson(res, 409, { ok: false, code: 'ASSET_ALREADY_CAPTURED' });
     if (!['DISCOVERED', 'FETCHING'].includes(String(asset.mirror_status).toUpperCase())) return sendJson(res, 409, { ok: false, code: 'ASSET_STATE_REJECTED', status: asset.mirror_status });
@@ -602,7 +873,7 @@ async function handleApi(req, res, url) {
       source_url: validated.url,
       capture_strategy: validated.capture_strategy,
       mime_type: asset.mime_type,
-      max_bytes: validated.capture_strategy === 'page_blob' ? 25 * 1024 * 1024 : 100 * 1024 * 1024
+      max_bytes: ['page_blob','direct_input'].includes(validated.capture_strategy) ? 25 * 1024 * 1024 : 100 * 1024 * 1024
     });
   }
 
@@ -611,24 +882,29 @@ async function handleApi(req, res, url) {
     const asset = row(db, `SELECT a.*, s.workspace_id, s.provider AS session_provider FROM session_assets a JOIN sessions s ON s.id=a.session_id WHERE a.id=?`, assetContentMatch[1]);
     if (!asset) return sendJson(res, 404, { ok: false, code: 'ASSET_NOT_DISCOVERED', error: 'asset reference not found' });
     if (!['DISCOVERED', 'FETCHING'].includes(String(asset.mirror_status).toUpperCase())) return sendJson(res, 409, { ok: false, code: 'ASSET_STATE_REJECTED', status: asset.mirror_status });
-    const validatedUrl = validateProviderAssetUrl(asset.session_provider, asset.source_url);
+    let assetMetadata = {};
+    try { assetMetadata = JSON.parse(asset.metadata_json || '{}'); } catch {}
+    const directInput = asset.origin_kind === 'user_input' && assetMetadata.capture_strategy === 'direct_input' && !asset.source_url;
+    const validatedUrl = directInput
+      ? { ok: true, url: '', capture_strategy: 'direct_input' }
+      : validateProviderAssetUrl(asset.session_provider, asset.source_url);
     if (!validatedUrl.ok) return sendJson(res, 403, { ok: false, code: validatedUrl.code, status: validatedUrl.status });
     const suppliedSource = String(req.headers['x-aih-asset-source-url'] || '');
     if (suppliedSource !== asset.source_url) return sendJson(res, 403, { ok: false, code: 'ASSET_SOURCE_MISMATCH' });
     const captureStrategy = String(req.headers['x-aih-asset-capture-strategy'] || 'background_https');
     if (captureStrategy !== validatedUrl.capture_strategy) return sendJson(res, 403, { ok: false, code: 'ASSET_CAPTURE_STRATEGY_MISMATCH' });
     const declaredLength = Number(req.headers['content-length'] || 0);
-    const assetLimit = captureStrategy === 'page_blob' ? 25 * 1024 * 1024 : 100 * 1024 * 1024;
+    const assetLimit = ['page_blob','direct_input'].includes(captureStrategy) ? 25 * 1024 * 1024 : 100 * 1024 * 1024;
     if (declaredLength > assetLimit) {
       run(db, `UPDATE session_assets SET mirror_status='FAILED',metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.capture_error',?),updated_at=? WHERE id=?`, `asset exceeds ${assetLimit} byte capture limit`, new Date().toISOString(), asset.id);
-      setCaptureStages(db, asset.session_id, { attachments: false });
+      recomputeSessionAssetStages(asset.session_id);
       return sendJson(res, 413, { ok: false, code: 'ASSET_TOO_LARGE' });
     }
     const receivedType = String(req.headers['content-type'] || 'application/octet-stream').split(';')[0].trim().toLowerCase();
     const allowedTypes = /^(?:image\/|application\/(?:pdf|zip|octet-stream|vnd\.)|text\/)/;
     if (!allowedTypes.test(receivedType) || !providerAssetMimeCompatible(asset.mime_type, receivedType)) {
       run(db, `UPDATE session_assets SET mirror_status='FAILED',metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.capture_error',?),updated_at=? WHERE id=?`, `received MIME ${receivedType || '(missing)'} did not match ${asset.mime_type || '(unspecified)'}`, new Date().toISOString(), asset.id);
-      setCaptureStages(db, asset.session_id, { attachments: false });
+      recomputeSessionAssetStages(asset.session_id);
       return sendJson(res, 415, { ok: false, code: 'ASSET_MIME_REJECTED' });
     }
     run(db, `UPDATE session_assets SET mirror_status='FETCHING',updated_at=? WHERE id=?`, new Date().toISOString(), asset.id);
@@ -638,26 +914,43 @@ async function handleApi(req, res, url) {
     try {
       const size = await streamRequestToFile(req, tempPath, assetLimit);
       if (!size) throw Object.assign(new Error('empty provider asset rejected'), { code: 'ASSET_EMPTY' });
+      const detectedType = sniffAssetMime(tempPath, receivedType, asset.name);
+      if (!providerAssetMimeCompatible(asset.mime_type, detectedType)) throw Object.assign(new Error(`captured bytes have MIME ${detectedType}, which conflicts with observed ${asset.mime_type}`), { code: 'ASSET_MIME_REJECTED' });
+      const sourceType = asset.origin_kind === 'user_input'
+        ? asset.capture_method === 'clipboard_image' ? 'clipboard_image' : 'provider_user_attachment'
+        : 'provider_generated_asset';
+      const provenance = {
+        originating_provider_family: asset.session_provider,
+        originating_surface: `${asset.session_provider}.web`,
+        session_id: asset.session_id,
+        provider_conversation_id: row(db, 'SELECT external_id FROM sessions WHERE id=?', asset.session_id)?.external_id || '',
+        user_message_id: asset.originating_provider_message_id || '',
+        attachment_native_id: asset.native_id,
+        original_displayed_filename: asset.name,
+        capture_method: asset.capture_method,
+        origin_kind: asset.origin_kind
+      };
       const artifact = archiveFile(db, {
         filePath: tempPath,
         workspaceId: asset.workspace_id,
         sessionId: asset.session_id,
         provider: asset.session_provider,
-        artifactType: asset.asset_type || 'file',
+        artifactType: sourceType,
         sourceUrl: asset.source_url,
         nativeId: asset.native_id,
         sourcePathOverride: `live:${asset.session_provider}:${asset.session_id}:${asset.id}`,
-        metadata: { original_name: asset.name, declared_mime_type: asset.mime_type, captured_via: 'browser_companion', capture_strategy: captureStrategy }
+        metadata: { original_name: asset.name, declared_mime_type: asset.mime_type, detected_mime_type: detectedType, captured_via: 'browser_companion', capture_strategy: captureStrategy, source_type: sourceType, provenance }
       });
-      run(db, `UPDATE artifacts SET name=?, mime_type=? WHERE id=?`, asset.name || artifact.name, receivedType || asset.mime_type || artifact.mime_type, artifact.id);
-      run(db, `UPDATE session_assets SET mirror_status='CAPTURED',artifact_id=?,updated_at=? WHERE id=?`, artifact.id, new Date().toISOString(), asset.id);
-      const unmirrored = Number(row(db, `SELECT COUNT(*) AS n FROM session_assets WHERE session_id=? AND UPPER(mirror_status)!='CAPTURED'`, asset.session_id)?.n || 0);
-      if (unmirrored === 0) setCaptureStages(db, asset.session_id, { attachments: true });
-      return sendJson(res, 201, { artifact_id: artifact.id, size_bytes: size, sha256: artifact.sha256, attachments_complete: unmirrored === 0 });
+      run(db, `UPDATE artifacts SET name=?,mime_type=? WHERE id=?`, asset.name || artifact.name, detectedType, artifact.id);
+      const providerResource = ingestProviderArtifactResource(db, { workspaceId: asset.workspace_id, artifact: row(db, 'SELECT * FROM artifacts WHERE id=?', artifact.id), sourceId: asset.id, provider: asset.session_provider, name: asset.name, sourceType, provenance });
+      run(db, `UPDATE session_assets SET mirror_status='CAPTURED',artifact_id=?,resource_id=?,resource_version_id=?,updated_at=? WHERE id=?`, artifact.id, providerResource.resource.id, providerResource.version.id, new Date().toISOString(), asset.id);
+      const stageState = recomputeSessionAssetStages(asset.session_id);
+      return sendJson(res, 201, { artifact_id: artifact.id, resource_id: providerResource.resource.id, resource_version_id: providerResource.version.id, reconciled_existing_resource: Boolean(providerResource.reconciled), size_bytes: size, sha256: artifact.sha256, ...stageState });
     } catch (error) {
       run(db, `UPDATE session_assets SET mirror_status='FAILED',metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.capture_error',?),updated_at=? WHERE id=?`, String(error.message || '').slice(0, 500), new Date().toISOString(), asset.id);
-      setCaptureStages(db, asset.session_id, { attachments: false });
-      return sendJson(res, error.message === 'file too large' ? 413 : 400, { ok: false, code: error.code || 'ASSET_CAPTURE_FAILED', error: error.message });
+      recomputeSessionAssetStages(asset.session_id);
+      const failureStatus = error.message === 'file too large' ? 413 : error.code === 'ASSET_MIME_REJECTED' ? 415 : 400;
+      return sendJson(res, failureStatus, { ok: false, code: error.code || 'ASSET_CAPTURE_FAILED', error: error.message });
     } finally {
       try { fs.unlinkSync(tempPath); } catch {}
     }
@@ -690,13 +983,114 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, { theme });
   }
 
+  if (url.pathname === '/api/personalization' && req.method === 'GET') {
+    const item = activePersonalization(db, { scope: 'global' });
+    return sendJson(res, 200, item ? { ...item, profile: JSON.parse(item.profile_json || '{}') } : null);
+  }
+  if (url.pathname === '/api/personalization' && req.method === 'PUT') {
+    try {
+      const body = await readJson(req, 64 * 1024);
+      const item = savePersonalization(db, { scope: 'global', profile: body.profile || {}, notes: body.notes || '' });
+      return sendJson(res, 200, { ...item, profile: JSON.parse(item.profile_json || '{}') });
+    } catch (error) { return sendJson(res, 400, { ok: false, code: error.code || 'PROFILE_SAVE_FAILED', error: error.message }); }
+  }
+
+  const instructionsMatch = url.pathname.match(/^\/api\/workspaces\/([^/]+)\/instructions$/);
+  if (instructionsMatch && req.method === 'GET') return sendJson(res, 200, activeProjectInstructions(db, instructionsMatch[1]));
+  if (instructionsMatch && req.method === 'PUT') {
+    try { return sendJson(res, 200, saveProjectInstructions(db, instructionsMatch[1], (await readJson(req, 64 * 1024)).content)); }
+    catch (error) { return sendJson(res, 400, { ok: false, code: error.code || 'INSTRUCTIONS_SAVE_FAILED', error: error.message }); }
+  }
+  const workspaceProfileMatch = url.pathname.match(/^\/api\/workspaces\/([^/]+)\/personalization$/);
+  if (workspaceProfileMatch && req.method === 'GET') {
+    const item = activePersonalization(db, { scope: 'workspace', workspaceId: workspaceProfileMatch[1] });
+    return sendJson(res, 200, item ? { ...item, profile: JSON.parse(item.profile_json || '{}') } : null);
+  }
+  if (workspaceProfileMatch && req.method === 'PUT') {
+    try {
+      const body = await readJson(req, 64 * 1024);
+      const item = savePersonalization(db, { scope: 'workspace', workspaceId: workspaceProfileMatch[1], profile: body.profile || {}, notes: body.notes || '' });
+      return sendJson(res, 200, { ...item, profile: JSON.parse(item.profile_json || '{}') });
+    } catch (error) { return sendJson(res, 400, { ok: false, code: error.code || 'PROFILE_SAVE_FAILED', error: error.message }); }
+  }
+  const instructionHistoryMatch = url.pathname.match(/^\/api\/workspaces\/([^/]+)\/instruction-history$/);
+  if (instructionHistoryMatch && req.method === 'GET') return sendJson(res, 200, instructionHistory(db, instructionHistoryMatch[1]));
+
+  const resourceDetailMatch = url.pathname.match(/^\/api\/resources\/([^/]+)$/);
+  if (resourceDetailMatch && req.method === 'GET') {
+    const resource = row(db, 'SELECT * FROM workspace_resources WHERE id=?', resourceDetailMatch[1]);
+    if (!resource) return sendJson(res, 404, { ok: false, code: 'RESOURCE_NOT_FOUND' });
+    return sendJson(res, 200, {
+      ...resource,
+      origin: JSON.parse(resource.origin_json || '{}'),
+      versions: rows(db, 'SELECT * FROM resource_versions WHERE resource_id=? ORDER BY observed_at DESC', resource.id).map(item => ({ ...item, metadata: JSON.parse(item.metadata_json || '{}'), coverage: JSON.parse(item.coverage_json || '{}') })),
+      representations: rows(db, `SELECT rr.*,a.name,a.mime_type,a.size_bytes,a.sha256 AS artifact_sha256 FROM resource_representations rr LEFT JOIN artifacts a ON a.id=rr.artifact_id WHERE rr.resource_id=? ORDER BY rr.created_at DESC,rr.page_start`, resource.id).map(item => ({ ...item, metadata: JSON.parse(item.metadata_json || '{}'), region: JSON.parse(item.region_json || '{}') })),
+      relationships: rows(db, `SELECT * FROM resource_relationships WHERE workspace_id=? AND ((source_type='resource' AND source_id=?) OR (target_type='resource' AND target_id=?) OR (target_type='resource_version' AND target_id IN (SELECT id FROM resource_versions WHERE resource_id=?))) ORDER BY created_at`, resource.workspace_id, resource.id, resource.id, resource.id).map(item => ({ ...item, provenance: JSON.parse(item.provenance_json || '{}') }))
+    });
+  }
+  const resourceContentMatch = url.pathname.match(/^\/api\/resources\/([^/]+)\/content$/);
+  if (resourceContentMatch && req.method === 'GET') {
+    const resource = row(db, `SELECT r.relative_path,r.mime_type,a.* FROM workspace_resources r JOIN resource_versions v ON v.id=r.current_version_id JOIN artifacts a ON a.id=v.archive_artifact_id WHERE r.id=? AND r.status='active'`, resourceContentMatch[1]);
+    if (!resource) return sendJson(res, 404, { ok: false, code: 'RESOURCE_NOT_AVAILABLE' });
+    return streamVaultFile(res, resource, { disposition: 'inline', name: path.basename(resource.relative_path || resource.name || 'resource') });
+  }
+  const resourcePolicyMatch = url.pathname.match(/^\/api\/resources\/([^/]+)\/policy$/);
+  if (resourcePolicyMatch && req.method === 'PATCH') {
+    try { return sendJson(res, 200, updateResourceContextPolicy(db, resourcePolicyMatch[1], await readJson(req, 16 * 1024))); }
+    catch (error) { return sendJson(res, 409, { ok: false, code: error.code || 'RESOURCE_POLICY_FAILED', error: error.message }); }
+  }
+  const resourceSaveCopyMatch = url.pathname.match(/^\/api\/resources\/([^/]+)\/save-copy$/);
+  if (resourceSaveCopyMatch && req.method === 'POST') {
+    try {
+      const body = await readJson(req, 16 * 1024);
+      return sendJson(res, 201, saveResourceCopyToProjectFolder(db, { resourceId: resourceSaveCopyMatch[1], rootId: String(body.root_id || ''), relativePath: String(body.relative_path || '') }));
+    } catch (error) { return sendJson(res, error.code === 'DESTINATION_CONFLICT' ? 409 : 400, { ok: false, code: error.code || 'RESOURCE_EXPORT_FAILED', error: error.message }); }
+  }
+  const openResourceMatch = url.pathname.match(/^\/api\/resources\/([^/]+)\/open$/);
+  if (openResourceMatch && req.method === 'POST') {
+    try {
+      const resource = row(db, `SELECT r.*,wr.root_path,wr.canonical_path,wr.root_kind FROM workspace_resources r JOIN workspace_roots wr ON wr.id=r.root_id WHERE r.id=? AND r.status='active'`, openResourceMatch[1]);
+      if (!resource) return sendJson(res, 404, { ok: false, code: 'RESOURCE_NOT_FOUND' });
+      if (resource.root_kind === 'provider_archive') return sendJson(res, 200, { ok: true, resource_id: resource.id, content_url: `/api/resources/${encodeURIComponent(resource.id)}/content` });
+      const resolved = resolveApprovedTarget(resource, resource.relative_path, { expectedType: 'file' });
+      const opener = process.platform === 'win32' ? 'explorer.exe' : process.platform === 'darwin' ? 'open' : 'xdg-open';
+      const child = spawn(opener, [resolved.absolutePath], { detached: true, stdio: 'ignore', windowsHide: false, shell: false });
+      child.unref();
+      return sendJson(res, 200, { ok: true, resource_id: resource.id });
+    } catch (error) { return sendJson(res, 409, { ok: false, code: error.code || 'RESOURCE_OPEN_FAILED', error: error.message }); }
+  }
+
+  const jobsMatch = url.pathname.match(/^\/api\/workspaces\/([^/]+)\/jobs$/);
+  if (jobsMatch && req.method === 'GET') return sendJson(res, 200, rows(db, 'SELECT * FROM background_jobs WHERE workspace_id=? ORDER BY created_at DESC LIMIT 100', jobsMatch[1]));
+  if (jobsMatch && req.method === 'POST') {
+    const workspaceId = jobsMatch[1];
+    if (!row(db, 'SELECT id FROM workspaces WHERE id=?', workspaceId)) return sendJson(res, 404, { ok: false, code: 'WORKSPACE_NOT_FOUND' });
+    try {
+      const body = await readJson(req, 32 * 1024);
+      const targetId = String(body.target_id || '');
+      const job = createBackgroundJob(db, { workspaceId, jobType: body.job_type, targetType: targetId ? 'resource' : 'workspace', targetId });
+      startBackgroundJob(db, job.id, backgroundJobHandler(job));
+      return sendJson(res, 202, job);
+    } catch (error) { return sendJson(res, 400, { ok: false, code: error.code || 'JOB_CREATE_FAILED', error: error.message }); }
+  }
+  const jobDetailMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)$/);
+  if (jobDetailMatch && req.method === 'GET') {
+    const job = row(db, 'SELECT * FROM background_jobs WHERE id=?', jobDetailMatch[1]);
+    return job ? sendJson(res, 200, job) : sendJson(res, 404, { ok: false, code: 'JOB_NOT_FOUND' });
+  }
+  const jobCancelMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)\/cancel$/);
+  if (jobCancelMatch && req.method === 'POST') {
+    const job = cancelBackgroundJob(db, jobCancelMatch[1]);
+    return job ? sendJson(res, 200, job) : sendJson(res, 404, { ok: false, code: 'JOB_NOT_FOUND' });
+  }
+
   if (url.pathname === '/api/workspaces' && req.method === 'GET') {
     const workspaces = rows(db, `
       SELECT w.*,
         (SELECT COUNT(*) FROM sessions s WHERE s.workspace_id = w.id) AS session_count,
         (SELECT COUNT(*) FROM memories m WHERE m.workspace_id = w.id AND m.status = 'active') AS memory_count,
         (SELECT COUNT(*) FROM artifacts a WHERE a.workspace_id = w.id) AS artifact_count
-      FROM workspaces w ORDER BY updated_at DESC
+      FROM workspaces w WHERE w.lifecycle_status='active' ORDER BY updated_at DESC
     `);
     return sendJson(res, 200, workspaces);
   }
@@ -831,7 +1225,7 @@ async function handleApi(req, res, url) {
 
   if (url.pathname === '/api/active-workspace' && req.method === 'PUT') {
     const { workspace_id } = await readJson(req);
-    if (!row(db, 'SELECT id FROM workspaces WHERE id = ?', workspace_id)) return sendJson(res, 404, { error: 'workspace not found' });
+    if (!row(db, `SELECT id FROM workspaces WHERE id=? AND lifecycle_status='active'`, workspace_id)) return sendJson(res, 404, { error: 'workspace not found' });
     run(db, `INSERT INTO settings (key, value) VALUES ('active_workspace_id', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, workspace_id);
     return sendJson(res, 200, workspaceSummary(workspace_id));
   }
@@ -848,7 +1242,7 @@ async function handleApi(req, res, url) {
     const status = String(body.status || '').toUpperCase();
     if (!['UNAVAILABLE','AUTH_REQUIRED','CORS_BLOCKED','EXPIRED','FAILED'].includes(status)) return sendJson(res, 400, { ok: false, code: 'ASSET_STATUS_INVALID' });
     run(db, `UPDATE session_assets SET mirror_status=?,metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.capture_error',?),updated_at=? WHERE id=?`, status, String(body.message || '').slice(0, 500), new Date().toISOString(), asset.id);
-    setCaptureStages(db, asset.session_id, { attachments: false });
+    recomputeSessionAssetStages(asset.session_id);
     return sendJson(res, 200, { ok: true, status });
   }
 
@@ -892,6 +1286,7 @@ async function handleApi(req, res, url) {
     const body = await readJson(req);
     const root = row(db, 'SELECT * FROM workspace_roots WHERE id=?', rootPolicyMatch[1]);
     if (!root) return sendJson(res, 404, { error: 'workspace root not found' });
+    if (root.root_kind === 'provider_archive') return sendJson(res, 409, { ok: false, code: 'INTERNAL_SOURCE_POLICY_FIXED', error: 'captured-provider archive policy is managed by Harness security' });
     run(db, `UPDATE workspace_roots SET required_for_freshness=?,indexing_enabled=?,provider_transmission_allowed=?,status='unknown',updated_at=? WHERE id=?`,
       body.required_for_freshness === false ? 0 : 1, body.indexing_enabled === false ? 0 : 1, body.transmission_policy === 'local_only' ? 0 : 1, new Date().toISOString(), root.id);
     markWorkspaceStale(db, root.workspace_id, 'root_policy_changed');
@@ -899,11 +1294,26 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, row(db, 'SELECT * FROM workspace_roots WHERE id=?', root.id));
   }
 
+  const openRootMatch = url.pathname.match(/^\/api\/workspace-roots\/([^/]+)\/open$/);
+  if (openRootMatch && req.method === 'POST') {
+    const root = row(db, 'SELECT * FROM workspace_roots WHERE id=?', openRootMatch[1]);
+    if (!root) return sendJson(res, 404, { ok: false, code: 'ROOT_NOT_FOUND' });
+    if (root.root_kind === 'provider_archive') return sendJson(res, 409, { ok: false, code: 'INTERNAL_SOURCE_NOT_OPENABLE' });
+    try {
+      const verified = fs.realpathSync.native(root.root_path);
+      if (path.resolve(verified) !== path.resolve(root.canonical_path)) return sendJson(res, 409, { ok: false, code: 'ROOT_IDENTITY_CHANGED' });
+      const opener = process.platform === 'win32' ? 'explorer.exe' : process.platform === 'darwin' ? 'open' : 'xdg-open';
+      const child = spawn(opener, [verified], { detached: true, stdio: 'ignore', windowsHide: false, shell: false });
+      child.unref();
+      return sendJson(res, 200, { ok: true, root_id: root.id });
+    } catch (error) { return sendJson(res, 409, { ok: false, code: 'ROOT_OPEN_FAILED', error: error.message }); }
+  }
+
   const removeRootMatch = url.pathname.match(/^\/api\/workspace-roots\/([^/]+)$/);
   if (removeRootMatch && req.method === 'DELETE') {
     const root = row(db, 'SELECT * FROM workspace_roots WHERE id=?', removeRootMatch[1]);
     if (!root) return sendJson(res, 404, { ok: false, code: 'ROOT_NOT_FOUND' });
-    if (root.root_kind === 'primary') return sendJson(res, 409, { ok: false, code: 'PRIMARY_ROOT_REMOVAL_BLOCKED', error: 'attach or designate another primary root before removing this root' });
+    if (root.root_kind === 'primary' || root.root_kind === 'provider_archive') return sendJson(res, 409, { ok: false, code: root.root_kind === 'primary' ? 'PRIMARY_ROOT_REMOVAL_BLOCKED' : 'INTERNAL_SOURCE_REMOVAL_BLOCKED', error: 'this durable source cannot be removed from the root policy action' });
     run(db, 'DELETE FROM workspace_roots WHERE id=?', root.id);
     markWorkspaceStale(db, root.workspace_id, 'approved_root_removed');
     refreshRootWatchers();
@@ -937,6 +1347,21 @@ async function handleApi(req, res, url) {
     const contextRun = row(db, 'SELECT * FROM outgoing_context_runs WHERE id=?', outgoingRunDetail[1]);
     if (!contextRun) return sendJson(res, 404, { error: 'outgoing context run not found' });
     return sendJson(res, 200, { ...contextRun, metadata: JSON.parse(contextRun.metadata_json || '{}'), sources: rows(db, 'SELECT * FROM outgoing_context_sources WHERE run_id=? ORDER BY retrieval_score DESC', contextRun.id) });
+  }
+
+  const removeWorkspaceMatch = url.pathname.match(/^\/api\/workspaces\/([^/]+)$/);
+  if (removeWorkspaceMatch && req.method === 'DELETE') {
+    const workspace = row(db, `SELECT * FROM workspaces WHERE id=? AND lifecycle_status='active'`, removeWorkspaceMatch[1]);
+    if (!workspace) return sendJson(res, 404, { ok: false, code: 'WORKSPACE_NOT_FOUND' });
+    const remaining = rows(db, `SELECT id FROM workspaces WHERE lifecycle_status='active' AND id!=? ORDER BY updated_at DESC`, workspace.id);
+    if (!remaining.length) return sendJson(res, 409, { ok: false, code: 'LAST_WORKSPACE_REMOVAL_BLOCKED', error: 'Create or restore another Project Space before removing the last active one.' });
+    const removedAt = new Date().toISOString();
+    run(db, `UPDATE workspaces SET lifecycle_status='removed',freshness_status='stale',updated_at=? WHERE id=?`, removedAt, workspace.id);
+    run(db, `UPDATE workspace_roots SET indexing_enabled=0,status='removed',updated_at=? WHERE workspace_id=?`, removedAt, workspace.id);
+    const activeId = row(db, `SELECT value FROM settings WHERE key='active_workspace_id'`)?.value;
+    if (activeId === workspace.id) run(db, `INSERT INTO settings (key,value) VALUES ('active_workspace_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, remaining[0].id);
+    refreshRootWatchers();
+    return sendJson(res, 200, { ok: true, workspace_id: workspace.id, tracking_removed: true, live_files_deleted: false, archive_preserved: true, next_workspace_id: remaining[0].id });
   }
 
   const wsMatch = url.pathname.match(/^\/api\/workspaces\/([^/]+)$/);

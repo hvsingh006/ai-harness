@@ -19,14 +19,36 @@ function Ensure-Winget {
     throw "Windows Package Manager (winget) is required. Install 'App Installer' from Microsoft Store, then run this installer again."
   }
 }
+function Find-InstalledTool($Command) {
+  $found = Get-Command $Command -ErrorAction SilentlyContinue
+  if ($found) { return $found.Source }
+  if ($Command -eq 'pdftotext') {
+    $packageRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+    $candidate = Get-ChildItem -LiteralPath $packageRoot -Filter 'pdftotext.exe' -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like '*oschwartz10612.Poppler*' } | Select-Object -First 1
+    if ($candidate) {
+      [Environment]::SetEnvironmentVariable('AIH_POPPLER_BIN', $candidate.DirectoryName, 'User')
+      $env:AIH_POPPLER_BIN = $candidate.DirectoryName
+      return $candidate.FullName
+    }
+  }
+  if ($Command -eq 'tesseract') {
+    $candidate = Join-Path $env:ProgramFiles 'Tesseract-OCR\tesseract.exe'
+    if (Test-Path -LiteralPath $candidate) {
+      [Environment]::SetEnvironmentVariable('AIH_TESSERACT_PATH', $candidate, 'User')
+      $env:AIH_TESSERACT_PATH = $candidate
+      return $candidate
+    }
+  }
+  return $null
+}
 function Ensure-Package($Command, $PackageId, $DisplayName) {
-  if (Get-Command $Command -ErrorAction SilentlyContinue) { return }
+  if (Find-InstalledTool $Command) { return }
   Write-Step "Installing $DisplayName"
   Ensure-Winget
   winget install --id $PackageId -e --accept-package-agreements --accept-source-agreements
   if ($LASTEXITCODE -ne 0) { throw "$DisplayName installation failed." }
   Refresh-Path
-  if (-not (Get-Command $Command -ErrorAction SilentlyContinue)) { throw "$DisplayName was installed but is not available yet. Restart Windows and run this installer again." }
+  if (-not (Find-InstalledTool $Command)) { throw "$DisplayName was installed but Harness could not locate it. Restart Windows and run this installer again." }
 }
 function Test-GitHubAuth {
   $old = $ErrorActionPreference
@@ -49,6 +71,7 @@ Ensure-Package 'git' 'Git.Git' 'Git'
 Ensure-Package 'gh' 'GitHub.cli' 'GitHub CLI'
 Ensure-Package 'node' 'OpenJS.NodeJS.LTS' 'Node.js LTS'
 Ensure-Package 'pdftotext' 'oschwartz10612.Poppler' 'Poppler PDF text extractor'
+Ensure-Package 'tesseract' 'UB-Mannheim.TesseractOCR' 'Tesseract OCR engine'
 
 $nodeVersionText = (node --version).Trim().TrimStart('v')
 if ([version]$nodeVersionText -lt [version]'22.5.0') {
@@ -134,7 +157,7 @@ if (Test-Path (Join-Path $RepoDir '.git')) {
 Write-Step 'Installing dependencies and validating'
 Push-Location $RepoDir
 try {
-  if (Test-Path 'package-lock.json') { npm ci --no-audit --no-fund } else { npm install --no-audit --no-fund }
+  npm install --no-package-lock --no-audit --no-fund
   if ($LASTEXITCODE -ne 0) { throw 'npm dependency setup failed.' }
   npm test
   if ($LASTEXITCODE -ne 0) { throw 'AI Harness tests failed.' }

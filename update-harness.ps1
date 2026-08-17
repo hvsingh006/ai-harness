@@ -13,11 +13,7 @@ function Require-Command($name, $message) {
 }
 
 function Install-Dependencies {
-  if (Test-Path 'package-lock.json') {
-    npm ci --no-audit --no-fund
-  } else {
-    npm install --no-audit --no-fund
-  }
+  npm install --no-package-lock --no-audit --no-fund
   if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
 }
 

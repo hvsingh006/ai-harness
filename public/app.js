@@ -1,4 +1,4 @@
-const API = 'http://127.0.0.1:4317/api';
+const API = '/api';
 let workspaces = [];
 let active = null;
 let currentView = 'workspace';
@@ -6,6 +6,14 @@ let readiness = null;
 let health = null;
 let managedMigrations = [];
 let localAgents = {};
+let surfaces = [];
+let multimodalTools = {};
+let securityState = {};
+let globalPersonalization = null;
+let selectedSourceReview = null;
+let policyRootId = null;
+let policyRootOriginalCloud = false;
+let resourceCopyId = null;
 
 const qs = s => document.querySelector(s);
 const esc = (value = '') => String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
@@ -46,11 +54,18 @@ function statusBadge(status) {
 }
 
 async function load() {
-  const [settings, ws, ready, serviceHealth, migrations, agents] = await Promise.all([api('/settings'), api('/workspaces'), api('/readiness'), api('/health'), api('/storage/managed-project-migrations'), api('/local-agents')]);
+  const [settings, ws, ready, serviceHealth, migrations, agents, surfaceList, tools, security, personalization] = await Promise.all([
+    api('/settings'), api('/workspaces'), api('/readiness'), api('/health'), api('/storage/managed-project-migrations'), api('/local-agents'),
+    api('/surfaces'), api('/tools'), api('/security'), api('/personalization')
+  ]);
   readiness = ready;
   health = serviceHealth;
   managedMigrations = migrations;
   localAgents = agents;
+  surfaces = surfaceList;
+  multimodalTools = tools;
+  securityState = security;
+  globalPersonalization = personalization;
   workspaces = ws;
   const versionLabel = qs('#versionLabel');
   if (versionLabel) versionLabel.textContent = `Version ${health?.version || 'unknown'}`;
@@ -65,8 +80,10 @@ async function load() {
     try {
       readiness = await api('/readiness');
       if (active?.id) active.integrity = await api(`/workspaces/${encodeURIComponent(active.id)}/integrity`);
+      if (active?.id && ['resources','security'].includes(currentView)) active = await api(`/workspaces/${encodeURIComponent(active.id)}`);
       renderReadiness();
       renderIntegrity();
+      if (currentView === 'resources' && (active?.jobs || []).some(job => ['queued','running'].includes(job.status))) render();
     } catch {}
   }, 10000);
 }
@@ -149,6 +166,7 @@ function renderProjectIntegrity() {
   const reasons = snapshot?.details?.reasons || [];
   const status = String(integrity.freshness || 'stale').toLowerCase();
   const labels = { current: 'Project Current', verifying: 'Verifying Project', stale: 'Context Stale', blocked: 'Context Blocked', error: 'Context Error' };
+  const coverage = active.representation_coverage || { status: 'unknown', complete: 0, partial: 0, blocked: 0 };
   return `
     <div class="card integrity-card">
       <div class="section-title"><div><div class="eyebrow">VERIFIED CONTEXT INTEGRITY</div><h3>${esc(labels[status] || 'Context Stale')}</h3></div><div><button class="tiny-button" id="retryVerification">Retry verification</button> <span class="badge ${status === 'current' ? 'safe' : ''}">${esc(status)}</span></div></div>
@@ -156,11 +174,12 @@ function renderProjectIntegrity() {
       <div class="integrity-grid">
         <div><strong>Files/index</strong><span>generation ${esc(integrity.corpus_generation || 0)} / ${esc(integrity.index_generation || 0)}</span></div>
         <div><strong>History coverage</strong><span>${esc(integrity.history_coverage || 'unknown')}</span></div>
+        <div><strong>Representation coverage</strong><span>${esc(coverage.status)} · ${esc(coverage.complete)} complete / ${esc(coverage.partial)} partial / ${esc(coverage.blocked)} blocked</span></div>
         <div><strong>Last snapshot</strong><span>${esc(snapshot?.id || 'none yet')}</span></div>
       </div>
       ${reasons.length ? `<div class="blocked-reasons">${reasons.map(reason => `<div><strong>${esc(reason.code)}</strong> ${esc(reason.message)}</div>`).join('')}</div>` : ''}
       <div class="section-title source-head"><h3>Project Sources</h3><button class="tiny-button" id="addProjectRoot">Add linked source</button></div>
-      <div class="list">${roots.map(root => `<div class="list-row"><div><div class="list-title">${esc(root.label || root.root_kind)}</div><div class="list-sub">${esc(root.root_path)}<br>${root.required_for_freshness ? 'required' : 'optional'} · ${root.indexing_enabled ? 'indexed' : 'not indexed'} · ${root.provider_transmission_allowed ? 'provider allowed' : 'local only'}</div></div><div>${root.root_kind === 'repository' ? `<button class="tiny-button" data-open-agent="codex" data-root-id="${esc(root.id)}" ${localAgents.codex?.available ? '' : 'disabled'}>Open in Codex</button> <button class="tiny-button" data-open-agent="antigravity" data-root-id="${esc(root.id)}" ${localAgents.antigravity?.available ? '' : 'disabled'}>Open in Antigravity</button> ` : ''}${root.root_kind !== 'primary' ? `<button class="tiny-button" data-remove-root="${esc(root.id)}">Remove</button> ` : ''}<span class="badge ${root.status === 'current' ? 'safe' : ''}">${esc(root.status || 'unknown')}</span></div></div>`).join('') || '<div class="empty">No approved roots.</div>'}</div>
+      <div class="list">${roots.map(root => `<div class="list-row"><div><div class="list-title">${esc(root.label || root.root_kind)}</div><div class="list-sub">${esc(root.root_path)}<br>${root.required_for_freshness ? 'required' : 'optional'} · ${root.indexing_enabled ? 'indexed' : 'not indexed'} · ${root.provider_transmission_allowed ? 'provider allowed' : 'local only'}</div></div><div><button class="tiny-button" data-open-root="${esc(root.id)}">Open source</button> <button class="tiny-button" data-root-policy="${esc(root.id)}" data-required="${root.required_for_freshness}" data-indexed="${root.indexing_enabled}" data-transmission="${root.provider_transmission_allowed}">Policy</button> ${root.root_kind === 'repository' ? `<button class="tiny-button" data-open-agent="codex" data-root-id="${esc(root.id)}" ${localAgents.codex?.available ? '' : 'disabled'}>Open in Codex</button> <button class="tiny-button" data-open-agent="antigravity" data-root-id="${esc(root.id)}" ${localAgents.antigravity?.available ? '' : 'disabled'}>Open in Antigravity</button> ` : ''}${root.root_kind !== 'primary' ? `<button class="tiny-button" data-remove-root="${esc(root.id)}">Remove</button> ` : ''}<span class="badge ${root.status === 'current' ? 'safe' : ''}">${esc(root.status || 'unknown')}</span></div></div>`).join('') || '<div class="empty">No approved roots.</div>'}</div>
     </div>`;
 }
 
@@ -170,8 +189,7 @@ function renderWorkspace() {
   return `
     <div class="hero">
       <div class="card">
-        <div class="eyebrow">PROJECT SPACE</div>
-        <h2>${esc(active.name)}</h2>
+        <div class="section-title"><div><div class="eyebrow">PROJECT SPACE</div><h2>${esc(active.name)}</h2></div><button class="tiny-button danger" id="removeWorkspace">Remove Project Space</button></div>
         <p class="lede">${esc(active.description)}</p>
         <div class="focus"><strong>CURRENT WORKING STATE</strong>${esc(active.active_focus || 'No active focus yet.')}</div>
         <div class="principle"><strong>Purpose</strong><span>Keep your project context, files, and chat history available when you start a new chat or switch between ChatGPT and Gemini. Use AI to improve productivity and understanding without replacing your judgment.</span></div>
@@ -189,6 +207,16 @@ function renderWorkspace() {
       ${metric('sessions retained', archive.sessions || 0)}
       ${metric('safe to delete', archive.safe_sessions || 0, `${archive.incomplete_sessions || 0} incomplete`)}
     </div>
+    <div class="card" style="margin-bottom:18px">
+      <div class="section-title"><h3>Retained storage</h3><span class="badge">nothing auto-deleted</span></div>
+      <div class="integrity-grid">
+        <div><strong>Current project resources</strong><span>${esc(bytes(archive.project_resource_bytes || 0))}</span></div>
+        <div><strong>Immutable original archive</strong><span>${esc(bytes(archive.original_archive_bytes || 0))}</span></div>
+        <div><strong>Rebuildable derived context</strong><span>${esc(bytes(archive.derived_bytes || 0))}</span></div>
+        <div><strong>Harness backups (all projects)</strong><span>${esc(bytes(archive.backup_bytes || 0))}</span></div>
+      </div>
+      <p class="list-sub">Approximate known total ${esc(bytes(archive.total_known_bytes || 0))}. Physical content-addressed deduplication can make actual disk use smaller than logical totals.</p>
+    </div>
     <div class="card">
       <div class="section-title"><h3>Recent chats</h3><span class="badge">same project context</span></div>
       <div class="list">${recent.map(s => `
@@ -203,7 +231,7 @@ function renderSessions() {
       <div class="section-title"><div><div class="eyebrow">CHAT HISTORY</div><h2>All chats for ${esc(active.name)}</h2></div><span class="badge">${esc((active.sessions || []).length)} chats</span></div>
       <p class="lede">ChatGPT and Gemini conversations stay attached to this Project Space. Reopen an old native chat, search prior messages, or bring an archived chat back into a new prompt.</p>
       <div class="list">${(active.sessions || []).map(s => `
-        <div class="list-row session-row" data-session="${esc(s.id)}"><div><div class="list-title">${esc(s.display_label || s.title)}</div><div class="list-sub">${esc(providerName(s.provider))} · ${esc(s.message_count)} messages · ${esc(s.started_at || '')}<br>${esc(s.title)}</div><div class="session-actions">${s.native_url ? `<button class="tiny-button" data-open="${esc(s.native_url)}">Open chat ↗</button>` : ''}<button class="tiny-button" data-session-context="${esc(s.id)}">Bring into prompt</button></div></div>${statusBadge(s.capture_status)}</div>`).join('') || '<div class="empty">No chats captured yet.</div>'}</div>
+        <div class="list-row session-row" data-session="${esc(s.id)}"><div><div class="list-title">${esc(s.display_label || s.title)}</div><div class="list-sub">${esc(providerName(s.provider))} · ${esc(s.message_count)} messages · ${esc(s.started_at || '')}<br>${esc(s.title)}${s.capture_status !== 'safe_to_delete' ? `<br>Preservation incomplete:${s.raw_complete ? '' : ' transcript'}${s.user_input_assets_complete ? '' : ' user input bytes'}${s.provider_output_assets_complete ? '' : ' generated asset bytes'}${s.derived_complete ? '' : ' derived state/search gate'}` : '<br>Transcript and required asset bytes are durably preserved.'}</div><div class="session-actions">${s.native_url ? `<button class="tiny-button" data-open="${esc(s.native_url)}">Open chat ↗</button>` : ''}<button class="tiny-button" data-session-context="${esc(s.id)}">Bring into prompt</button></div></div>${statusBadge(s.capture_status)}</div>`).join('') || '<div class="empty">No chats captured yet.</div>'}</div>
     </div>
     <div class="two-col">
       <div class="card">
@@ -221,6 +249,85 @@ function renderSessions() {
           <div id="importProgress" class="list-sub">Use this only when you want to bring older ChatGPT or Gemini history into the project.</div>
         </div>
       </div>
+    </div>`;
+}
+
+function coverageFor(resource) {
+  try { return JSON.parse(resource.coverage_json || '{}'); }
+  catch { return {}; }
+}
+
+function resourceOrigin(resource) {
+  let origin = {};
+  try { origin = JSON.parse(resource.origin_json || '{}'); } catch {}
+  const provider = providerName(origin.originating_provider_family || origin.provider || '');
+  if (resource.source_type === 'clipboard_image') return `Pasted into ${provider || 'native chat'}${origin.imported_at ? ` · ${origin.imported_at}` : ''}`;
+  if (resource.source_type === 'provider_user_attachment') return `Attached in ${provider || 'native chat'}${origin.imported_at ? ` · ${origin.imported_at}` : ''}`;
+  if (resource.source_type === 'provider_generated_asset') return `Generated by ${provider || 'native chat'}${origin.imported_at ? ` · ${origin.imported_at}` : ''}`;
+  return 'Project folder';
+}
+
+function renderResources() {
+  const resources = active.resources || [];
+  const coverage = active.representation_coverage || {};
+  const jobs = active.jobs || [];
+  const running = jobs.filter(job => ['queued','running'].includes(job.status));
+  return `
+    <div class="card" style="margin-bottom:18px">
+      <div class="section-title"><div><div class="eyebrow">RESOURCE LIBRARY</div><h2>Current sources and immutable versions</h2></div><span class="badge ${coverage.status === 'complete' ? 'safe' : ''}">${esc(coverage.status || 'unknown')} representation coverage</span></div>
+      <p class="lede">Original files remain authoritative. Digital text, page images, embedded images, and OCR are version-linked derived representations that can be rebuilt without deleting originals or history.</p>
+      <div class="toolbar"><button class="tiny-button" data-job-type="verify_sources">Verify now</button> <button class="tiny-button" data-job-type="full_integrity_verify">Full integrity verification</button> <button class="tiny-button" data-job-type="rebuild_derived">Rebuild stale derived data</button> <button class="tiny-button" data-job-type="create_backup">Create backup</button> <button class="tiny-button" data-job-type="run_diagnostics">Run diagnostics</button></div>
+      ${running.length ? `<div class="job-banner">${running.map(job => `${esc(job.job_type.replaceAll('_',' '))}: ${esc(job.phase || job.status)} ${job.progress_total ? `(${job.progress_current}/${job.progress_total})` : ''}`).join('<br>')}</div>` : ''}
+      <div class="list">${resources.map(resource => {
+        const itemCoverage = coverageFor(resource);
+        return `<div class="list-row resource-library-row"><div><div class="list-title">${esc(resource.relative_path)}</div><div class="list-sub">${esc(resource.resource_type)} · ${esc(bytes(resource.size_bytes))} · indexing ${esc(resource.indexing_status)} · representations ${esc(resource.representation_coverage || 'unknown')}${itemCoverage.page_count ? ` · ${esc(itemCoverage.page_count)} pages` : ''}<br>Origin: ${esc(resourceOrigin(resource))}<br>${resource.priority_status === 'priority' ? 'Priority Context · ' : ''}${resource.context_critical ? 'Context Critical · ' : ''}${resource.knowledge_status !== 'active' ? `${esc(resource.knowledge_status)} · ` : ''}Observed ${esc(resource.observed_at || '')}</div></div><div><button class="tiny-button" data-open-resource="${esc(resource.id)}">Open source</button> <button class="tiny-button" data-inspect-resource="${esc(resource.id)}">Versions &amp; provenance</button> <button class="tiny-button" data-reprocess-resource="${esc(resource.id)}">Retry processing</button> <button class="tiny-button" data-resource-policy="${esc(resource.id)}" data-policy-key="priority_status" data-policy-value="${resource.priority_status === 'priority' ? 'normal' : 'priority'}">${resource.priority_status === 'priority' ? 'Unpin' : 'Always consider'}</button> <button class="tiny-button" data-resource-policy="${esc(resource.id)}" data-policy-key="context_critical" data-policy-value="${resource.context_critical ? 'false' : 'true'}">${resource.context_critical ? 'Not critical' : 'Context Critical'}</button> <button class="tiny-button" data-resource-policy="${esc(resource.id)}" data-policy-key="knowledge_status" data-policy-value="${resource.knowledge_status === 'superseded' ? 'active' : 'superseded'}">${resource.knowledge_status === 'superseded' ? 'Mark active' : 'Mark superseded'}</button> <button class="tiny-button" data-resource-policy="${esc(resource.id)}" data-policy-key="provider_transmission_allowed" data-policy-value="${resource.provider_transmission_allowed ? 'false' : 'true'}">${resource.provider_transmission_allowed ? 'Exclude from AI' : 'Allow for AI'}</button>${resource.source_type !== 'filesystem' ? ` <button class="tiny-button" data-save-resource="${esc(resource.id)}" data-resource-name="${esc(resource.relative_path.split('/').pop())}">Save copy to project folder</button>` : ''}</div></div>`;
+      }).join('') || '<div class="empty">No indexed resources yet. Add or link a source from Project Space.</div>'}</div>
+    </div>
+    <div class="two-col">
+      <div class="card"><div class="section-title"><h3>Processing tools</h3><span class="badge">local only</span></div><div class="list">${Object.values(multimodalTools).map(tool => `<div class="list-row"><div><div class="list-title">${esc(tool.name)}</div><div class="list-sub">${esc(tool.version || tool.code)}</div></div>${statusBadge(tool.available ? 'complete' : 'unavailable')}</div>`).join('')}</div></div>
+      <div class="card"><div class="section-title"><h3>Recent jobs</h3><span class="badge">${jobs.length}</span></div><div class="list">${jobs.slice(0, 12).map(job => `<div class="list-row"><div><div class="list-title">${esc(job.job_type.replaceAll('_',' '))}</div><div class="list-sub">${esc(job.phase || job.status)}${job.started_at ? ` · started ${esc(job.started_at)}` : ''}${job.error_code ? `<br>${esc(job.error_code)}: ${esc(job.error_message || 'No technical detail recorded.')}` : ''}</div></div><div>${['queued','running','cancel_requested'].includes(job.status) ? `<button class="tiny-button" data-cancel-job="${esc(job.id)}">Cancel</button> ` : ''}${statusBadge(job.status)}</div></div>`).join('') || '<div class="empty">No processing jobs yet.</div>'}</div></div>
+    </div>`;
+}
+
+function renderInstructions() {
+  const context = active.instruction_context || {};
+  const project = context.project_instructions || {};
+  const workspaceProfile = context.workspace_personalization || {};
+  const global = globalPersonalization ? { profile: globalPersonalization.profile || {}, notes: globalPersonalization.notes || '', version: globalPersonalization.version_number } : { profile: {}, notes: '' };
+  return `
+    <div class="card" style="margin-bottom:18px"><div class="section-title"><div><div class="eyebrow">PROJECT INSTRUCTIONS</div><h2>Durable guidance for ${esc(active.name)}</h2></div><span class="badge">${project.version ? `version ${esc(project.version)}` : 'not configured'}</span></div>
+      <p class="lede">These instructions are versioned and apply after security policy and the current explicit request, but before personalization, derived state, retrieved evidence, or old AI responses.</p>
+      <form id="projectInstructionsForm"><textarea id="projectInstructionsText" rows="12" maxlength="32000" placeholder="Project-specific constraints, terminology, quality standards, and standing decisions…">${esc(project.content || '')}</textarea><div class="dialog-actions"><button class="primary" type="submit">Save project instructions</button></div></form>
+      <button class="tiny-button" id="viewInstructionHistory">View instruction &amp; personalization history</button>
+    </div>
+    <div class="two-col">
+      ${personalizationForm('global', 'Global personalization', global)}
+      ${personalizationForm('workspace', 'Project override', { profile: workspaceProfile.profile || {}, notes: workspaceProfile.notes || '', version: workspaceProfile.version })}
+    </div>`;
+}
+
+function personalizationForm(scope, title, item) {
+  const profile = item.profile || {};
+  return `<div class="card"><div class="section-title"><h3>${esc(title)}</h3><span class="badge">${item.version ? `version ${esc(item.version)}` : 'optional'}</span></div><form data-personalization-form="${scope}">
+    <label class="form-field"><span>Response style</span><input name="response_style" value="${esc(profile.response_style || '')}" maxlength="2000"></label>
+    <label class="form-field"><span>Detail level</span><input name="detail_level" value="${esc(profile.detail_level || '')}" maxlength="2000"></label>
+    <label class="form-field"><span>Learning preferences</span><input name="learning_preferences" value="${esc(profile.learning_preferences || '')}" maxlength="2000"></label>
+    <label class="form-field"><span>Tool preferences</span><input name="tool_preferences" value="${esc(profile.tool_preferences || '')}" maxlength="2000"></label>
+    <label class="form-field"><span>Notes</span><textarea name="notes" rows="5" maxlength="16000">${esc(item.notes || '')}</textarea></label>
+    <button class="primary" type="submit">Save ${scope === 'global' ? 'global preferences' : 'project override'}</button></form></div>`;
+}
+
+function renderSecurity() {
+  const paired = securityState.companion;
+  const agentSessions = securityState.active_agent_context_sessions || [];
+  return `
+    <div class="card" style="margin-bottom:18px"><div class="section-title"><div><div class="eyebrow">SECURITY BOUNDARIES</div><h2>Connections and delivery surfaces</h2></div><span class="badge">fail closed</span></div>
+      <p class="lede">Cloud chat surfaces receive only selected, security-scanned context and approved current attachments. They never receive filesystem, shell, Git, SSH, or credential capability. Local coding agents receive one registered repository and an expiring read-only context session.</p>
+      <div class="list">${surfaces.map(surface => `<div class="list-row"><div><div class="list-title">${esc(surface.display_name)}</div><div class="list-sub">${esc(surface.channel)} · adapter ${esc(surface.adapter_version)}${surface.limitation ? `<br>${esc(surface.limitation)}` : ''}</div></div>${statusBadge(surface.status)}</div>`).join('')}</div>
+    </div>
+    <div class="two-col">
+      <div class="card"><div class="section-title"><h3>Browser companion</h3><span class="badge ${paired ? 'safe' : ''}">${paired ? 'paired' : 'not paired'}</span></div><p class="lede">${paired ? `Paired ${esc(paired.paired_at || '')}. Last seen ${esc(paired.last_seen_at || 'not yet')}.` : 'Pair from Setup; no token copying is required.'}</p>${paired ? '<button class="tiny-button danger" id="revokeCompanion">Revoke companion</button>' : '<button class="tiny-button" data-go-setup>Open Setup</button>'}</div>
+      <div class="card"><div class="section-title"><h3>Local-agent context sessions</h3><span class="badge">${agentSessions.length} active</span></div><div class="list">${agentSessions.map(session => `<div class="list-row"><div><div class="list-title">${esc(session.agent)}</div><div class="list-sub">Expires ${esc(session.expires_at)} · ${esc(JSON.parse(session.capabilities_json || '[]').join(', '))}</div></div><button class="tiny-button danger" data-revoke-agent-context="${esc(session.id)}">Revoke</button></div>`).join('') || '<div class="empty">No active local-agent context sessions.</div>'}</div></div>
     </div>`;
 }
 
@@ -275,7 +382,7 @@ function renderSetup() {
 
 function render() {
   if (!active) return;
-  const views = { workspace: renderWorkspace, history: renderSessions, setup: renderSetup };
+  const views = { workspace: renderWorkspace, resources: renderResources, history: renderSessions, instructions: renderInstructions, security: renderSecurity, setup: renderSetup };
   qs('#view').innerHTML = (views[currentView] || renderWorkspace)();
   wireDynamicButtons();
 }
@@ -324,6 +431,115 @@ async function uploadProjectFiles(files) {
 }
 
 function wireDynamicButtons() {
+  const queueJob = async (jobType, targetId = '') => {
+    const job = await api(`/workspaces/${encodeURIComponent(active.id)}/jobs`, { method: 'POST', body: JSON.stringify({ job_type: jobType, target_id: targetId }) });
+    active = await api(`/workspaces/${encodeURIComponent(active.id)}`);
+    render();
+    return job;
+  };
+
+  document.querySelectorAll('[data-job-type]').forEach(button => button.addEventListener('click', async () => {
+    button.disabled = true;
+    try { await queueJob(button.dataset.jobType); }
+    catch (error) { alert(`Could not start job: ${error.message}`); button.disabled = false; }
+  }));
+  document.querySelectorAll('[data-reprocess-resource]').forEach(button => button.addEventListener('click', async () => {
+    button.disabled = true; button.textContent = 'Queued';
+    try { await queueJob('reprocess_resource', button.dataset.reprocessResource); }
+    catch (error) { alert(`Could not retry processing: ${error.message}`); button.disabled = false; }
+  }));
+  document.querySelectorAll('[data-cancel-job]').forEach(button => button.addEventListener('click', async () => {
+    button.disabled = true;
+    try {
+      await api(`/jobs/${encodeURIComponent(button.dataset.cancelJob)}/cancel`, { method: 'POST', body: '{}' });
+      active = await api(`/workspaces/${encodeURIComponent(active.id)}`); render();
+    } catch (error) { alert(`Could not cancel job: ${error.message}`); button.disabled = false; }
+  }));
+  document.querySelectorAll('[data-open-resource]').forEach(button => button.addEventListener('click', async () => {
+    try {
+      const result = await api(`/resources/${encodeURIComponent(button.dataset.openResource)}/open`, { method: 'POST', body: '{}' });
+      if (result.content_url) window.open(`${API.replace(/\/api$/, '')}${result.content_url}`, '_blank', 'noopener');
+    }
+    catch (error) { alert(`Could not open source: ${error.message}`); }
+  }));
+  document.querySelectorAll('[data-resource-policy]').forEach(button => button.addEventListener('click', async () => {
+    const key = button.dataset.policyKey;
+    const raw = button.dataset.policyValue;
+    const value = raw === 'true' ? true : raw === 'false' ? false : raw;
+    if (key === 'provider_transmission_allowed' && value === true && !confirm('Allow this resource to supply relevant non-secret context or attachments to ChatGPT and Gemini? Root and secret policy still apply.')) return;
+    try {
+      await api(`/resources/${encodeURIComponent(button.dataset.resourcePolicy)}/policy`, { method: 'PATCH', body: JSON.stringify({ [key]: value }) });
+      active = await api(`/workspaces/${encodeURIComponent(active.id)}`); render();
+    } catch (error) { alert(`Could not update resource context policy: ${error.message}`); }
+  }));
+  document.querySelectorAll('[data-save-resource]').forEach(button => button.addEventListener('click', () => {
+    resourceCopyId = button.dataset.saveResource;
+    const roots = (active.roots || []).filter(root => root.root_kind !== 'provider_archive' && root.indexing_enabled);
+    qs('#resourceCopyRoot').innerHTML = roots.map(root => `<option value="${esc(root.id)}">${esc(root.label || root.root_kind)} · ${esc(root.root_path)}</option>`).join('');
+    qs('#resourceCopyPath').value = button.dataset.resourceName || 'captured-resource';
+    qs('#resourceCopyDialog').showModal();
+  }));
+  document.querySelectorAll('[data-inspect-resource]').forEach(button => button.addEventListener('click', async () => {
+    try {
+      const detail = await api(`/resources/${encodeURIComponent(button.dataset.inspectResource)}`);
+      qs('#contextJson').textContent = JSON.stringify(detail, null, 2);
+      qs('#contextDialog').showModal();
+    } catch (error) { alert(`Could not inspect resource: ${error.message}`); }
+  }));
+
+  qs('#projectInstructionsForm')?.addEventListener('submit', async event => {
+    event.preventDefault();
+    try {
+      await api(`/workspaces/${encodeURIComponent(active.id)}/instructions`, { method: 'PUT', body: JSON.stringify({ content: qs('#projectInstructionsText').value }) });
+      active = await api(`/workspaces/${encodeURIComponent(active.id)}`); render();
+    } catch (error) { alert(`Could not save instructions: ${error.message}`); }
+  });
+  qs('#viewInstructionHistory')?.addEventListener('click', async () => {
+    try {
+      const history = await api(`/workspaces/${encodeURIComponent(active.id)}/instruction-history`);
+      qs('#contextJson').textContent = JSON.stringify(history, null, 2);
+      qs('#contextDialog').showModal();
+    } catch (error) { alert(`Could not load edit history: ${error.message}`); }
+  });
+  document.querySelectorAll('[data-personalization-form]').forEach(form => form.addEventListener('submit', async event => {
+    event.preventDefault();
+    const data = new FormData(form);
+    const profile = Object.fromEntries(['response_style','detail_level','learning_preferences','tool_preferences'].map(key => [key, String(data.get(key) || '').trim()]).filter(([, value]) => value));
+    const scope = form.dataset.personalizationForm;
+    try {
+      const saved = await api(scope === 'global' ? '/personalization' : `/workspaces/${encodeURIComponent(active.id)}/personalization`, { method: 'PUT', body: JSON.stringify({ profile, notes: String(data.get('notes') || '') }) });
+      if (scope === 'global') globalPersonalization = saved;
+      active = await api(`/workspaces/${encodeURIComponent(active.id)}`); render();
+    } catch (error) { alert(`Could not save personalization: ${error.message}`); }
+  }));
+
+  qs('#revokeCompanion')?.addEventListener('click', async () => {
+    if (!confirm('Revoke the paired browser companion? Native continuity will pause until you pair again.')) return;
+    try {
+      await api('/security/companion/revoke', { method: 'POST', body: '{}' });
+      [securityState, readiness] = await Promise.all([api('/security'), api('/readiness')]); renderReadiness(); render();
+    } catch (error) { alert(`Could not revoke companion: ${error.message}`); }
+  });
+  document.querySelectorAll('[data-revoke-agent-context]').forEach(button => button.addEventListener('click', async () => {
+    try {
+      await api(`/security/agent-context/${encodeURIComponent(button.dataset.revokeAgentContext)}/revoke`, { method: 'POST', body: '{}' });
+      securityState = await api('/security'); render();
+    } catch (error) { alert(`Could not revoke context session: ${error.message}`); }
+  }));
+  document.querySelectorAll('[data-go-setup]').forEach(button => button.addEventListener('click', () => {
+    currentView = 'setup'; document.querySelectorAll('.nav-item').forEach(item => item.classList.toggle('active', item.dataset.view === 'setup')); render();
+  }));
+
+  qs('#removeWorkspace')?.addEventListener('click', async () => {
+    if (!confirm(`Remove ${active.name} from active Harness tracking? Live project files will stay on disk and retained archive records will be preserved.`)) return;
+    try {
+      await api(`/workspaces/${encodeURIComponent(active.id)}`, { method: 'DELETE', body: '{}' });
+      workspaces = await api('/workspaces');
+      active = await api('/active-workspace');
+      renderWorkspaceSelect(); renderIntegrity(); render();
+    } catch (error) { alert(`Could not remove Project Space: ${error.message}`); }
+  });
+
   document.querySelectorAll('[data-migrate-workspace]').forEach(button => button.addEventListener('click', async e => {
     const id = e.currentTarget.dataset.migrateWorkspace;
     e.currentTarget.disabled = true;
@@ -365,19 +581,34 @@ function wireDynamicButtons() {
   });
 
   qs('#addProjectRoot')?.addEventListener('click', async () => {
-    const folderPath = prompt('Paste the full path of the folder or repository to approve for this Project Space.');
-    if (!folderPath?.trim()) return;
-    const providerAllowed = confirm('Allow relevant non-secret material from this source to be sent to ChatGPT/Gemini? Choose Cancel to keep it local-only.');
-    try {
-      await api(`/workspaces/${encodeURIComponent(active.id)}/roots`, { method: 'POST', body: JSON.stringify({
-        path: folderPath.trim(), root_kind: 'linked_folder', required_for_freshness: true, indexing_enabled: true,
-        transmission_policy: providerAllowed ? 'provider_allowed' : 'local_only'
-      }) });
-      active = await api(`/workspaces/${encodeURIComponent(active.id)}`);
-      renderIntegrity();
-      render();
-    } catch (error) { alert(`Could not add source: ${error.message}`); }
+    let selected;
+    try { selected = await api('/dialogs/select-source', { method: 'POST', body: JSON.stringify({ workspace_id: active.id }) }); }
+    catch (error) { alert(`Folder picker unavailable: ${error.message}`); return; }
+    if (!selected?.selected) return;
+    selectedSourceReview = selected;
+    qs('#sourcePath').value = selected.path;
+    qs('#sourceDetected').textContent = `${selected.detected?.kind || 'Folder'} detected.${selected.duplicate ? ` This source already exists as ${selected.duplicate.label || selected.duplicate.root_id}; saving will update its policy.` : ' Harness will validate scope, identity, and private-state boundaries before registration.'}`;
+    qs('#sourceRequired').checked = true;
+    qs('#sourceIndexed').checked = true;
+    qs('#sourceCloud').checked = true;
+    qs('#sourceDialog').showModal();
   });
+
+  document.querySelectorAll('[data-open-root]').forEach(button => button.addEventListener('click', async () => {
+    try { await api(`/workspace-roots/${encodeURIComponent(button.dataset.openRoot)}/open`, { method: 'POST', body: '{}' }); }
+    catch (error) { alert(`Could not open source: ${error.message}`); }
+  }));
+
+  document.querySelectorAll('[data-root-policy]').forEach(button => button.addEventListener('click', async () => {
+    policyRootId = button.dataset.rootPolicy;
+    policyRootOriginalCloud = button.dataset.transmission === '1';
+    const root = (active.roots || []).find(item => item.id === policyRootId);
+    qs('#rootPolicyTitle').textContent = `Edit ${root?.label || 'source'}`;
+    qs('#rootRequired').checked = button.dataset.required === '1';
+    qs('#rootIndexed').checked = button.dataset.indexed === '1';
+    qs('#rootCloud').checked = button.dataset.transmission === '1';
+    qs('#rootPolicyDialog').showModal();
+  }));
 
   qs('#retryVerification')?.addEventListener('click', async e => {
     const button = e.currentTarget;
@@ -404,7 +635,7 @@ function wireDynamicButtons() {
   document.querySelectorAll('[data-open-agent]').forEach(button => button.addEventListener('click', async () => {
     try {
       const result = await api(`/workspaces/${encodeURIComponent(active.id)}/roots/${encodeURIComponent(button.dataset.rootId)}/open-agent`, { method: 'POST', body: JSON.stringify({ agent: button.dataset.openAgent }) });
-      alert(`${button.dataset.openAgent} opened on ${result.repository}`);
+      alert(`${button.dataset.openAgent} opened on the registered repository with read-only Harness context until ${result.context_expires_at}.`);
     } catch (error) { alert(`Could not open coding agent: ${error.message}`); }
   }));
 
@@ -481,11 +712,13 @@ function wireDynamicButtons() {
     setTimeout(() => e.currentTarget.textContent = original, 1400);
   });
   qs('#attachProjectFolder')?.addEventListener('click', async e => {
-    const folderPath = prompt('Paste the full path of the existing project folder to attach. The Harness will not move or delete it.', active.root_path || '');
-    if (!folderPath?.trim()) return;
+    let selected;
+    try { selected = await api('/dialogs/select-source', { method: 'POST', body: '{}' }); }
+    catch (error) { alert(`Folder picker unavailable: ${error.message}`); return; }
+    if (!selected?.selected) return;
     const original = e.currentTarget.textContent;
     try {
-      active = await api(`/workspaces/${encodeURIComponent(active.id)}/attach-folder`, { method: 'POST', body: JSON.stringify({ path: folderPath.trim() }) });
+      active = await api(`/workspaces/${encodeURIComponent(active.id)}/attach-folder`, { method: 'POST', body: JSON.stringify({ path: selected.path }) });
       e.currentTarget.textContent = 'Attached';
       setTimeout(render, 450);
     } catch (error) {
@@ -595,6 +828,58 @@ qs('#newWorkspaceButton').addEventListener('click', () => {
 });
 qs('#closeWorkspaceDialog').addEventListener('click', () => qs('#workspaceDialog').close());
 qs('#cancelWorkspaceButton').addEventListener('click', () => qs('#workspaceDialog').close());
+qs('#closeSourceDialog').addEventListener('click', () => qs('#sourceDialog').close());
+qs('#cancelSourceDialog').addEventListener('click', () => qs('#sourceDialog').close());
+qs('#closeRootPolicyDialog').addEventListener('click', () => qs('#rootPolicyDialog').close());
+qs('#cancelRootPolicyDialog').addEventListener('click', () => qs('#rootPolicyDialog').close());
+qs('#closeResourceCopyDialog').addEventListener('click', () => qs('#resourceCopyDialog').close());
+qs('#cancelResourceCopyDialog').addEventListener('click', () => qs('#resourceCopyDialog').close());
+qs('#resourceCopyForm').addEventListener('submit', async event => {
+  event.preventDefault();
+  if (!resourceCopyId) return;
+  try {
+    await api(`/resources/${encodeURIComponent(resourceCopyId)}/save-copy`, { method: 'POST', body: JSON.stringify({ root_id: qs('#resourceCopyRoot').value, relative_path: qs('#resourceCopyPath').value.trim() }) });
+    resourceCopyId = null;
+    qs('#resourceCopyDialog').close();
+    active = await api(`/workspaces/${encodeURIComponent(active.id)}`);
+    render();
+  } catch (error) { alert(`Could not save copy: ${error.message}`); }
+});
+qs('#sourceForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  if (!selectedSourceReview?.path || !active?.id) return;
+  try {
+    await api(`/workspaces/${encodeURIComponent(active.id)}/roots`, { method: 'POST', body: JSON.stringify({
+      path: selectedSourceReview.path,
+      root_kind: selectedSourceReview.detected?.git_repository ? 'repository' : 'linked_folder',
+      required_for_freshness: qs('#sourceRequired').checked,
+      indexing_enabled: qs('#sourceIndexed').checked,
+      transmission_policy: qs('#sourceCloud').checked ? 'provider_allowed' : 'local_only'
+    }) });
+    selectedSourceReview = null;
+    qs('#sourceDialog').close();
+    active = await api(`/workspaces/${encodeURIComponent(active.id)}`);
+    renderIntegrity();
+    render();
+  } catch (error) { alert(`Could not add source: ${error.message}`); }
+});
+qs('#rootPolicyForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  if (!policyRootId) return;
+  if (!policyRootOriginalCloud && qs('#rootCloud').checked && !confirm('Allow this previously local-only source to supply relevant non-secret context or attachments to ChatGPT and Gemini?')) return;
+  try {
+    await api(`/workspace-roots/${encodeURIComponent(policyRootId)}/policy`, { method: 'PUT', body: JSON.stringify({
+      required_for_freshness: qs('#rootRequired').checked,
+      indexing_enabled: qs('#rootIndexed').checked,
+      transmission_policy: qs('#rootCloud').checked ? 'provider_allowed' : 'local_only'
+    }) });
+    policyRootId = null;
+    qs('#rootPolicyDialog').close();
+    active = await api(`/workspaces/${encodeURIComponent(active.id)}`);
+    renderIntegrity();
+    render();
+  } catch (error) { alert(`Could not update policy: ${error.message}`); }
+});
 qs('#workspaceForm').addEventListener('submit', async e => {
   e.preventDefault();
   const name = qs('#workspaceName').value.trim();

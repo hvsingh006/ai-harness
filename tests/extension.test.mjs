@@ -10,8 +10,8 @@ test('extension manifest is limited to Harness localhost, ChatGPT, and Gemini an
   assert.equal(manifest.version, '0.8.0');
   assert.equal(pkg.version, manifest.version);
   assert.equal(sourceVersion, manifest.version);
-  assert.match(fs.readFileSync('src/version.mjs', 'utf8'), /COMPANION_PROTOCOL_VERSION = 3/);
-  assert.match(fs.readFileSync('extension/content.js', 'utf8'), /PROTOCOL_VERSION = 3/);
+  assert.match(fs.readFileSync('src/version.mjs', 'utf8'), /COMPANION_PROTOCOL_VERSION = 4/);
+  assert.match(fs.readFileSync('extension/content.js', 'utf8'), /PROTOCOL_VERSION = 4/);
   assert.deepEqual(new Set(manifest.host_permissions), new Set(['http://127.0.0.1:4317/*', 'https://chatgpt.com/*', 'https://gemini.google.com/*']));
   const providerScript = manifest.content_scripts.find(script => script.matches.includes('https://chatgpt.com/*'));
   assert.deepEqual(providerScript.js, ['provider-adapters.js', 'send-transaction.js', 'content.js']);
@@ -26,6 +26,10 @@ test('companion background allowlists bounded operations, provider asset origins
   assert.match(source, /PROVIDER_ASSET_HOSTS/);
   assert.match(source, /discoveredAssetDescriptor/);
   assert.match(source, /aih-mirror-asset-bytes/);
+  assert.match(source, /aih-mirror-input-bytes/);
+  assert.match(source, /direct_input/);
+  assert.match(source, /draft-context/);
+  assert.match(source, /prewarm/);
   assert.match(source, /attempt < 4/);
   assert.doesNotMatch(source, /read-file/);
   assert.match(source, /X-AIH-Companion-Token/);
@@ -72,6 +76,16 @@ test('native send interception uses every explicit transaction state and waits f
   assert.match(source, /attachmentMode: 'fallback'/);
   assert.match(source, /fallback_from_run_id/);
   assert.match(source, /deliveries_reconciled|Reverify current project source/);
+  assert.match(source, /preservePendingNativeInputs/);
+  assert.match(source, /USER_INPUT_ASSET_CAPTURE_INCOMPLETE/);
+  assert.match(source, /clipboard_image/);
+  assert.match(source, /drag_drop/);
+  assert.match(source, /scheduleDraftRetrieval/);
+  assert.match(source, /prewarmProject/);
+  assert.match(source, /associationConfirmed/);
+  assert.match(source, /providerAcceptanceTransition/);
+  assert.match(source, /originating_provider_message_id/);
+  assert.match(fs.readFileSync('extension/provider-adapters.js', 'utf8'), /messageContext/);
 });
 
 test('native send transaction model enforces legal transitions, one replay, invalidation, and keyboard gating', () => {
@@ -154,7 +168,7 @@ test('synthetic Gemini DOM variants detect alternate composer/send/message/strea
   assert.equal(health.ok, true);
   assert.equal(health.messages, 2);
   assert.equal(health.streaming, true);
-  assert.equal(health.protocol_version, 3);
+  assert.equal(health.protocol_version, 4);
 });
 
 test('attachment confirmation requires new composer-scoped filename evidence and ignores old inventory', () => {

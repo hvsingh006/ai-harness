@@ -1,9 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
 import { openDatabase, row, storageForDatabase } from '../src/db.mjs';
 import { workspaceStatus, isWithin } from '../src/dev-workspace.mjs';
 import { HARNESS_VERSION, COMPANION_PROTOCOL_VERSION } from '../src/version.mjs';
+import { multimodalToolStatus } from '../src/tooling.mjs';
 
 const checks = [];
 function check(name, ok, detail = '') { checks.push({ name, ok: Boolean(ok), detail }); }
@@ -32,7 +32,7 @@ try {
   storage = storageForDatabase(db);
   const workspaces = Number(row(db, 'SELECT COUNT(*) AS n FROM workspaces')?.n || 0);
   check('SQLite database', true, `${workspaces} workspace(s) · ${storage.dbPath}`);
-  const requiredTables = ['workspace_roots','workspace_resources','resource_versions','resource_chunks','project_snapshots','outgoing_context_runs','companion_pairings'];
+  const requiredTables = ['workspace_roots','workspace_resources','resource_versions','resource_representations','resource_chunks','project_snapshots','outgoing_context_runs','companion_pairings','instruction_versions','personalization_versions','agent_context_sessions','background_jobs'];
   const missing = requiredTables.filter(table => !row(db, `SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table));
   check('Context-integrity schema', missing.length === 0, missing.length ? `Missing: ${missing.join(', ')}` : 'roots, versions, chunks, snapshots, audit, and pairing tables present');
   const outgoingColumns = db.prepare('PRAGMA table_info(outgoing_context_runs)').all().map(item => item.name);
@@ -64,9 +64,12 @@ if (storage) {
     portableDatabase ? 'Explicit database keeps a portable project root.' : `${storage.projectsDir} | private: ${storage.workspaceRoot}`);
 }
 
-const pdfTool = spawnSync('pdftotext', ['-v'], { encoding: 'utf8', windowsHide: true, timeout: 3000 });
-const pdfVersion = String(pdfTool.stderr || pdfTool.stdout || '').split(/\r?\n/).find(Boolean)?.trim() || '';
-check('PDF text extractor', !pdfTool.error && [0, 1].includes(pdfTool.status), !pdfTool.error ? `pdftotext available · ${pdfVersion || 'version unknown'}` : 'Not installed; run install-harness.ps1 to install Poppler automatically. Required PDF indexing fails closed.');
+const tools = multimodalToolStatus();
+for (const [name, label] of [['pdfinfo','PDF metadata'],['pdftotext','PDF digital text'],['pdftoppm','PDF page rendering'],['pdfimages','PDF embedded images'],['tesseract','OCR']]) {
+  const tool = tools[name];
+  check(label, tool.available, tool.available ? `${tool.version || 'version unknown'} · ${tool.executable}` : `Not available (${tool.code}); run install-harness.ps1.`);
+}
+check('Dependency-free lockfile policy', !fs.existsSync(path.join(development.repository.root, 'package-lock.json')), 'package-lock.json is intentionally absent; .npmrc prevents dependency-free install noise');
 
 try {
   const response = await fetch('http://127.0.0.1:4317/api/health', { signal: AbortSignal.timeout(1200) });

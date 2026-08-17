@@ -5,6 +5,7 @@ import { refreshWorkspaceRepositories } from './repository.mjs';
 import { workspaceHistoryCoverage } from './chat-capture.mjs';
 import { PATH_POLICY_VERSION } from './security/paths.mjs';
 import { SECRET_POLICY_VERSION } from './security/secrets.mjs';
+import { instructionContext } from './instructions.mjs';
 
 export const SECURITY_POLICY_VERSION = `${PATH_POLICY_VERSION}+${SECRET_POLICY_VERSION}`;
 
@@ -16,14 +17,26 @@ function updateWorkingState(db, workspaceId, snapshotId, generation) {
   const workspace = row(db, 'SELECT * FROM workspaces WHERE id=?', workspaceId);
   const repository = row(db, `SELECT rs.* FROM repository_states rs JOIN workspace_roots wr ON wr.id=rs.root_id
     WHERE rs.workspace_id=? AND wr.provider_transmission_allowed=1 AND wr.status='current' ORDER BY rs.observed_at DESC LIMIT 1`, workspaceId);
+  const instructions = instructionContext(db, workspaceId);
   const state = {
     workspace: { id: workspace.id, name: workspace.name, active_focus: workspace.active_focus },
+    generations: { corpus: workspace.corpus_generation, index: workspace.index_generation, chat: workspace.chat_generation },
+    instructions: {
+      project: instructions.project_instructions ? { id: instructions.project_instructions.id, version: instructions.project_instructions.version, hash: instructions.project_instructions.hash } : null,
+      global_personalization: instructions.global_personalization ? { id: instructions.global_personalization.id, version: instructions.global_personalization.version, hash: instructions.global_personalization.hash } : null,
+      workspace_personalization: instructions.workspace_personalization ? { id: instructions.workspace_personalization.id, version: instructions.workspace_personalization.version, hash: instructions.workspace_personalization.hash } : null
+    },
     open_tasks: rows(db, `SELECT id,title,details,priority,task_type,updated_at FROM workspace_tasks WHERE workspace_id=? AND status='open' ORDER BY priority,updated_at DESC LIMIT 20`, workspaceId),
     decisions: rows(db, `SELECT id,title,decision,rationale,source_ref,created_at FROM decisions WHERE workspace_id=? ORDER BY created_at DESC LIMIT 20`, workspaceId),
     recently_observed_resources: rows(db, `SELECT r.id,r.relative_path,r.resource_type,v.sha256,v.observed_at
       FROM workspace_resources r JOIN resource_versions v ON v.id=r.current_version_id JOIN workspace_roots wr ON wr.id=r.root_id
       WHERE r.workspace_id=? AND r.status='active' AND r.provider_transmission_allowed=1 AND wr.provider_transmission_allowed=1 AND wr.status='current'
       ORDER BY v.observed_at DESC LIMIT 30`, workspaceId),
+    priority_resources: rows(db, `SELECT r.id,r.relative_path,r.resource_type,r.context_critical,r.priority_status,v.sha256,v.observed_at
+      FROM workspace_resources r JOIN resource_versions v ON v.id=r.current_version_id JOIN workspace_roots wr ON wr.id=r.root_id
+      WHERE r.workspace_id=? AND r.status='active' AND r.knowledge_status='active' AND (r.priority_status='priority' OR r.context_critical=1)
+        AND r.provider_transmission_allowed=1 AND wr.provider_transmission_allowed=1 AND wr.status='current'
+      ORDER BY r.context_critical DESC,r.updated_at DESC LIMIT 30`, workspaceId),
     repository: repository ? { branch: repository.branch, head_commit: repository.head_commit, upstream: repository.upstream, dirty: Boolean(repository.dirty), observed_at: repository.observed_at } : null,
     recent_sessions: rows(db, `SELECT id,provider,title,message_count,history_coverage,last_captured_at FROM sessions WHERE workspace_id=? ORDER BY COALESCE(last_captured_at,started_at) DESC LIMIT 12`, workspaceId)
   };
@@ -78,6 +91,13 @@ export function verifyProjectFreshness(db, { workspaceId, captureResult }) {
     root_inventory_ms: Number(resources.diagnostics?.root_inventory_ms || 0),
     hash_version_ms: Number(resources.diagnostics?.hash_version_ms || 0),
     extraction_index_ms: Number(resources.diagnostics?.extraction_index_ms || 0),
+    inventory_verify_ms: Number(resources.diagnostics?.root_inventory_ms || 0),
+    changed_hash_ms: Number(resources.diagnostics?.hash_version_ms || 0),
+    processing_wait_ms: Number(resources.diagnostics?.extraction_index_ms || 0),
+    files_inventory_count: Number(resources.diagnostics?.files_inventory_count || 0),
+    candidate_files: Number(resources.diagnostics?.candidate_files || 0),
+    files_hashed: Number(resources.diagnostics?.files_hashed || 0),
+    files_processed: Number(resources.diagnostics?.files_processed || 0),
     repository_ms: repositoryRefreshMs,
     snapshot_ms: 0,
     root_verification_ms: rootVerificationMs,
@@ -90,6 +110,7 @@ export function verifyProjectFreshness(db, { workspaceId, captureResult }) {
     roots: resources.roots,
     changed_resources: resources.changed_count,
     deleted_resources: resources.deleted_count,
+    resources_fast_path: Boolean(resources.fast_path),
     repository_states: repository.states.map(item => ({ root_id: item.root_id, branch: item.branch, head: item.head, dirty: item.dirty, state_hash: item.state_hash })),
     chat: { session_id: captureResult?.session?.id || null, synchronized_visible: Boolean(captureResult?.synchronized_visible), raw_capture_complete: Boolean(captureResult?.raw_capture_complete) },
     diagnostics

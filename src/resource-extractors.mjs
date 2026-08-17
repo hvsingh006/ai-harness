@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
 import { mimeFromName } from './archive.mjs';
+import { runTool, toolStatus } from './tooling.mjs';
 
 const TEXT_EXTENSIONS = new Set([
   '.txt', '.md', '.markdown', '.json', '.jsonl', '.yaml', '.yml', '.xml', '.html', '.htm', '.css',
@@ -18,7 +18,7 @@ export function classifyResource(filePath) {
     return { resourceType: 'office', mimeType, extractable: false, attachmentOnly: true };
   }
   if (extension === '.svg') return { resourceType: 'image', mimeType, extractable: true };
-  if (mimeType.startsWith('image/')) return { resourceType: 'image', mimeType, extractable: false };
+  if (mimeType.startsWith('image/')) return { resourceType: 'image', mimeType, extractable: false, ocrExtractable: ['image/png','image/jpeg','image/webp'].includes(mimeType) };
   if (TEXT_EXTENSIONS.has(extension) || mimeType.startsWith('text/') || /(?:json|xml|yaml)/.test(mimeType)) {
     return { resourceType: extension && ['.js','.mjs','.cjs','.jsx','.ts','.tsx','.py','.c','.h','.cpp','.hpp','.java','.go','.rs','.sv','.v','.vhd','.vhdl','.tcl','.sh','.ps1'].includes(extension) ? 'code' : 'text', mimeType, extractable: true };
   }
@@ -78,12 +78,9 @@ function chunkLines(text, { linesPerChunk = 80, overlapLines = 12 } = {}) {
 }
 
 function extractPdf(filePath, maxBytes) {
-  const result = spawnSync('pdftotext', ['-layout', filePath, '-'], {
-    encoding: 'utf8',
-    windowsHide: true,
-    timeout: 30000,
-    maxBuffer: maxBytes
-  });
+  const tool = toolStatus('pdftotext');
+  if (!tool.available) return { status: 'unsupported', reason: 'pdftotext is not installed', chunks: [], metadata: { extractor: 'pdftotext', available: false } };
+  const result = runTool('pdftotext', ['-layout', filePath, '-'], { timeout: 30000, maxBuffer: maxBytes });
   if (result.error?.code === 'ENOENT') return { status: 'unsupported', reason: 'pdftotext is not installed', chunks: [], metadata: { extractor: 'pdftotext', available: false } };
   if (result.error) return { status: 'failed', reason: result.error.message, chunks: [], metadata: { extractor: 'pdftotext' } };
   if (result.status !== 0) return { status: 'failed', reason: String(result.stderr || 'PDF extraction failed').trim(), chunks: [], metadata: { extractor: 'pdftotext' } };
@@ -92,7 +89,7 @@ function extractPdf(filePath, maxBytes) {
   pages.forEach((page, index) => {
     for (const chunk of chunkLines(page, { linesPerChunk: 60, overlapLines: 8 })) chunks.push({ ...chunk, pageStart: index + 1, pageEnd: index + 1 });
   });
-  return { status: 'complete', chunks, metadata: { extractor: 'pdftotext', page_count: pages.length } };
+  return { status: 'complete', chunks, metadata: { extractor: 'pdftotext', extractor_version: tool.version, page_count: pages.length } };
 }
 
 export function extractFile(filePath, { maxTextBytes = 8 * 1024 * 1024, maxPdfInputBytes = 100 * 1024 * 1024, maxPdfOutputBytes = 32 * 1024 * 1024, logicalPath = filePath } = {}) {

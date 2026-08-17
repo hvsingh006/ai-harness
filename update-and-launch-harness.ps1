@@ -9,7 +9,7 @@ try {
   $health = Invoke-RestMethod -Uri 'http://127.0.0.1:4317/api/health' -TimeoutSec 2
   if ($health.pid) {
     Write-Host "Stopping running AI Harness process $($health.pid)..."
-    try { Invoke-RestMethod -Uri 'http://127.0.0.1:4317/api/shutdown' -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 2 | Out-Null } catch {}
+    try { Invoke-RestMethod -Uri 'http://127.0.0.1:4317/api/shutdown' -Method Post -Headers @{ Origin = 'http://127.0.0.1:4317' } -ContentType 'application/json' -Body '{}' -TimeoutSec 2 | Out-Null } catch {}
     for ($attempt = 0; $attempt -lt 20; $attempt++) {
       if (-not (Get-Process -Id ([int]$health.pid) -ErrorAction SilentlyContinue)) { break }
       Start-Sleep -Milliseconds 200

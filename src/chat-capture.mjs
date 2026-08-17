@@ -85,6 +85,8 @@ export function captureBrowserSession(db, body) {
     throw Object.assign(new Error('provider conversation belongs to another Project Space'), { code: 'SESSION_WORKSPACE_MISMATCH', sessionId: session.id });
   }
   const observedAt = new Date().toISOString();
+  const evidence = body.capture_evidence || {};
+  const rawComplete = captureComplete(evidence);
   let sessionCreated = false;
   if (!session) {
     const id = `session-${randomUUID()}`;
@@ -104,16 +106,29 @@ export function captureBrowserSession(db, body) {
 
   let messagesAdded = 0;
   let deliveriesReconciled = 0;
+  let visiblePathChanged = false;
   const messages = Array.isArray(body.messages) ? body.messages : [];
+  const visibleMessageIdentities = [];
   for (let index = 0; index < messages.length; index++) {
     const item = messages[index] || {};
     const rawContent = String(item.content || item.text || '').trim();
     if (!rawContent) continue;
     const providerMessageId = String(item.provider_message_id || sha256Text(`${item.role || 'unknown'}\0${rawContent}\0${index}`).slice(0, 32));
-    if (row(db, 'SELECT id FROM messages WHERE session_id=? AND provider_message_id=?', session.id, providerMessageId)) continue;
+    const cleanContent = item.role === 'user' ? cleanManagedUserText(rawContent) : rawContent;
+    const contentHash = sha256Text(cleanContent);
+    const captureIdentity = `${providerMessageId}\0${contentHash}`;
+    visibleMessageIdentities.push(captureIdentity);
+    const existingMessage = row(db, 'SELECT id,path_status,parent_provider_message_id FROM messages WHERE session_id=? AND provider_message_id=? AND content_hash=? ORDER BY ordinal DESC LIMIT 1', session.id, providerMessageId, contentHash);
+    if (existingMessage) {
+      if (rawComplete && existingMessage.path_status !== 'visible') visiblePathChanged = true;
+      run(db, `UPDATE messages SET path_status=CASE WHEN ? THEN 'visible' ELSE path_status END,last_seen_in_capture_at=?,
+        parent_provider_message_id=CASE WHEN ?!='' THEN ? ELSE parent_provider_message_id END WHERE id=?`,
+        rawComplete ? 1 : 0, observedAt, String(item.parent_provider_message_id || '').slice(0, 500), String(item.parent_provider_message_id || '').slice(0, 500), existingMessage.id);
+      continue;
+    }
+    if (row(db, 'SELECT id FROM messages WHERE session_id=? AND provider_message_id=? LIMIT 1', session.id, providerMessageId)) visiblePathChanged = rawComplete || visiblePathChanged;
     const ordinal = Number(row(db, 'SELECT COALESCE(MAX(ordinal), -1) AS n FROM messages WHERE session_id=?', session.id)?.n ?? -1) + 1;
     const id = `msg-${randomUUID()}`;
-    const cleanContent = item.role === 'user' ? cleanManagedUserText(rawContent) : rawContent;
     let outgoingContextRunId = item.outgoing_context_run_id || null;
     if (item.role === 'user' && !outgoingContextRunId) {
       const exactProviderTextHash = sha256Text(rawContent);
@@ -138,11 +153,11 @@ export function captureBrowserSession(db, body) {
       }
     }
     const harnessManaged = cleanContent !== rawContent || Boolean(outgoingContextRunId);
-    run(db, `INSERT INTO messages (id,session_id,provider_message_id,parent_provider_message_id,ordinal,role,content_text,clean_content_text,content_json,raw_json,content_hash,created_at,outgoing_context_run_id,harness_managed)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      id, session.id, providerMessageId, '', ordinal, item.role || 'unknown', rawContent, cleanContent,
-      JSON.stringify(item.content_json || {}), JSON.stringify(item.raw || {}), sha256Text(cleanContent), item.created_at || observedAt,
-      outgoingContextRunId, harnessManaged ? 1 : 0);
+    run(db, `INSERT INTO messages (id,session_id,provider_message_id,parent_provider_message_id,ordinal,role,content_text,clean_content_text,content_json,raw_json,content_hash,created_at,outgoing_context_run_id,harness_managed,path_status,last_seen_in_capture_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      id, session.id, providerMessageId, String(item.parent_provider_message_id || '').slice(0, 500), ordinal, item.role || 'unknown', rawContent, cleanContent,
+      JSON.stringify(item.content_json || {}), JSON.stringify(item.raw || {}), contentHash, item.created_at || observedAt,
+      outgoingContextRunId, harnessManaged ? 1 : 0, rawComplete ? 'visible' : 'unknown', observedAt);
     try {
       run(db, `INSERT INTO message_fts (message_id,session_id,workspace_id,provider,title,role,content) VALUES (?,?,?,?,?,?,?)`,
         id, session.id, workspaceId, provider, body.title || session.title, item.role || 'unknown', cleanContent);
@@ -150,33 +165,84 @@ export function captureBrowserSession(db, body) {
     messagesAdded += 1;
   }
 
+  if (rawComplete) {
+    const identitiesJson = JSON.stringify(visibleMessageIdentities);
+    const alternatives = run(db, `UPDATE messages SET path_status='alternate'
+      WHERE session_id=? AND path_status='visible' AND (provider_message_id || char(0) || content_hash) NOT IN (SELECT value FROM json_each(?))`, session.id, identitiesJson);
+    if (alternatives.changes) visiblePathChanged = true;
+  }
+
   const assets = Array.isArray(body.assets) ? body.assets : [];
   for (const asset of assets) {
-    const validated = validateProviderAssetUrl(provider, asset.url);
-    const nativeId = String(asset.native_id || sha256Text(`${asset.url || ''}|${asset.name || ''}`).slice(0, 32));
+    const providerMessageId = String(asset.originating_provider_message_id || '').slice(0, 500);
+    const messageRole = providerMessageId
+      ? row(db, `SELECT role FROM messages WHERE session_id=? AND provider_message_id=? ORDER BY CASE path_status WHEN 'visible' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END,ordinal DESC LIMIT 1`, session.id, providerMessageId)?.role
+      : '';
+    const requestedOrigin = String(asset.origin_kind || '').toLowerCase();
+    const originKind = requestedOrigin === 'user_input' || messageRole === 'user' ? 'user_input' : 'provider_output';
+    const requestedMethod = String(asset.capture_method || '').toLowerCase();
+    const captureMethod = ['direct_file_input','clipboard_image','drag_drop','provider_url','page_blob','history_dom'].includes(requestedMethod)
+      ? requestedMethod
+      : String(asset.url || '').startsWith('blob:') ? 'page_blob' : 'provider_url';
+    const directInput = originKind === 'user_input' && ['direct_file_input','clipboard_image','drag_drop'].includes(captureMethod) && !asset.url;
+    const validated = directInput
+      ? { ok: true, status: 'DISCOVERED', url: '', capture_strategy: 'direct_input' }
+      : validateProviderAssetUrl(provider, asset.url);
+    const nativeId = String(asset.native_id || sha256Text(`${asset.url || ''}|${asset.name || ''}|${providerMessageId}|${originKind}`).slice(0, 32)).slice(0, 500);
     const existingAsset = row(db, 'SELECT * FROM session_assets WHERE session_id=? AND native_id=?', session.id, nativeId);
     if (existingAsset) {
+      let metadata = {};
+      try { metadata = JSON.parse(existingAsset.metadata_json || '{}'); } catch {}
+      metadata = { ...metadata, ...(asset.metadata || {}), discovery_code: validated.code || '', discovered_url: validated.ok ? validated.url : '', capture_strategy: validated.capture_strategy || metadata.capture_strategy || '' };
+      run(db, `UPDATE session_assets SET name=?,mime_type=?,origin_kind=?,capture_method=?,originating_provider_message_id=CASE WHEN ?!='' THEN ? ELSE originating_provider_message_id END,metadata_json=?,updated_at=? WHERE id=?`,
+        String(asset.name || existingAsset.name || '').slice(0, 240), String(asset.mime_type || existingAsset.mime_type || 'application/octet-stream').slice(0, 200),
+        originKind, captureMethod, providerMessageId, providerMessageId, JSON.stringify(metadata), observedAt, existingAsset.id);
+      if (providerMessageId && existingAsset.resource_id) {
+        const capturedMessage = row(db, `SELECT id,role FROM messages WHERE session_id=? AND provider_message_id=? ORDER BY CASE path_status WHEN 'visible' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END,ordinal DESC LIMIT 1`, session.id, providerMessageId);
+        const linkedResource = row(db, 'SELECT id,source_type,origin_json FROM workspace_resources WHERE id=?', existingAsset.resource_id);
+        if (linkedResource && ['provider_user_attachment','clipboard_image','provider_generated_asset'].includes(linkedResource.source_type)) {
+          let origin = {};
+          try { origin = JSON.parse(linkedResource.origin_json || '{}'); } catch {}
+          origin.originating_provider_message_id = providerMessageId;
+          if (capturedMessage?.id) origin.originating_message_id = capturedMessage.id;
+          run(db, 'UPDATE workspace_resources SET origin_json=?,updated_at=? WHERE id=?', JSON.stringify(origin), observedAt, linkedResource.id);
+        }
+        for (const relationship of rows(db, `SELECT id,provenance_json FROM resource_relationships WHERE source_type='session_asset' AND source_id=?`, existingAsset.id)) {
+          let provenance = {};
+          try { provenance = JSON.parse(relationship.provenance_json || '{}'); } catch {}
+          provenance.originating_provider_message_id = providerMessageId;
+          if (capturedMessage?.id) provenance.originating_message_id = capturedMessage.id;
+          run(db, 'UPDATE resource_relationships SET provenance_json=? WHERE id=?', JSON.stringify(provenance), relationship.id);
+        }
+      }
       if (validated.ok && ['UNAVAILABLE','AUTH_REQUIRED','CORS_BLOCKED','EXPIRED','FAILED'].includes(String(existingAsset.mirror_status).toUpperCase())) {
         run(db, `UPDATE session_assets SET source_url=?,mirror_status='DISCOVERED',updated_at=? WHERE id=?`, validated.url, observedAt, existingAsset.id);
       }
       continue;
     }
-    run(db, `INSERT INTO session_assets (id,session_id,provider,asset_type,name,source_url,native_id,mime_type,mirror_status,metadata_json,created_at,updated_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+    run(db, `INSERT INTO session_assets (id,session_id,provider,asset_type,name,source_url,native_id,mime_type,mirror_status,metadata_json,created_at,updated_at,origin_kind,capture_method,originating_provider_message_id)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       `assetref-${randomUUID()}`, session.id, provider, asset.asset_type || 'file', asset.name || '', asset.url || '', nativeId,
       asset.mime_type || 'application/octet-stream', validated.status,
-      JSON.stringify({ ...(asset.metadata || {}), discovery_code: validated.code || '', discovered_url: validated.ok ? validated.url : '', capture_strategy: validated.capture_strategy || '' }), observedAt, observedAt);
+      JSON.stringify({ ...(asset.metadata || {}), discovery_code: validated.code || '', discovered_url: validated.ok ? validated.url : '', capture_strategy: validated.capture_strategy || '' }), observedAt, observedAt,
+      originKind, captureMethod, providerMessageId);
   }
 
-  const evidence = body.capture_evidence || {};
-  const rawComplete = captureComplete(evidence);
-  const assetRefs = Number(row(db, 'SELECT COUNT(*) AS n FROM session_assets WHERE session_id=?', session.id)?.n || 0);
-  const unmirrored = Number(row(db, `SELECT COUNT(*) AS n FROM session_assets WHERE session_id=? AND UPPER(mirror_status)!='CAPTURED'`, session.id)?.n || 0);
-  setCaptureStages(db, session.id, { raw: rawComplete, attachments: assetRefs === 0 || unmirrored === 0, derived: false, search: true });
+  const incompleteInputs = Number(row(db, `SELECT COUNT(*) AS n FROM session_assets WHERE session_id=? AND origin_kind='user_input' AND UPPER(mirror_status)!='CAPTURED'`, session.id)?.n || 0);
+  const incompleteOutputs = Number(row(db, `SELECT COUNT(*) AS n FROM session_assets WHERE session_id=? AND origin_kind!='user_input' AND UPPER(mirror_status)!='CAPTURED'`, session.id)?.n || 0);
+  const incompleteDerived = Number(row(db, `SELECT COUNT(*) AS n FROM session_assets sa LEFT JOIN resource_versions v ON v.id=sa.resource_version_id
+    WHERE sa.session_id=? AND (UPPER(sa.mirror_status)!='CAPTURED' OR v.id IS NULL OR v.indexing_status IN ('pending','processing','failed') OR v.representation_coverage IN ('blocked','partial','unknown'))`, session.id)?.n || 0);
+  setCaptureStages(db, session.id, {
+    raw: rawComplete,
+    userInputs: { complete: incompleteInputs === 0, details: incompleteInputs ? `${incompleteInputs} observed user input asset(s) still require durable bytes` : '' },
+    providerOutputs: { complete: incompleteOutputs === 0, details: incompleteOutputs ? `${incompleteOutputs} observed provider-generated asset(s) still require durable bytes` : '' },
+    derived: { complete: incompleteDerived === 0, details: incompleteDerived ? `${incompleteDerived} asset representation(s) are not completely derived` : '' },
+    search: { complete: incompleteDerived === 0, details: incompleteDerived ? 'asset search representation is incomplete' : '' }
+  });
   run(db, `UPDATE sessions SET message_count=(SELECT COUNT(*) FROM messages WHERE session_id=?),last_captured_at=?,history_coverage=?,capture_evidence_json=? WHERE id=?`,
     session.id, observedAt, rawComplete ? 'complete' : 'partial', JSON.stringify(evidence), session.id);
   const coverage = workspaceHistoryCoverage(db, workspaceId);
-  if (messagesAdded || sessionCreated) run(db, `UPDATE workspaces SET chat_generation=chat_generation+1,history_coverage=?,updated_at=? WHERE id=?`, coverage, observedAt, workspaceId);
+  if (messagesAdded || sessionCreated || visiblePathChanged) run(db, `UPDATE workspaces SET chat_generation=chat_generation+1,history_coverage=?,updated_at=? WHERE id=?`, coverage, observedAt, workspaceId);
   else run(db, `UPDATE workspaces SET history_coverage=? WHERE id=?`, coverage, workspaceId);
 
   return {
@@ -195,5 +261,5 @@ export function captureBrowserSession(db, body) {
 export function workspaceHistoryCoverage(db, workspaceId) {
   const sessions = rows(db, 'SELECT history_coverage,capture_status FROM sessions WHERE workspace_id=?', workspaceId);
   if (!sessions.length) return 'unknown';
-  return sessions.every(session => session.history_coverage === 'complete') ? 'complete' : 'partial';
+  return sessions.every(session => session.history_coverage === 'complete' && session.capture_status === 'safe_to_delete') ? 'complete' : 'partial';
 }

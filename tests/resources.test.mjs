@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { openDatabase, ensureWorkspaceProjectRoot, row, rows, run, registerWorkspaceRoot, storageForDatabase } from '../src/db.mjs';
-import { reconcileWorkspaceResources, currentWorkspaceResources } from '../src/resources.mjs';
+import { ingestProviderArtifactResource, reconcileWorkspaceResources, currentWorkspaceResources, reprocessResourceVersion, saveResourceCopyToProjectFolder, updateResourceContextPolicy } from '../src/resources.mjs';
+import { archiveFile } from '../src/archive.mjs';
 import { inspectRepositoryRoot, refreshWorkspaceRepositories } from '../src/repository.mjs';
 import { migrateManagedWorkspaceProject } from '../src/workspace-migration.mjs';
 import { classifyResource, extractFile } from '../src/resource-extractors.mjs';
@@ -63,6 +64,25 @@ test('resource reconciliation discovers new files and preserves deleted resource
   assert.equal(removed.deleted_count, 1);
   assert.equal(row(db, `SELECT status FROM workspace_resources WHERE relative_path='one.txt'`).status, 'deleted');
   assert.equal(row(db, `SELECT COUNT(*) AS n FROM resource_versions v JOIN workspace_resources r ON r.id=v.resource_id WHERE r.relative_path='one.txt'`).n, 1);
+});
+
+test('high-confidence same-root renames preserve logical resource and version identity', t => {
+  const { db, root } = fixture(t, 'aih-resource-rename-');
+  const beforePath = path.join(root, 'design-old.md');
+  const afterPath = path.join(root, 'design-current.md');
+  fs.writeFileSync(beforePath, 'Stable renamed design evidence.\n');
+  reconcileWorkspaceResources(db, 'ws-harness');
+  const before = row(db, `SELECT * FROM workspace_resources WHERE relative_path='design-old.md'`);
+  fs.renameSync(beforePath, afterPath);
+  const renamed = reconcileWorkspaceResources(db, 'ws-harness');
+  assert.equal(renamed.ok, true);
+  assert.equal(renamed.renamed_count, 1);
+  assert.equal(renamed.deleted_count, 0);
+  const after = row(db, `SELECT * FROM workspace_resources WHERE relative_path='design-current.md'`);
+  assert.equal(after.id, before.id);
+  assert.equal(after.current_version_id, before.current_version_id);
+  assert.equal(row(db, 'SELECT COUNT(*) AS n FROM resource_versions WHERE resource_id=?', before.id).n, 1);
+  assert.equal(row(db, 'SELECT path FROM resource_chunk_fts WHERE resource_id=? LIMIT 1', before.id).path, 'design-current.md');
 });
 
 test('linked roots require explicit registration and local-only roots never become transmissible', t => {
@@ -172,7 +192,7 @@ test('managed-project migration reports a target conflict without overwriting ei
   assert.equal(fs.existsSync(path.join(target, 'source.txt')), false);
 });
 
-test('unchanged failed PDF versions are retried after the extractor becomes available without re-adding the file', t => {
+test('unchanged failed optional PDF versions remain non-blocking and retry after the extractor becomes available without re-adding the file', t => {
   const available = spawnSync('pdftotext', ['-v'], { windowsHide: true });
   if (available.error) { t.skip('pdftotext is not installed in this test environment'); return; }
   const { db, root, dir } = fixture(t);
@@ -191,19 +211,97 @@ test('unchanged failed PDF versions are retried after the extractor becomes avai
   pdfText += `xref\n0 6\n0000000000 65535 f \n${offsets.slice(1).map(offset => `${String(offset).padStart(10, '0')} 00000 n `).join('\n')}\ntrailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
   fs.writeFileSync(pdf, pdfText);
   const originalPath = process.env.PATH;
+  const originalPoppler = process.env.AIH_POPPLER_BIN;
+  const originalLocalAppData = process.env.LOCALAPPDATA;
   const emptyTools = path.join(dir, 'empty-tools');
   fs.mkdirSync(emptyTools);
   try {
     process.env.PATH = emptyTools;
+    delete process.env.AIH_POPPLER_BIN;
+    process.env.LOCALAPPDATA = emptyTools;
     const first = reconcileWorkspaceResources(db, 'ws-harness');
-    assert.equal(first.ok, false);
+    assert.equal(first.ok, true, 'an unrelated non-critical PDF representation failure must not block ordinary current work');
+    assert.equal(first.extraction_failures, 1);
     assert.equal(row(db, `SELECT indexing_status FROM resource_versions v JOIN workspace_resources r ON r.current_version_id=v.id WHERE r.relative_path='retry.pdf'`).indexing_status, 'failed');
     process.env.PATH = originalPath;
+    if (originalPoppler === undefined) delete process.env.AIH_POPPLER_BIN; else process.env.AIH_POPPLER_BIN = originalPoppler;
+    if (originalLocalAppData === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = originalLocalAppData;
+    reprocessResourceVersion(db, row(db, `SELECT id FROM workspace_resources WHERE relative_path='retry.pdf'`).id);
     const retried = reconcileWorkspaceResources(db, 'ws-harness');
     assert.equal(retried.ok, true, JSON.stringify(retried.reasons));
     assert.equal(row(db, `SELECT indexing_status FROM resource_versions v JOIN workspace_resources r ON r.current_version_id=v.id WHERE r.relative_path='retry.pdf'`).indexing_status, 'complete');
     assert.equal(row(db, `SELECT COUNT(*) AS n FROM resource_versions v JOIN workspace_resources r ON r.id=v.resource_id WHERE r.relative_path='retry.pdf'`).n, 1);
-  } finally { process.env.PATH = originalPath; }
+  } finally {
+    process.env.PATH = originalPath;
+    if (originalPoppler === undefined) delete process.env.AIH_POPPLER_BIN; else process.env.AIH_POPPLER_BIN = originalPoppler;
+    if (originalLocalAppData === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = originalLocalAppData;
+  }
+});
+
+test('warm manifests hash no unchanged files and a single edit processes only its delta', t => {
+  const { db, root } = fixture(t, 'aih-resource-scale-');
+  for (let index = 0; index < 400; index++) fs.writeFileSync(path.join(root, `source-${String(index).padStart(4, '0')}.txt`), `source ${index}\n`);
+  const first = reconcileWorkspaceResources(db, 'ws-harness');
+  assert.equal(first.ok, true);
+  assert.equal(first.diagnostics.files_hashed, 400);
+  const warm = reconcileWorkspaceResources(db, 'ws-harness');
+  assert.equal(warm.fast_path, true);
+  assert.equal(warm.diagnostics.files_hashed, 0);
+  assert.equal(warm.diagnostics.files_processed, 0);
+  fs.writeFileSync(path.join(root, 'source-0173.txt'), 'source 173 changed current bytes\n');
+  const changed = reconcileWorkspaceResources(db, 'ws-harness');
+  assert.equal(changed.ok, true);
+  assert.equal(changed.changed_count, 1);
+  assert.equal(changed.diagnostics.candidate_files, 1);
+  assert.equal(changed.diagnostics.files_hashed, 1);
+  assert.equal(changed.diagnostics.files_processed, 1);
+});
+
+test('context-critical resources fail closed even when their root is otherwise optional', t => {
+  const { db, root } = fixture(t, 'aih-critical-resource-');
+  fs.writeFileSync(path.join(root, 'critical.txt'), 'verified critical evidence\n');
+  assert.equal(reconcileWorkspaceResources(db, 'ws-harness').ok, true);
+  const resource = row(db, `SELECT * FROM workspace_resources WHERE relative_path='critical.txt'`);
+  run(db, 'UPDATE workspace_roots SET required_for_freshness=0 WHERE id=?', resource.root_id);
+  updateResourceContextPolicy(db, resource.id, { context_critical: true });
+  run(db, `UPDATE resource_versions SET indexing_status='failed',representation_coverage='partial' WHERE id=?`, resource.current_version_id);
+  const blocked = reconcileWorkspaceResources(db, 'ws-harness');
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.reasons.some(item => item.code === 'CONTEXT_CRITICAL_RESOURCE_NOT_READY' && item.resource_id === resource.id), true);
+  updateResourceContextPolicy(db, resource.id, { context_critical: false });
+  const optional = reconcileWorkspaceResources(db, 'ws-harness');
+  assert.equal(optional.reasons.some(item => item.code === 'CONTEXT_CRITICAL_RESOURCE_NOT_READY'), false);
+});
+
+test('native user input reconciles a unique exact approved-root resource and refuses ambiguous hash merging', t => {
+  const { db, root, dir } = fixture(t, 'aih-native-reconcile-');
+  const bytes = Buffer.from('exact user attachment bytes');
+  fs.writeFileSync(path.join(root, 'architecture.txt'), bytes);
+  reconcileWorkspaceResources(db, 'ws-harness');
+  const existing = row(db, `SELECT * FROM workspace_resources WHERE relative_path='architecture.txt'`);
+  const outside = path.join(dir, 'outside-architecture.txt');
+  fs.writeFileSync(outside, bytes);
+  const artifact = archiveFile(db, { filePath: outside, workspaceId: 'ws-harness', provider: 'chatgpt', artifactType: 'provider_user_attachment', sourcePathOverride: 'native:test:unique' });
+  const reconciled = ingestProviderArtifactResource(db, { workspaceId: 'ws-harness', artifact, sourceId: 'asset-unique', provider: 'chatgpt', name: 'architecture.txt', sourceType: 'provider_user_attachment', provenance: { user_message_id: 'msg-1' } });
+  assert.equal(reconciled.reconciled, true);
+  assert.equal(reconciled.resource.id, existing.id);
+  assert.equal(reconciled.version.id, existing.current_version_id);
+
+  fs.writeFileSync(path.join(root, 'architecture-copy.txt'), bytes);
+  reconcileWorkspaceResources(db, 'ws-harness');
+  const secondOutside = path.join(dir, 'second-outside.txt');
+  fs.writeFileSync(secondOutside, bytes);
+  const secondArtifact = archiveFile(db, { filePath: secondOutside, workspaceId: 'ws-harness', provider: 'gemini', artifactType: 'provider_user_attachment', sourcePathOverride: 'native:test:ambiguous' });
+  const separate = ingestProviderArtifactResource(db, { workspaceId: 'ws-harness', artifact: secondArtifact, sourceId: 'asset-ambiguous', provider: 'gemini', name: 'architecture.txt', sourceType: 'provider_user_attachment' });
+  assert.equal(separate.reconciled, false);
+  assert.equal(separate.resource.source_type, 'provider_user_attachment');
+  assert.notEqual(separate.resource.id, existing.id);
+  const primaryRoot = row(db, `SELECT * FROM workspace_roots WHERE workspace_id='ws-harness' AND root_kind='primary'`);
+  const saved = saveResourceCopyToProjectFolder(db, { resourceId: separate.resource.id, rootId: primaryRoot.id, relativePath: 'imports/architecture-from-gemini.txt' });
+  assert.equal(fs.readFileSync(path.join(root, 'imports', 'architecture-from-gemini.txt')).equals(bytes), true);
+  assert.equal(saved.sha256, secondArtifact.sha256);
+  assert.ok(row(db, `SELECT id FROM resource_relationships WHERE source_id=? AND relationship_type='saved_copy_as' AND target_id=?`, separate.version.id, saved.exported_resource.current_version_id));
+  assert.throws(() => saveResourceCopyToProjectFolder(db, { resourceId: separate.resource.id, rootId: primaryRoot.id, relativePath: 'imports/architecture-from-gemini.txt' }), error => error.code === 'DESTINATION_CONFLICT');
 });
 
 test('Office formats are explicit immutable attachment-only resources instead of silently pretending extraction', t => {

@@ -19,7 +19,10 @@
 
       <nav id="nav">
         <button class="nav-item active" data-view="workspace">Project Space</button>
+        <button class="nav-item" data-view="resources">Resources</button>
         <button class="nav-item" data-view="history">Chat History</button>
+        <button class="nav-item" data-view="instructions">Instructions</button>
+        <button class="nav-item" data-view="security">Security &amp; surfaces</button>
         <button class="nav-item" data-view="setup">Setup</button>
       </nav>
 
@@ -84,6 +87,47 @@
         <button type="button" class="secondary" id="cancelWorkspaceButton">Cancel</button>
         <button type="submit" class="primary">Create project</button>
       </div>
+    </form>
+  </dialog>
+
+  <dialog id="sourceDialog">
+    <form id="sourceForm" method="dialog">
+      <div class="dialog-head">
+        <div><div class="eyebrow">APPROVE PROJECT SOURCE</div><h2>Review linked source</h2></div>
+        <button type="button" id="closeSourceDialog" class="icon-button" aria-label="Close">×</button>
+      </div>
+      <label class="form-field"><span>Selected folder</span><input id="sourcePath" readonly /></label>
+      <p class="callout" id="sourceDetected"></p>
+      <label class="check-field"><input type="checkbox" id="sourceRequired" checked /><span><strong>Required for Project Current</strong><small>Harness will fail closed if this source cannot be verified.</small></span></label>
+      <label class="check-field"><input type="checkbox" id="sourceIndexed" checked /><span><strong>Index locally</strong><small>Detect changes and build current searchable representations.</small></span></label>
+      <label class="check-field"><input type="checkbox" id="sourceCloud" checked /><span><strong>Available to cloud AI</strong><small>Relevant non-secret material may be sent to ChatGPT or Gemini. Turn off for local-only use.</small></span></label>
+      <div class="dialog-actions"><button type="button" class="secondary" id="cancelSourceDialog">Cancel</button><button type="submit" class="primary">Add source</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="rootPolicyDialog">
+    <form id="rootPolicyForm" method="dialog">
+      <div class="dialog-head">
+        <div><div class="eyebrow">SOURCE POLICY</div><h2 id="rootPolicyTitle">Edit source</h2></div>
+        <button type="button" id="closeRootPolicyDialog" class="icon-button" aria-label="Close">×</button>
+      </div>
+      <label class="check-field"><input type="checkbox" id="rootRequired" /><span><strong>Required for verified context</strong><small>Missing or changed identity blocks Project Current.</small></span></label>
+      <label class="check-field"><input type="checkbox" id="rootIndexed" /><span><strong>Index locally</strong><small>Keep current versions and derived context updated.</small></span></label>
+      <label class="check-field"><input type="checkbox" id="rootCloud" /><span><strong>Available to cloud AI</strong><small>When off, this source is never included in browser-provider context or attachments.</small></span></label>
+      <div class="dialog-actions"><button type="button" class="secondary" id="cancelRootPolicyDialog">Cancel</button><button type="submit" class="primary">Save policy</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="resourceCopyDialog">
+    <form id="resourceCopyForm" method="dialog">
+      <div class="dialog-head">
+        <div><div class="eyebrow">EXPORT DURABLE RESOURCE</div><h2>Save copy to project folder</h2></div>
+        <button type="button" id="closeResourceCopyDialog" class="icon-button" aria-label="Close">×</button>
+      </div>
+      <p class="callout">The resource is already durable in the Project Space. This optional action writes its exact current bytes into one approved project source without changing the archived origin.</p>
+      <label class="form-field"><span>Approved destination</span><select id="resourceCopyRoot" required></select></label>
+      <label class="form-field"><span>Relative filename</span><input id="resourceCopyPath" required maxlength="500" /></label>
+      <div class="dialog-actions"><button type="button" class="secondary" id="cancelResourceCopyDialog">Cancel</button><button type="submit" class="primary">Save exact copy</button></div>
     </form>
   </dialog>
 

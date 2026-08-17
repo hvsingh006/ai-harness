@@ -50,6 +50,8 @@ export function buildStoragePaths(workspaceRoot = defaultWorkspaceRoot(), projec
     runtimeDir: path.join(root, '.harness'),
     importsDir: path.join(root, 'Archive', 'Imports'),
     stagingDir: path.join(root, '.harness', 'staging'),
+    derivedDir: path.join(root, '.harness', 'derived'),
+    contextSessionsDir: path.join(root, '.harness', 'context-sessions'),
     vaultDir: path.join(root, 'Archive', 'Vault'),
     dbPath: path.join(root, 'harness.db')
   };
@@ -89,6 +91,8 @@ export function ensureStorageLayout(paths) {
     paths.runtimeDir,
     paths.importsDir,
     paths.stagingDir,
+    paths.derivedDir,
+    paths.contextSessionsDir,
     paths.vaultDir
   ]) fs.mkdirSync(dir, { recursive: true });
   return paths;

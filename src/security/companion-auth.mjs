@@ -80,7 +80,7 @@ export function authenticateCompanionRequest(db, req, { installSecret = '' } = {
 
 export function isSameOriginDashboardRequest(req, port) {
   const origin = String(req.headers.origin || '');
-  if (!origin) return true;
+  if (!origin) return false;
   return origin === `http://127.0.0.1:${port}` || origin === `http://localhost:${port}`;
 }
 

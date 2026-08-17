@@ -8,6 +8,7 @@
     "start": "node src/server.mjs",
     "dev": "node --watch src/server.mjs",
     "test": "node --test",
+    "test:clean": "node scripts/clean-worktree-check.mjs",
     "import": "node scripts/import.mjs",
     "doctor": "node scripts/doctor.mjs",
     "backup": "node scripts/backup.mjs",

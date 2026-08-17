@@ -5,10 +5,13 @@ const ALLOWED_PATHS = [
   /^\/companion\/active-workspace$/,
   /^\/companion\/provider-session(?:\?.*)?$/,
   /^\/companion\/capture$/,
+  /^\/companion\/workspaces\/[A-Za-z0-9_-]+\/prewarm$/,
+  /^\/companion\/workspaces\/[A-Za-z0-9_-]+\/draft-context$/,
   /^\/companion\/workspaces\/[A-Za-z0-9_-]+\/prepare-send$/,
   /^\/companion\/outgoing-context\/[A-Za-z0-9_-]+\/sent$/,
   /^\/companion\/outgoing-context\/[A-Za-z0-9_-]+\/failed$/,
   /^\/companion\/resource-versions\/[A-Za-z0-9_-]+\/content$/,
+  /^\/companion\/representations\/[A-Za-z0-9_-]+\/content$/,
   /^\/companion\/session-assets\/[A-Za-z0-9_-]+\/source$/,
   /^\/companion\/session-assets\/[A-Za-z0-9_-]+\/content$/,
   /^\/companion\/session-assets\/[A-Za-z0-9_-]+\/status$/
@@ -103,7 +106,7 @@ async function uploadDiscoveredAsset(descriptor, bytes, contentType) {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (!message || !['aih-api-request', 'aih-pair', 'aih-resource-request', 'aih-mirror-asset', 'aih-mirror-asset-bytes'].includes(message.type)) return false;
+  if (!message || !['aih-api-request', 'aih-pair', 'aih-resource-request', 'aih-mirror-asset', 'aih-mirror-asset-bytes', 'aih-mirror-input-bytes'].includes(message.type)) return false;
 
   (async () => {
     if (message.type === 'aih-pair') {
@@ -164,6 +167,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       if (bytes.byteLength > descriptor.max_bytes) {
         await reportAssetStatus(message.asset_id, 'FAILED', 'Provider blob asset exceeds capture limit');
         throw new Error('Provider blob asset exceeds capture limit');
+      }
+      return uploadDiscoveredAsset(descriptor, bytes, message.mime_type || descriptor.mime_type);
+    }
+
+    if (message.type === 'aih-mirror-input-bytes') {
+      const descriptor = await discoveredAssetDescriptor(message.asset_id);
+      if (descriptor.provider !== message.provider || descriptor.capture_strategy !== 'direct_input' || descriptor.source_url) throw new Error('Native input asset descriptor rejected');
+      const bytes = base64ToBytes(message.data_base64);
+      if (!bytes.byteLength || bytes.byteLength > descriptor.max_bytes) {
+        await reportAssetStatus(message.asset_id, 'FAILED', !bytes.byteLength ? 'Native input asset was empty' : 'Native input asset exceeds capture limit');
+        throw new Error(!bytes.byteLength ? 'Native input asset was empty' : 'Native input asset exceeds capture limit');
       }
       return uploadDiscoveredAsset(descriptor, bytes, message.mime_type || descriptor.mime_type);
     }

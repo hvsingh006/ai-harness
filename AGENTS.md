@@ -31,6 +31,11 @@ For code changes, run at minimum:
 
 If a command cannot run because the Harness service/browser companion is intentionally not running, distinguish that non-blocking condition from actual installation failures.
 
+## Scoped Harness context for local agents
+- When Codex or Antigravity is opened from the Harness UI, the process receives an expiring, read-only Project Space context session.
+- On Windows, use `node $env:AIH_CONTEXT_HELPER status`, `query "..."`, `sources`, `resource <opaque-id>`, or `visual <opaque-id>` when those environment variables are present. The visual command streams verified bytes and does not create a repository file.
+- The helper talks only to the localhost Harness API. It does not open the Harness database, grant another workspace/root, or add write capability.
+
 ## Git safety
 - Do not use `git reset --hard`, `git clean`, force-push, or destructive history rewriting unless explicitly requested for a recovery task.
 - Stage only intended files when the worktree is mixed.

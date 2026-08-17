@@ -1,5 +1,5 @@
 (() => {
-  const ADAPTER_PROTOCOL_VERSION = 3;
+  const ADAPTER_PROTOCOL_VERSION = 4;
   const PROVIDER_ACCEPT_TIMEOUT_MS = 15000;
   const SELECTORS = Object.freeze({
     chatgpt: Object.freeze({
@@ -103,10 +103,25 @@
     return after.some(item => !prior.has(item.key) && item.name.toLowerCase().includes(lower));
   }
 
+  function messageContext(providerId, node) {
+    const container = providerId === 'chatgpt'
+      ? node?.closest?.('[data-message-author-role]')
+      : node?.closest?.('user-query, model-response');
+    if (!container) return null;
+    const role = providerId === 'chatgpt'
+      ? container.getAttribute('data-message-author-role') || 'unknown'
+      : container.tagName.toLowerCase() === 'user-query' ? 'user' : 'assistant';
+    const providerMessageId = providerId === 'chatgpt'
+      ? container.getAttribute('data-message-id') || container.closest('[data-message-id]')?.getAttribute('data-message-id') || ''
+      : container.id || '';
+    return { role, provider_message_id: providerMessageId, container };
+  }
+
   function makeShared(providerId) {
     const selectors = SELECTORS[providerId];
     return {
       protocolVersion: ADAPTER_PROTOCOL_VERSION,
+      surfaceId: `${providerId}.web`,
       composerText: textOf,
       setComposerText: setText,
       findComposer: () => chooseActive(queryCandidates(selectors.composer)),
@@ -116,6 +131,7 @@
       loadingVisible: () => queryCandidates(['[aria-busy="true"]', '[role="progressbar"]', 'mat-progress-spinner']).some(nodeVisible),
       streamingVisible: () => queryCandidates(selectors.streaming).some(nodeVisible),
       attachmentInventory: () => attachmentInventory(selectors.attachmentEvidence),
+      messageContext: node => messageContext(providerId, node),
       capabilities() {
         const composer = this.findComposer();
         const send = this.findSendButton({ allowDisabled: true });
@@ -125,7 +141,7 @@
         if (!composer) failures.push({ code: 'PROVIDER_COMPOSER_UNAVAILABLE', capability: 'composer' });
         if (!send) failures.push({ code: 'PROVIDER_SEND_CONTROL_UNAVAILABLE', capability: 'send' });
         if (established && messages.length === 0) failures.push({ code: 'PROVIDER_MESSAGE_EXTRACTION_EMPTY', capability: 'messages' });
-        return { ok: failures.length === 0, protocol_version: ADAPTER_PROTOCOL_VERSION, provider: providerId, adapter_version: this.version,
+        return { ok: failures.length === 0, protocol_version: ADAPTER_PROTOCOL_VERSION, provider: providerId, surface_id: this.surfaceId, adapter_version: this.version,
           established_conversation: established, composer: Boolean(composer), send: Boolean(send), messages: messages.length,
           streaming: this.streamingVisible(), attachment_input: Boolean(this.findAttachmentInput()),
           attachment_evidence_count: this.attachmentInventory().length, scroller: Boolean(this.conversationScroller()), failures };
@@ -177,7 +193,7 @@
   const chatgpt = {
     id: 'chatgpt', version: 'chatgpt-2026-08-16.2',
     refs() { const match = location.pathname.match(/\/c\/([^/?#]+)/); return [...(match?.[1] ? [{ ref_type: 'chat_id', ref_value: match[1], source: 'browser_companion' }] : []), { ref_type: 'route', ref_value: `${location.pathname}${location.search}`, source: 'browser_companion' }, { ref_type: 'native_url', ref_value: location.href, source: 'browser_companion' }]; },
-    captureMessages() { return queryCandidates(SELECTORS.chatgpt.messages).filter(nodeVisible).map((node, index) => ({ role: node.getAttribute('data-message-author-role') || 'unknown', content: node.innerText?.trim() || '', provider_message_id: node.getAttribute('data-message-id') || node.closest('[data-message-id]')?.getAttribute('data-message-id') || '', raw: { index, html: node.outerHTML.slice(0, 50000) } })).filter(item => item.content); },
+    captureMessages() { return queryCandidates(SELECTORS.chatgpt.messages).filter(nodeVisible).map((node, index) => ({ role: node.getAttribute('data-message-author-role') || 'unknown', content: node.innerText?.trim() || '', provider_message_id: node.getAttribute('data-message-id') || node.closest('[data-message-id]')?.getAttribute('data-message-id') || '', parent_provider_message_id: node.getAttribute('data-parent-message-id') || node.closest('[data-parent-message-id]')?.getAttribute('data-parent-message-id') || '', raw: { index, html: node.outerHTML.slice(0, 50000) } })).filter(item => item.content); },
     ...makeShared('chatgpt')
   };
   const gemini = {

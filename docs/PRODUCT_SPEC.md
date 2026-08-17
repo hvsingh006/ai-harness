@@ -4,7 +4,27 @@
 
 `Project Current` and `sent` are separate claims. Project Current requires verified current sources/index/repository/chat/security. Sent additionally requires provider acceptance evidence tied to the exact prepared attempt. A click, composer mutation, timer, or optimistic API response is insufficient. Protocol mismatch, missing capability evidence, established-chat zero-message extraction, source mutation, uncertain attachment confirmation, or uncertain provider acceptance fails closed.
 
-Office files are intentionally attachment-only in 0.8.0; no Office text-extraction claim is made. Images are immutable/current but have no OCR claim. These are capabilities, not silent degradation.
+Office files are intentionally attachment-only in 0.8.0; no Office text-extraction claim is made. PNG/JPEG/WebP attempt bounded local OCR, and PDFs attempt metadata, per-page digital text, page rendering, embedded-image extraction, and OCR. Representation coverage is reported independently from source freshness. These are explicit capabilities, not silent degradation.
+
+## Native-chat resource continuity
+
+Eligible user-provided files and pasted/clipboard images introduced in an associated ChatGPT or Gemini composer become durable Project Space resources before a guaranteed managed Send proceeds. Three cases are distinct:
+
+1. A unique exact-hash match inside an approved root records attachment/message provenance on the existing filesystem resource. Filename alone never merges resources.
+2. A file from outside approved roots is copied byte-for-byte into the private immutable archive. Harness does not authorize or watch the external parent directory.
+3. A pathless clipboard image is archived directly with safe MIME/type validation and processed like any other image resource.
+
+Imported inputs and provider-generated outputs share the resource/version/representation architecture but retain different source types and authority/provenance. They belong logically to the Project Space without being written to its Git repository. **Save copy to project folder** is explicit, conflict-checked, hash-verified export; it is not required for cross-provider continuity.
+
+A provider chat is not safe to delete until transcript, actual user-input bytes, provider-output bytes, derived representations, and search index are all complete. Observed-but-unavailable assets remain visible preservation gaps and keep history coverage partial.
+
+## Fast verified context
+
+Guaranteed freshness uses persisted per-root manifests containing path, size, high-resolution modification/change metadata, stable file identity where available, current hash, and resource/version identity. Each send double-inventories the root, hashes only candidates, and rejects races. A separate full-integrity job rehashes every approved byte. Background watchers and prewarm reduce latency but are never freshness proof.
+
+Speculative retrieval is local-only and keyed by Project Space, session, surface/adapter, query, corpus/index/chat generations, instructions, and personalization. Final send revalidates that identity and runs current secret/security filtering. Session ledgers send a full bootstrap to a fresh conversation, concise deltas to a bounded established conversation, and force periodic rebootstrap. Fixed-priority background jobs have bounded concurrency, backpressure, cancellation, and safe restart recovery.
+
+Retrieval combines current working state, current resource chunks, retained cross-provider messages, durable native attachments, explicit decisions/tasks, recency, user-role authority, relationship/deictic evidence, and deterministic budgets. **Always consider** sources enter candidates despite recency pressure. **Context Critical** sources block CURRENT when unsafe or incomplete. Superseded/deprecated knowledge is excluded from ordinary retrieval and becomes eligible under explicit historical intent.
 
 ## Product goal
 
@@ -91,6 +111,10 @@ Keep the first UI small:
 - Open Gemini
 - Open both
 - Inspect context / fresh session helpers
+- Resource Library, versions, processing/retry, and coverage
+- project instructions and restrained global/project personalization
+- security/surface status, pairing/revocation, scoped Codex/Antigravity launch
+- fixed backup/diagnostic/update jobs with visible status
 - light, dark, and system appearance
 
 There are no Learning, Development, Direction, or provider-selection modes in the first UI. Those are use cases, not workspace types.
@@ -102,7 +126,7 @@ There are no Learning, Development, Direction, or provider-selection modes in th
 - autonomous multi-agent orchestration
 - dedicated learning dashboards
 - dedicated development dashboards
-- coding-agent integrations
+- broad/autonomous coding-agent orchestration or Projects-parent permission
 - complex knowledge graphs
 
 The internal architecture may leave room for later expansion, but none of these should complicate the initial user experience.

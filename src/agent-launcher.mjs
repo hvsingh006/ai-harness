@@ -1,14 +1,17 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { execFileSync, spawn } from 'node:child_process';
 import { row } from './db.mjs';
 import { canonicalizeExistingPath } from './security/paths.mjs';
 import { inspectRepositoryRoot } from './repository.mjs';
+import { createAgentContextSession, revokeAgentContextSession } from './agent-context.mjs';
 
 const AGENTS = Object.freeze({
   codex: { command: 'codex', display: 'Codex' },
   antigravity: { command: 'agy', display: 'Antigravity' }
 });
+const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function comparable(value) {
   const resolved = path.resolve(value);
@@ -48,15 +51,28 @@ export function launchRegisteredAgent(db, { workspaceId, rootId, agent }) {
   const selected = resolveRegisteredRepositoryForAgent(db, { workspaceId, rootId });
   const executable = findAgentExecutable(agent);
   if (!executable) throw Object.assign(new Error(`${definition.display} is not installed or is not on PATH`), { code: 'TOOL_NOT_INSTALLED' });
+  const context = createAgentContextSession(db, { workspaceId, rootId, agent });
+  const childEnvironment = {
+    ...process.env,
+    AIH_CONTEXT_URL: `http://127.0.0.1:${Number(process.env.HARNESS_PORT || 4317)}/api/agent-context`,
+    AIH_CONTEXT_TOKEN: context.token,
+    AIH_CONTEXT_SESSION_ID: context.id,
+    AIH_CONTEXT_HELPER: path.join(appRoot, 'scripts', 'aih-context.mjs')
+  };
   let child;
-  if (process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(executable)) {
-    let terminal = null;
-    try { terminal = execFileSync('where.exe', ['wt.exe'], { encoding: 'utf8', windowsHide: true, timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] }).split(/\r?\n/).find(Boolean)?.trim(); } catch {}
-    if (!terminal) throw Object.assign(new Error('Windows Terminal is required to launch this command shim without a shell'), { code: 'AGENT_TERMINAL_UNAVAILABLE' });
-    child = spawn(terminal, ['-d', selected.canonical, executable], { cwd: selected.canonical, detached: true, windowsHide: false, stdio: 'ignore' });
-  } else {
-    child = spawn(executable, [], { cwd: selected.canonical, detached: true, windowsHide: false, stdio: 'ignore' });
+  try {
+    if (process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(executable)) {
+      let terminal = null;
+      try { terminal = execFileSync('where.exe', ['wt.exe'], { encoding: 'utf8', windowsHide: true, timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] }).split(/\r?\n/).find(Boolean)?.trim(); } catch {}
+      if (!terminal) throw Object.assign(new Error('Windows Terminal is required to launch this command shim without a shell'), { code: 'AGENT_TERMINAL_UNAVAILABLE' });
+      child = spawn(terminal, ['-d', selected.canonical, executable], { cwd: selected.canonical, detached: true, windowsHide: false, stdio: 'ignore', env: childEnvironment });
+    } else {
+      child = spawn(executable, [], { cwd: selected.canonical, detached: true, windowsHide: false, stdio: 'ignore', env: childEnvironment });
+    }
+  } catch (error) {
+    revokeAgentContextSession(db, context.id);
+    throw error;
   }
   child.unref();
-  return { ok: true, agent, workspace_id: workspaceId, root_id: rootId, repository: selected.canonical, pid: child.pid, branch: selected.state.branch, head: selected.state.head };
+  return { ok: true, agent, workspace_id: workspaceId, root_id: rootId, repository: selected.canonical, pid: child.pid, branch: selected.state.branch, head: selected.state.head, context_session_id: context.id, context_expires_at: context.expires_at, context_capabilities: context.capabilities };
 }
