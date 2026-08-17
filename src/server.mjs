@@ -23,7 +23,7 @@ import { multimodalToolStatus } from './tooling.mjs';
 import { surfaceRegistry, browserSurfaceForProvider, publicSurfaceStatus } from './surface-registry.mjs';
 import { activeProjectInstructions, activePersonalization, saveProjectInstructions, savePersonalization, instructionContext, instructionHistory } from './instructions.mjs';
 import { authenticateAgentContext, agentContextStatus, agentContextQuery, agentContextSources, agentContextResource, agentContextVisual, revokeAgentContextSession } from './agent-context.mjs';
-import { backgroundQueueStatus, cancelBackgroundJob, createBackgroundJob, recoverBackgroundJobs, startBackgroundJob } from './jobs.mjs';
+import { backgroundQueueStatus, cancelBackgroundJob, createBackgroundJob, recoverBackgroundJobs, startBackgroundJob, registerJobDispatcher } from './jobs.mjs';
 import { createDatabaseBackup } from './backup.mjs';
 import { prepareSpeculativeDraft } from './context-cache.mjs';
 import { refreshWorkspaceRepositories } from './repository.mjs';
@@ -129,6 +129,7 @@ function refreshRootWatchers() {
 }
 
 refreshRootWatchers();
+registerJobDispatcher(backgroundJobHandler);
 recoverBackgroundJobs(db, backgroundJobHandler);
 const watcherRecoveryTimer = setInterval(() => {
   refreshRootWatchers();
@@ -319,7 +320,7 @@ function workspaceSummary(id) {
     integrity: workspaceIntegrity(db, id),
     representation_coverage: representationCoverage(db, id),
     instruction_context: instructionContext(db, id),
-    resources: currentWorkspaceResources(db, id),
+    resources: currentWorkspaceResources(db, id).slice(0, 100),
     providers: rows(db, 'SELECT * FROM provider_links WHERE workspace_id = ? ORDER BY provider', id),
     sessions: rows(db, 'SELECT * FROM sessions WHERE workspace_id = ? ORDER BY started_at DESC LIMIT 100', id),
     memories: rows(db, `SELECT * FROM memories WHERE (workspace_id = ? OR scope = 'global') AND status = 'active' ORDER BY scope, updated_at DESC`, id),
@@ -1266,6 +1267,15 @@ async function handleApi(req, res, url) {
   if (integrityMatch && req.method === 'GET') {
     const integrity = workspaceIntegrity(db, integrityMatch[1]);
     return integrity ? sendJson(res, 200, integrity) : sendJson(res, 404, { error: 'workspace not found' });
+  }
+
+  const resourcesMatch = url.pathname.match(/^\/api\/workspaces\/([^/]+)\/resources$/);
+  if (resourcesMatch && req.method === 'GET') {
+    const page = Math.max(1, Number(url.searchParams.get('page')) || 1);
+    const limit = Math.max(1, Math.min(1000, Number(url.searchParams.get('limit')) || 100));
+    const allResources = currentWorkspaceResources(db, resourcesMatch[1]);
+    const paginated = allResources.slice((page - 1) * limit, page * limit);
+    return sendJson(res, 200, { items: paginated, total: allResources.length, page, limit });
   }
 
   const rootsMatch = url.pathname.match(/^\/api\/workspaces\/([^/]+)\/roots$/);

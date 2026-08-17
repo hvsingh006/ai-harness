@@ -4,7 +4,7 @@ import crypto, { randomUUID } from 'node:crypto';
 import { archiveFile } from './archive.mjs';
 import { row, rows, run, storageForDatabase } from './db.mjs';
 import { scanOutgoingText } from './security/secrets.mjs';
-import { runTool, toolStatus } from './tooling.mjs';
+import { runTool, runToolAsync, toolStatus } from './tooling.mjs';
 
 export const MULTIMODAL_LIMITS = Object.freeze({
   maxInputBytes: 200 * 1024 * 1024,
@@ -178,6 +178,36 @@ function ocrImage(filePath) {
   const status = toolStatus('tesseract');
   if (!status.available) return { ok: false, status, text: '', confidence: null, regions: [], message: 'Tesseract OCR is unavailable' };
   const result = runTool('tesseract', [filePath, 'stdout', '-l', 'eng', '--psm', '6', 'tsv'], { timeout: MULTIMODAL_LIMITS.toolTimeoutMs, maxBuffer: MULTIMODAL_LIMITS.maxToolOutputBytes });
+  if (result.error || result.status !== 0) return { ok: false, status, text: '', confidence: null, regions: [], message: String(result.stderr || result.error?.message || 'OCR failed').trim() };
+  return { ok: true, status, ...parseTsv(result.stdout, MULTIMODAL_LIMITS.maxOcrCharactersPerPage) };
+}
+
+async function extractPdfPageTextAsync(filePath, page) {
+  const status = toolStatus('pdftotext');
+  if (!status.available) return { ok: false, text: '', status };
+  const result = await runToolAsync('pdftotext', ['-layout', '-f', page, '-l', page, filePath, '-'], { timeout: MULTIMODAL_LIMITS.toolTimeoutMs, maxBuffer: MULTIMODAL_LIMITS.maxToolOutputBytes });
+  return { ok: !result.error && result.status === 0, text: String(result.stdout || '').trim(), status, error: String(result.stderr || result.error?.message || '').trim() };
+}
+
+async function renderPdfPageAsync(filePath, page, tempDir) {
+  const status = toolStatus('pdftoppm');
+  if (!status.available) return { ok: false, status, pagePath: '', message: 'Poppler pdftoppm is unavailable' };
+  const prefix = path.join(tempDir, 'requested-page');
+  const result = await runToolAsync('pdftoppm', ['-png', '-r', MULTIMODAL_LIMITS.renderDpi, '-f', page, '-l', page, filePath, prefix], { timeout: MULTIMODAL_LIMITS.toolTimeoutMs, maxBuffer: MULTIMODAL_LIMITS.maxToolOutputBytes });
+  if (result.error || result.status !== 0) return { ok: false, status, pagePath: '', message: String(result.stderr || result.error?.message || 'PDF page rendering failed').trim() };
+  const name = fs.readdirSync(tempDir).find(item => /^requested-page-\d+\.png$/i.test(item));
+  if (!name) return { ok: false, status, pagePath: '', message: `page ${page} did not produce a render` };
+  const pagePath = path.join(tempDir, name);
+  const dimensions = pngDimensions(pagePath);
+  const pixels = Number(dimensions.width || 0) * Number(dimensions.height || 0);
+  if (!pixels || pixels > MULTIMODAL_LIMITS.maxRenderedPixelsPerPage) return { ok: false, status, pagePath: '', message: `page ${page} exceeds the configured pixel bound` };
+  return { ok: true, status, pagePath, dimensions };
+}
+
+async function ocrImageAsync(filePath) {
+  const status = toolStatus('tesseract');
+  if (!status.available) return { ok: false, status, text: '', confidence: null, regions: [], message: 'Tesseract OCR is unavailable' };
+  const result = await runToolAsync('tesseract', [filePath, 'stdout', '-l', 'eng', '--psm', '6', 'tsv'], { timeout: MULTIMODAL_LIMITS.toolTimeoutMs, maxBuffer: MULTIMODAL_LIMITS.maxToolOutputBytes });
   if (result.error || result.status !== 0) return { ok: false, status, text: '', confidence: null, regions: [], message: String(result.stderr || result.error?.message || 'OCR failed').trim() };
   return { ok: true, status, ...parseTsv(result.stdout, MULTIMODAL_LIMITS.maxOcrCharactersPerPage) };
 }
@@ -437,6 +467,7 @@ export async function completePdfBackground(db, versionId, progress) {
     FROM workspace_resources r JOIN resource_versions v ON v.id=r.current_version_id LEFT JOIN artifacts a ON a.id=v.archive_artifact_id
     WHERE v.id=? AND r.status='active' AND r.resource_type='pdf'`, versionId);
   if (!current?.vault_path || !fs.existsSync(current.vault_path)) throw Object.assign(new Error('immutable current PDF original is unavailable'), { code: 'PDF_ORIGINAL_UNAVAILABLE' });
+  
   let coverage = {};
   try { coverage = JSON.parse(current.coverage_json || '{}'); } catch {}
   if (coverage.status === 'complete') return { status: 'complete', pages: coverage.page_count };
@@ -457,23 +488,126 @@ export async function completePdfBackground(db, versionId, progress) {
     return { status: 'complete', pages: pageCount };
   }
   
+  let currentProcessedCount = processedPages.length;
   for (let i = 0; i < pendingPages.length; i++) {
     const page = pendingPages[i];
     progress({ current: i, total: pendingPages.length, phase: `processing page ${page} of ${pageCount}` });
-    const result = ensurePdfPageRepresentation(db, { workspaceId: current.workspace_id, resourceId: current.resource_id, page });
-    if (!result.ok && result.code !== 'VISUAL_PAGE_SECURITY_BLOCKED') {
-      throw Object.assign(new Error(`PDF page ${page} extraction failed: ${result.message}`), { code: result.code });
+    const result = await ensurePdfPageRepresentationAsync(db, { workspaceId: current.workspace_id, resourceId: current.resource_id, page, expectedVersionId: versionId, expectedSha256: current.sha256 });
+    if (!result.ok) {
+      if (result.code === 'RESOURCE_VERSION_SUPERSEDED') {
+        return { status: 'cancelled', pages: pageCount, reason: 'RESOURCE_VERSION_SUPERSEDED' };
+      }
+      if (result.code !== 'VISUAL_PAGE_SECURITY_BLOCKED') {
+        throw Object.assign(new Error(`PDF page ${page} extraction failed: ${result.message}`), { code: result.code });
+      }
     }
+    
+    currentProcessedCount++;
     
     // Update coverage periodically to keep UI responsive
     if ((i + 1) % 5 === 0 || i === pendingPages.length - 1) {
-      const interimCoverage = { ...coverage, pending_page_count: pendingPages.length - (i + 1), processed_page_count: processedPages.length + (i + 1) };
+      const latestVersion = row(db, 'SELECT coverage_json FROM resource_versions WHERE id=?', versionId);
+      let latestCoverage = {};
+      try { latestCoverage = JSON.parse(latestVersion?.coverage_json || '{}'); } catch {}
+      const interimCoverage = { ...latestCoverage, pending_page_count: pageCount - currentProcessedCount, processed_page_count: currentProcessedCount };
       run(db, 'UPDATE resource_versions SET coverage_json=? WHERE id=?', JSON.stringify(interimCoverage), versionId);
     }
   }
   
   progress({ current: pendingPages.length, total: pendingPages.length, phase: 'completion successful' });
-  const nextCoverage = { ...coverage, status: 'complete', pending_page_count: 0, processed_page_count: pageCount, processing_scope: 'complete_document' };
-  run(db, 'UPDATE resource_versions SET representation_coverage=?,coverage_json=? WHERE id=?', 'complete', JSON.stringify(nextCoverage), versionId);
-  return { status: 'complete', pages: pageCount };
+  const finalVersion = row(db, 'SELECT coverage_json FROM resource_versions WHERE id=?', versionId);
+  let finalCoverage = {};
+  try { finalCoverage = JSON.parse(finalVersion?.coverage_json || '{}'); } catch {}
+  
+  // Base final completion status on actual representation rows in the DB
+  const actualProcessedPages = Number(row(db, `SELECT COUNT(DISTINCT page_start) AS n FROM resource_representations WHERE resource_version_id=? AND representation_kind='page_image' AND status='complete'`, versionId)?.n || 0);
+  const isComplete = actualProcessedPages >= pageCount;
+  
+  const nextCoverage = { ...finalCoverage, status: isComplete ? 'complete' : 'partial', pending_page_count: Math.max(0, pageCount - actualProcessedPages), processed_page_count: actualProcessedPages, processing_scope: isComplete ? 'complete_document' : finalCoverage.processing_scope };
+  run(db, 'UPDATE resource_versions SET representation_coverage=?,coverage_json=? WHERE id=?', isComplete ? 'complete' : 'partial', JSON.stringify(nextCoverage), versionId);
+  return { status: isComplete ? 'complete' : 'partial', pages: pageCount };
+}
+
+export async function ensurePdfPageRepresentationAsync(db, { workspaceId, resourceId, page, expectedVersionId, expectedSha256 }) {
+  const requestedPage = Number(page || 0);
+  if (!Number.isInteger(requestedPage) || requestedPage < 1 || requestedPage > MULTIMODAL_LIMITS.maxPdfPages) return { ok: false, code: 'PDF_PAGE_INVALID', message: 'requested PDF page is outside the supported range' };
+  const current = row(db, `SELECT r.*,v.id AS version_id,v.sha256,v.security_status,v.coverage_json,v.metadata_json,v.archive_artifact_id,a.vault_path
+    FROM workspace_resources r JOIN resource_versions v ON v.id=r.current_version_id LEFT JOIN artifacts a ON a.id=v.archive_artifact_id
+    WHERE r.id=? AND r.workspace_id=? AND r.status='active' AND r.resource_type='pdf'`, resourceId, workspaceId);
+  if (expectedVersionId && current?.version_id !== expectedVersionId) return { ok: false, code: 'RESOURCE_VERSION_SUPERSEDED', message: 'resource version superseded before processing' };
+  if (expectedSha256 && current?.sha256 !== expectedSha256) return { ok: false, code: 'RESOURCE_VERSION_SUPERSEDED', message: 'resource content hash superseded before processing' };
+  if (!current?.vault_path || !fs.existsSync(current.vault_path)) return { ok: false, code: 'PDF_ORIGINAL_UNAVAILABLE', message: 'the immutable current PDF original is unavailable' };
+  if (current.security_status !== 'clear' || !current.provider_transmission_allowed) return { ok: false, code: 'VISUAL_PAGE_SECURITY_BLOCKED', message: 'the PDF is not security-cleared for visual delivery' };
+  const existing = row(db, `SELECT rr.*,a.name,a.mime_type,a.size_bytes,a.sha256 AS artifact_sha256 FROM resource_representations rr
+    LEFT JOIN artifacts a ON a.id=rr.artifact_id WHERE rr.resource_version_id=? AND rr.representation_kind='page_image' AND rr.page_start=? AND rr.status='complete' AND rr.security_status='clear'
+    ORDER BY rr.created_at DESC LIMIT 1`, current.version_id, requestedPage);
+  if (existing) return { ok: true, created: false, representation: existing };
+
+  let coverage = {};
+  try { coverage = JSON.parse(current.coverage_json || '{}'); } catch {}
+  let pageCount = Number(coverage.page_count || 0);
+  if (!pageCount) {
+    const inspected = inspectPdf(current.vault_path);
+    if (!inspected.ok) return { ok: false, code: inspected.code, message: inspected.message };
+    pageCount = inspected.metadata.page_count;
+  }
+  if (requestedPage > pageCount) return { ok: false, code: 'PDF_PAGE_OUT_OF_RANGE', message: `the current PDF has ${pageCount} pages, not page ${requestedPage}` };
+
+  const storage = storageForDatabase(db);
+  const tempDir = path.join(storage.derivedDir, `page-${current.version_id}-${requestedPage}-${randomUUID()}`);
+  fs.mkdirSync(tempDir, { recursive: true });
+  try {
+    const rendered = await renderPdfPageAsync(current.vault_path, requestedPage, tempDir);
+    if (!rendered.ok) return { ok: false, code: rendered.status?.code || 'PDF_PAGE_RENDER_FAILED', message: rendered.message };
+    const digital = await extractPdfPageTextAsync(current.vault_path, requestedPage);
+    const ocr = await ocrImageAsync(rendered.pagePath);
+    if (!ocr.ok) return { ok: false, code: ocr.status?.code || 'OCR_FAILED', message: ocr.message || 'OCR failed; visual security could not be evaluated' };
+    const digitalText = digital.ok ? digital.text : '';
+    const visualSecurity = scanOutgoingText(`${digitalText}\n${ocr.text}`, { source: `${resourceId}:page:${requestedPage}` });
+    const pageSecurityStatus = visualSecurity.blocked ? 'blocked' : visualSecurity.redacted ? 'redact_required' : 'clear';
+    const currentCheck = row(db, `SELECT current_version_id FROM workspace_resources WHERE id=?`, resourceId);
+    if (expectedVersionId && currentCheck?.current_version_id !== expectedVersionId) return { ok: false, code: 'RESOURCE_VERSION_SUPERSEDED', message: 'superseded before commit' };
+    const imageArtifact = archiveFile(db, { filePath: rendered.pagePath, workspaceId, provider: 'local', artifactType: 'pdf_page_image', sourcePathOverride: `derived:${current.version_id}:page_image:${requestedPage}`, metadata: { resource_version_id: current.version_id, page: requestedPage, rebuildable: true, ...rendered.dimensions } });
+    const pageImageId = addRepresentation(db, { workspaceId, resourceId, versionId: current.version_id, kind: 'page_image', page: requestedPage, artifactId: imageArtifact?.id, extractor: 'pdftoppm', extractorVersion: rendered.status.version, contentSha256: imageArtifact?.sha256 || '', metadata: { ...rendered.dimensions, materialized_on_demand: true, visual_secret_analysis: 'ocr_based_not_mathematically_complete' }, securityStatus: pageSecurityStatus });
+    const chunks = [];
+    if (digitalText) {
+      const digitalHash = sha256(digitalText);
+      let digitalRepresentation = row(db, `SELECT id FROM resource_representations WHERE resource_version_id=? AND representation_kind='digital_text' AND page_start=? AND content_sha256=? ORDER BY created_at DESC LIMIT 1`, current.version_id, requestedPage, digitalHash);
+      if (!digitalRepresentation) {
+        const artifact = archiveDerivedText(db, { workspaceId, versionId: current.version_id, kind: 'digital_text', page: requestedPage, text: digitalText, tempDir });
+        const id = addRepresentation(db, { workspaceId, resourceId, versionId: current.version_id, kind: 'digital_text', page: requestedPage, artifactId: artifact?.id, extractor: 'pdftotext', extractorVersion: digital.status.version, contentSha256: digitalHash, confidence: 1, trustClass: 'source_derived', metadata: { materialized_on_demand: true }, securityStatus: pageSecurityStatus });
+        digitalRepresentation = { id };
+      }
+      const hasDigitalChunk = Number(row(db, `SELECT COUNT(*) AS n FROM resource_chunks WHERE resource_version_id=? AND page_start=? AND source_kind='digital_text'`, current.version_id, requestedPage)?.n || 0) > 0;
+      if (!hasDigitalChunk) chunks.push(...chunkText(digitalText, { page: requestedPage, sourceKind: 'digital_text', confidence: 1, authority: 'source_derived' }).map(chunk => ({ ...chunk, representationId: digitalRepresentation.id })));
+    }
+    const similarity = textSimilarity(digitalText, ocr.text);
+    const ocrHash = sha256(ocr.text);
+    let ocrRepresentation = row(db, `SELECT id FROM resource_representations WHERE resource_version_id=? AND representation_kind='ocr_text' AND page_start=? AND content_sha256=? ORDER BY created_at DESC LIMIT 1`, current.version_id, requestedPage, ocrHash);
+    if (!ocrRepresentation) {
+      const ocrArtifact = archiveDerivedText(db, { workspaceId, versionId: current.version_id, kind: 'ocr_text', page: requestedPage, text: ocr.text, tempDir });
+      const id = addRepresentation(db, { workspaceId, resourceId, versionId: current.version_id, kind: 'ocr_text', page: requestedPage, artifactId: ocrArtifact?.id, extractor: 'tesseract', extractorVersion: ocr.status.version, contentSha256: ocrHash, confidence: ocr.confidence, metadata: { regions: ocr.regions, deduplicated_from_digital: similarity >= 0.82, digital_similarity: similarity, untrusted_evidence: true, materialized_on_demand: true }, securityStatus: pageSecurityStatus });
+      ocrRepresentation = { id };
+    }
+    const hasOcrChunk = Number(row(db, `SELECT COUNT(*) AS n FROM resource_chunks WHERE resource_version_id=? AND page_start=? AND source_kind='ocr_text'`, current.version_id, requestedPage)?.n || 0) > 0;
+    if (similarity < 0.82 && !hasOcrChunk) chunks.push(...chunkText(ocr.text, { page: requestedPage, sourceKind: 'ocr_text', confidence: ocr.confidence, authority: 'untrusted_derived', region: { regions: ocr.regions } }).map(chunk => ({ ...chunk, representationId: ocrRepresentation.id })));
+    appendVersionChunks(db, { workspaceId, resource: current, version: { id: current.version_id }, chunks, metadata: { materialized_on_demand: true, page: requestedPage } });
+
+    let versionMetadata = {};
+    try { versionMetadata = JSON.parse(current.metadata_json || '{}'); } catch {}
+    const securityFindings = [...(versionMetadata.security_findings || []), ...visualSecurity.detections];
+    const nextVersionSecurity = visualSecurity.blocked ? 'local_only:content-secret' : visualSecurity.redacted ? 'redact_required' : current.security_status;
+    const processedPages = Number(row(db, `SELECT COUNT(DISTINCT page_start) AS n FROM resource_representations WHERE resource_version_id=? AND representation_kind='page_image' AND status='complete'`, current.version_id)?.n || 0);
+    const latestVersion = row(db, 'SELECT coverage_json FROM resource_versions WHERE id=?', current.version_id);
+    let latestCoverage = coverage;
+    try { latestCoverage = JSON.parse(latestVersion?.coverage_json || '{}'); } catch {}
+    const latestOnDemandPages = [...new Set([...(latestCoverage.on_demand_pages || []), requestedPage])].sort((a, b) => a - b);
+    const nextCoverage = { ...latestCoverage, status: processedPages >= pageCount && latestCoverage.processing_scope === 'complete_document' ? 'complete' : 'partial', processed_page_count: processedPages, pending_page_count: Math.max(0, pageCount - processedPages), on_demand_pages: latestOnDemandPages, visual_secret_analysis: 'ocr_based_not_mathematically_complete' };
+    run(db, 'UPDATE resource_versions SET security_status=?,metadata_json=?,representation_coverage=?,coverage_json=? WHERE id=?', nextVersionSecurity, JSON.stringify({ ...versionMetadata, security_findings: securityFindings }), nextCoverage.status, JSON.stringify(nextCoverage), current.version_id);
+    if (visualSecurity.blocked) run(db, 'UPDATE workspace_resources SET provider_transmission_allowed=0,updated_at=? WHERE id=?', now(), resourceId);
+    if (pageSecurityStatus !== 'clear') return { ok: false, code: 'VISUAL_PAGE_SECURITY_BLOCKED', message: `page ${requestedPage} contains possible secret material and cannot be attached`, security_status: pageSecurityStatus };
+    return { ok: true, created: true, representation: row(db, `SELECT rr.*,a.name,a.mime_type,a.size_bytes,a.sha256 AS artifact_sha256 FROM resource_representations rr LEFT JOIN artifacts a ON a.id=rr.artifact_id WHERE rr.id=?`, pageImageId) };
+  } finally {
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+  }
 }

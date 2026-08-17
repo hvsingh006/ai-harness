@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync, execFile } from 'node:child_process';
 
 const TOOL_NAMES = Object.freeze({
   pdftotext: { family: 'poppler', versionArgs: ['-v'] },
@@ -101,5 +101,30 @@ export function runTool(name, args, options = {}) {
     cwd: options.cwd || os.tmpdir(),
     env: options.env || process.env,
     shell: false
+  });
+}
+
+export function runToolAsync(name, args, options = {}) {
+  return new Promise((resolve) => {
+    const executable = resolveTool(name);
+    if (!executable) {
+      resolve({ error: Object.assign(new Error(`${name} is not installed`), { code: 'ENOENT' }), status: null, stdout: '', stderr: '' });
+      return;
+    }
+    const timeout = options.timeout || 30000;
+    const maxBuffer = options.maxBuffer || 32 * 1024 * 1024;
+    const encoding = options.encoding === null ? null : (options.encoding || 'utf8');
+    
+    execFile(executable, args.map(String), {
+      encoding,
+      windowsHide: true,
+      timeout,
+      maxBuffer,
+      cwd: options.cwd || os.tmpdir(),
+      env: options.env || process.env,
+      shell: false
+    }, (error, stdout, stderr) => {
+      resolve({ error, status: error ? (error.code === 'ETIMEDOUT' ? null : error.code) : 0, stdout: stdout || '', stderr: stderr || '' });
+    });
   });
 }

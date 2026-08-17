@@ -10,13 +10,30 @@ const maxConcurrentJobs = Math.max(1, Math.min(4, Number(process.env.AIH_BACKGRO
 
 function now() { return new Date().toISOString(); }
 
+let globalJobDispatcher = null;
+
+export function registerJobDispatcher(dispatcher) {
+  globalJobDispatcher = dispatcher;
+}
+
 export function createBackgroundJob(db, { workspaceId = null, jobType, targetType = 'workspace', targetId = '' }) {
   if (!JOB_TYPES.includes(jobType)) throw Object.assign(new Error(`unsupported background job type: ${jobType}`), { code: 'JOB_TYPE_UNSUPPORTED' });
+  
+  if (jobType === 'complete_pdf' && targetType === 'resource_version') {
+    const existing = row(db, `SELECT * FROM background_jobs WHERE workspace_id=? AND job_type=? AND target_type=? AND target_id=? AND status IN ('queued','running')`, workspaceId, jobType, targetType, targetId);
+    if (existing) return existing;
+  }
+
   const outstanding = Number(row(db, `SELECT COUNT(*) AS n FROM background_jobs WHERE status IN ('queued','running')`)?.n || 0);
   if (outstanding >= 100) throw Object.assign(new Error('background processing queue is full; current interactive work remains prioritized'), { code: 'JOB_BACKPRESSURE' });
   const id = `job-${randomUUID()}`;
   run(db, `INSERT INTO background_jobs (id,workspace_id,job_type,target_type,target_id,status,created_at) VALUES (?,?,?,?,?,'queued',?)`, id, workspaceId, jobType, targetType, targetId, now());
-  return row(db, 'SELECT * FROM background_jobs WHERE id=?', id);
+  const job = row(db, 'SELECT * FROM background_jobs WHERE id=?', id);
+  if (globalJobDispatcher) {
+    const handler = globalJobDispatcher(job);
+    if (handler) startBackgroundJob(db, job.id, handler);
+  }
+  return job;
 }
 
 function pumpQueue() {
