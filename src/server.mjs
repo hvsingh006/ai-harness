@@ -18,7 +18,7 @@ import { pendingManagedWorkspaceMigrations, migrateManagedWorkspaceProject } fro
 import { isPathWithin, resolveApprovedTarget } from './security/paths.mjs';
 import { inspectSafeUpdate } from './update-safety.mjs';
 import { agentCapabilities, launchRegisteredAgent } from './agent-launcher.mjs';
-import { representationCoverage } from './multimodal.mjs';
+import { representationCoverage, completePdfBackground } from './multimodal.mjs';
 import { multimodalToolStatus } from './tooling.mjs';
 import { surfaceRegistry, browserSurfaceForProvider, publicSurfaceStatus } from './surface-registry.mjs';
 import { activeProjectInstructions, activePersonalization, saveProjectInstructions, savePersonalization, instructionContext, instructionHistory } from './instructions.mjs';
@@ -76,6 +76,12 @@ function backgroundJobHandler(job) {
       }
       progress({ current: resources.length, total: resources.length, phase: 'rebuild complete' });
       return { resource_count: results.length, coverage: representationCoverage(db, workspaceId) };
+    }
+    if (job.job_type === 'complete_pdf') {
+      if (!targetId) throw Object.assign(new Error('resource target required'), { code: 'JOB_TARGET_REQUIRED' });
+      progress({ current: 0, total: 1, phase: 'completing PDF background processing' });
+      const result = await completePdfBackground(db, targetId, progress);
+      return result;
     }
     if (job.job_type === 'create_backup') return createDatabaseBackup(db);
     if (job.job_type === 'run_diagnostics') return { tools: multimodalToolStatus(), integrity: workspaceIntegrity(db, workspaceId), surfaces: surfaceRegistry.list().map(item => ({ id: item.id, capabilities: item.capabilities })) };

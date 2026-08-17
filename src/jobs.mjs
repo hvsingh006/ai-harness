@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { row, rows, run } from './db.mjs';
 
-export const JOB_TYPES = Object.freeze(['verify_sources','full_integrity_verify','reprocess_resource','rebuild_derived','create_backup','run_diagnostics']);
-const JOB_PRIORITIES = Object.freeze({ verify_sources: 0, full_integrity_verify: 3, reprocess_resource: 1, rebuild_derived: 4, create_backup: 3, run_diagnostics: 2 });
+export const JOB_TYPES = Object.freeze(['verify_sources','full_integrity_verify','reprocess_resource','complete_pdf','rebuild_derived','create_backup','run_diagnostics']);
+const JOB_PRIORITIES = Object.freeze({ verify_sources: 0, full_integrity_verify: 3, reprocess_resource: 1, complete_pdf: 5, rebuild_derived: 4, create_backup: 3, run_diagnostics: 2 });
 const queue = [];
 const queuedJobIds = new Set();
 let activeJobs = 0;

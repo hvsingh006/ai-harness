@@ -432,3 +432,48 @@ export function currentVisualRepresentations(db, workspaceId, { kinds = ['page_i
       AND r.knowledge_status='active' AND r.provider_transmission_allowed=1 AND wr.provider_transmission_allowed=1
     ORDER BY rr.created_at DESC,rr.page_start LIMIT 500`, workspaceId, ...kinds);
 }
+export async function completePdfBackground(db, versionId, progress) {
+  const current = row(db, `SELECT r.id AS resource_id, r.workspace_id, v.id AS version_id, v.sha256, v.security_status, v.coverage_json, v.metadata_json, v.archive_artifact_id, a.vault_path
+    FROM workspace_resources r JOIN resource_versions v ON v.id=r.current_version_id LEFT JOIN artifacts a ON a.id=v.archive_artifact_id
+    WHERE v.id=? AND r.status='active' AND r.resource_type='pdf'`, versionId);
+  if (!current?.vault_path || !fs.existsSync(current.vault_path)) throw Object.assign(new Error('immutable current PDF original is unavailable'), { code: 'PDF_ORIGINAL_UNAVAILABLE' });
+  let coverage = {};
+  try { coverage = JSON.parse(current.coverage_json || '{}'); } catch {}
+  if (coverage.status === 'complete') return { status: 'complete', pages: coverage.page_count };
+  
+  const pageCount = Number(coverage.page_count || 0);
+  if (!pageCount) throw Object.assign(new Error('PDF page count unknown'), { code: 'PDF_METADATA_UNAVAILABLE' });
+  
+  const processedPages = rows(db, `SELECT DISTINCT page_start FROM resource_representations WHERE resource_version_id=? AND representation_kind='page_image' AND status='complete'`, versionId).map(r => Number(r.page_start));
+  const processedSet = new Set(processedPages);
+  const pendingPages = [];
+  for (let i = 1; i <= pageCount; i++) {
+    if (!processedSet.has(i)) pendingPages.push(i);
+  }
+  
+  if (pendingPages.length === 0) {
+    const nextCoverage = { ...coverage, status: 'complete', pending_page_count: 0, processed_page_count: pageCount };
+    run(db, 'UPDATE resource_versions SET representation_coverage=?,coverage_json=? WHERE id=?', 'complete', JSON.stringify(nextCoverage), versionId);
+    return { status: 'complete', pages: pageCount };
+  }
+  
+  for (let i = 0; i < pendingPages.length; i++) {
+    const page = pendingPages[i];
+    progress({ current: i, total: pendingPages.length, phase: `processing page ${page} of ${pageCount}` });
+    const result = ensurePdfPageRepresentation(db, { workspaceId: current.workspace_id, resourceId: current.resource_id, page });
+    if (!result.ok && result.code !== 'VISUAL_PAGE_SECURITY_BLOCKED') {
+      throw Object.assign(new Error(`PDF page ${page} extraction failed: ${result.message}`), { code: result.code });
+    }
+    
+    // Update coverage periodically to keep UI responsive
+    if ((i + 1) % 5 === 0 || i === pendingPages.length - 1) {
+      const interimCoverage = { ...coverage, pending_page_count: pendingPages.length - (i + 1), processed_page_count: processedPages.length + (i + 1) };
+      run(db, 'UPDATE resource_versions SET coverage_json=? WHERE id=?', JSON.stringify(interimCoverage), versionId);
+    }
+  }
+  
+  progress({ current: pendingPages.length, total: pendingPages.length, phase: 'completion successful' });
+  const nextCoverage = { ...coverage, status: 'complete', pending_page_count: 0, processed_page_count: pageCount, processing_scope: 'complete_document' };
+  run(db, 'UPDATE resource_versions SET representation_coverage=?,coverage_json=? WHERE id=?', 'complete', JSON.stringify(nextCoverage), versionId);
+  return { status: 'complete', pages: pageCount };
+}

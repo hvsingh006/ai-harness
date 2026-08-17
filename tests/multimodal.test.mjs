@@ -8,7 +8,7 @@ import { openDatabase, ensureWorkspaceProjectRoot, row, rows, storageForDatabase
 import { reconcileWorkspaceResources, reprocessResourceVersion } from '../src/resources.mjs';
 import { retrieveWorkspaceEvidence } from '../src/retrieval.mjs';
 import { multimodalToolStatus } from '../src/tooling.mjs';
-import { ensurePdfPageRepresentation, MULTIMODAL_LIMITS, processMultimodalVersion } from '../src/multimodal.mjs';
+import { ensurePdfPageRepresentation, MULTIMODAL_LIMITS, processMultimodalVersion, completePdfBackground } from '../src/multimodal.mjs';
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aih-multimodal-'));
